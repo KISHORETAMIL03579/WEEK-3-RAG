@@ -14,7 +14,7 @@ from pathlib import Path
 from collections import Counter
 
 import fitz  # PyMuPDF
-from flask import Flask, request, jsonify, render_template, session
+from flask import Flask, request, jsonify, render_template, session, send_file
 from werkzeug.utils import secure_filename
 
 try:
@@ -55,6 +55,8 @@ ALLOWED_EXTENSIONS = {"pdf", "txt", "md"}
 VECTOR_STORE: dict[str, "VectorStore"] = {}
 SESSION_ACCESS: dict[str, float] = {}
 HASH_STORE: dict[str, set[str]] = {}
+SESSION_FILES: dict[str, dict[str, dict]] = {}
+CHUNK_COUNTS: dict[str, dict[str, int]] = {}
 
 SESSION_TTL = 60 * 60  # 1 hour
 MAX_SESSIONS = 20
@@ -156,6 +158,83 @@ class VectorStore:
         self.chunks, self.vectors = [], []
         self.path.unlink(missing_ok=True)
 
+    def remove_doc(self, doc_id: str) -> int:
+        """Remove all chunks + vectors for a doc. Returns how many were removed."""
+        before = len(self.chunks)
+        kept = [(c, v) for c, v in zip(self.chunks, self.vectors)
+                if c["doc_id"] != doc_id]
+        self.chunks = [c for c, _ in kept]
+        self.vectors = [v for _, v in kept]
+        removed = before - len(self.chunks)
+        if removed:
+            self.save()
+        return removed
+
+
+def _manifest_path(sid: str) -> Path:
+    return UPLOAD_FOLDER / f"{sid}.manifest.json"
+
+
+def _save_session_manifest(sid: str) -> None:
+    """Persist the doc_id → file mapping so it survives a server restart."""
+    files = SESSION_FILES.get(sid)
+    if files:
+        _manifest_path(sid).write_text(json.dumps({
+            doc_id: {"path": str(info["path"]), "name": info["name"]}
+            for doc_id, info in files.items()
+        }), encoding="utf-8")
+    else:
+        _manifest_path(sid).unlink(missing_ok=True)
+
+
+def _load_session_manifest(sid: str) -> None:
+    """Restore the file mapping for a session from disk."""
+    if sid in SESSION_FILES:
+        return
+    manifest = _manifest_path(sid)
+    if not manifest.exists():
+        return
+    try:
+        data = json.loads(manifest.read_text(encoding="utf-8"))
+    except Exception:
+        return
+    files: dict[str, dict] = {}
+    for doc_id, meta in data.items():
+        p = Path(meta.get("path", ""))
+        if p.exists():
+            files[doc_id] = {"path": p, "name": meta.get("name", p.name)}
+    if files:
+        SESSION_FILES[sid] = files
+
+
+def _cleanup_session_files(sid: str) -> None:
+    """Delete any uploaded files retained for a session."""
+    files = SESSION_FILES.pop(sid, None)
+    if files:
+        for info in files.values():
+            info["path"].unlink(missing_ok=True)
+    _manifest_path(sid).unlink(missing_ok=True)
+
+
+def _sweep_orphan_uploads() -> None:
+    """Remove upload files not referenced by any session manifest."""
+    referenced: set[str] = set()
+    for manifest in UPLOAD_FOLDER.glob("*.manifest.json"):
+        try:
+            data = json.loads(manifest.read_text(encoding="utf-8"))
+        except Exception:
+            continue
+        for meta in data.values():
+            referenced.add(str(Path(meta.get("path", "")).resolve()))
+    for f in UPLOAD_FOLDER.iterdir():
+        if f.name.endswith(".manifest.json"):
+            continue
+        if str(f.resolve()) not in referenced:
+            f.unlink(missing_ok=True)
+
+
+_sweep_orphan_uploads()
+
 
 def _get_store(sid: str) -> VectorStore:
     """Return this session's vector store, evicting stale/overflowing sessions."""
@@ -166,13 +245,16 @@ def _get_store(sid: str) -> VectorStore:
             SESSION_ACCESS.pop(s, None)
             HASH_STORE.pop(s, None)
             (VECTOR_FOLDER / f"{s}.pkl").unlink(missing_ok=True)
+            _cleanup_session_files(s)
     if len(SESSION_ACCESS) >= MAX_SESSIONS and sid not in SESSION_ACCESS:
         oldest = min(SESSION_ACCESS, key=SESSION_ACCESS.get)
         VECTOR_STORE.pop(oldest, None)
         SESSION_ACCESS.pop(oldest, None)
         HASH_STORE.pop(oldest, None)
         (VECTOR_FOLDER / f"{oldest}.pkl").unlink(missing_ok=True)
+        _cleanup_session_files(oldest)
     SESSION_ACCESS[sid] = now
+    _load_session_manifest(sid)
 
     store = VECTOR_STORE.get(sid)
     if store is None:
@@ -772,7 +854,7 @@ def upload():
     hashes = HASH_STORE.setdefault(sid, set())
     embedding_ok = bool(OPENROUTER_API_KEY)
     results = []
-    batch_chunks: list[list[dict]] = []
+    pending: list[dict] = []
 
     for f in files:
         if not f or not allowed_file(f.filename):
@@ -794,6 +876,7 @@ def upload():
                 content_hash = hashlib.sha256(fh.read()).hexdigest()
 
             if content_hash in hashes:
+                filepath.unlink(missing_ok=True)
                 results.append({"filename": original_name, "error": "Duplicate file skipped"})
                 continue
             hashes.add(content_hash)
@@ -805,6 +888,7 @@ def upload():
                      else extract_txt_pages(str(filepath)))
 
             if not pages:
+                filepath.unlink(missing_ok=True)
                 reason = ("No extractable text (password-protected or scanned PDF?)"
                           if ext == "pdf" else "Empty file")
                 results.append({"filename": original_name, "error": reason})
@@ -812,39 +896,62 @@ def upload():
 
             new_chunks = chunk_text(doc_info, pages, chunk_mode)
             if not new_chunks:
+                filepath.unlink(missing_ok=True)
                 results.append({"filename": original_name, "error": "No chunks produced"})
                 continue
 
-            batch_chunks.append(new_chunks)
+            CHUNK_COUNTS.setdefault(sid, {})
+            for mode in ("structured", "128", "256", "512"):
+                CHUNK_COUNTS[sid][mode] = len(chunk_text(doc_info, pages, mode))
 
-            results.append({
+            pending.append({
+                "filepath": filepath,
+                "doc_id": doc_id,
                 "filename": original_name,
-                "pages": len(pages),
-                "chunks": len(new_chunks),
-                "method": chunk_mode,
+                "ext": ext,
+                "chunks": new_chunks,
+                "result": {
+                    "filename": original_name,
+                    "pages": len(pages),
+                    "chunks": len(new_chunks),
+                    "method": chunk_mode,
+                },
             })
         except Exception as exc:
-            results.append({"filename": original_name, "error": f"Failed to index: {exc}"})
-        finally:
             filepath.unlink(missing_ok=True)
+            results.append({"filename": original_name, "error": f"Failed to index: {exc}"})
 
-    if not any(r.get("chunks") for r in results):
+    if not pending:
         return jsonify({"ok": False, "error": "No valid documents were indexed.",
                         "documents": results}), 400
 
     store = _get_store(sid)
-    if embedding_ok:
+    for item in pending:
         try:
-            for new_chunks in batch_chunks:
-                vectors = embed_texts([c["text"] for c in new_chunks])
-                store.add(new_chunks, vectors)
-        except Exception as exc:
-            results.append({"filename": "(embeddings)", "error": f"Embedding failed: {exc}"})
-    else:
-        for new_chunks in batch_chunks:
-            store.add(new_chunks, [])
+            if embedding_ok:
+                vectors = embed_texts([c["text"] for c in item["chunks"]])
+            else:
+                vectors = []
+            store.add(item["chunks"], vectors)
 
-    return jsonify({"ok": True, "documents": results, "total_chunks": len(store.chunks)})
+            stored_path = UPLOAD_FOLDER / f"{sid}__{item['doc_id']}.{item['ext']}"
+            item["filepath"].replace(stored_path)
+            SESSION_FILES.setdefault(sid, {})[item["doc_id"]] = {
+                "path": stored_path,
+                "name": item["filename"],
+            }
+            _save_session_manifest(sid)
+
+            item["result"]["doc_id"] = item["doc_id"]
+            item["result"]["openable"] = True
+            results.append(item["result"])
+        except Exception as exc:
+            item["filepath"].unlink(missing_ok=True)
+            results.append({"filename": item["filename"],
+                            "error": f"Failed to index: {exc}"})
+
+    return jsonify({"ok": True, "documents": results, "total_chunks": len(store.chunks),
+                    "chunk_comparison": CHUNK_COUNTS.get(sid, {})})
 
 
 @app.route("/load-url", methods=["POST"])
@@ -892,12 +999,69 @@ def load_url():
     else:
         store.add(new_chunks, [])
 
+    CHUNK_COUNTS.setdefault(sid, {})
+    for mode in ("structured", "128", "256", "512"):
+        CHUNK_COUNTS[sid][mode] = len(chunk_text(doc_info, pages, mode))
+
     return jsonify({"ok": True, "documents": [{
         "filename": doc_info["filename"],
+        "doc_id": doc_id,
+        "openable": False,
         "pages": 1,
         "chunks": len(new_chunks),
         "method": chunk_mode,
-    }], "total_chunks": len(store.chunks)})
+    }], "total_chunks": len(store.chunks),
+        "chunk_comparison": CHUNK_COUNTS.get(sid, {})})
+
+
+@app.route("/file/<doc_id>", methods=["GET"])
+def serve_file(doc_id: str):
+    """View an uploaded document (e.g. PDF) in an HTML viewer page."""
+    sid = session.get("session_id")
+    if not sid:
+        return jsonify({"error": "No active session"}), 400
+    info = SESSION_FILES.get(sid, {}).get(doc_id)
+    if not info or not info["path"].exists():
+        return jsonify({"error": "File not found or no longer available"}), 404
+    return render_template("view.html", doc_id=doc_id, filename=info["name"])
+
+
+@app.route("/file/<doc_id>/raw", methods=["GET"])
+def serve_file_raw(doc_id: str):
+    """Stream the raw PDF bytes (used by the viewer page's embedded viewer)."""
+    sid = session.get("session_id")
+    if not sid:
+        return jsonify({"error": "No active session"}), 400
+    info = SESSION_FILES.get(sid, {}).get(doc_id)
+    if not info or not info["path"].exists():
+        return jsonify({"error": "File not found or no longer available"}), 404
+    return send_file(info["path"], download_name=info["name"], as_attachment=False)
+
+
+@app.route("/file/<doc_id>/pages", methods=["GET"])
+def serve_file_pages(doc_id: str):
+    """Return the extracted pages (for the text viewer) of an uploaded document."""
+    sid = session.get("session_id")
+    if not sid:
+        return jsonify({"error": "No active session"}), 400
+    info = SESSION_FILES.get(sid, {}).get(doc_id)
+    if not info or not info["path"].exists():
+        return jsonify({"error": "File not found or no longer available"}), 404
+
+    name = info["name"]
+    ext = (name.rsplit(".", 1)[1] if "." in name else "").lower()
+    try:
+        pages = (extract_pdf_pages(str(info["path"])) if ext == "pdf"
+                 else extract_txt_pages(str(info["path"])))
+    except Exception as exc:
+        return jsonify({"error": f"Could not read document: {exc}"}), 500
+
+    return jsonify({
+        "filename": name,
+        "ext": ext,
+        "total_pages": len(pages),
+        "pages": [{"num": i + 1, "text": p.get("text", "")} for i, p in enumerate(pages)],
+    })
 
 
 @app.route("/ask", methods=["POST"])
@@ -911,6 +1075,12 @@ def ask():
 
     if not query:
         return jsonify({"error": "Empty query"}), 400
+
+    def annotate_openable(results):
+        files = SESSION_FILES.get(sid, {})
+        for r in results:
+            r["openable"] = r["doc_id"] in files
+        return results
 
     store = _get_store(sid)
     if not store.chunks:
@@ -935,7 +1105,7 @@ def ask():
             return jsonify({
                 "found": not _is_dont_know(answer),
                 "answer": answer or "I don't know.",
-                "sources": results,
+                "sources": annotate_openable(results),
             })
         except Exception:
             pass  # fall through to TF-IDF
@@ -944,7 +1114,9 @@ def ask():
     chunks = store.chunks
     index = build_index(chunks)
     results = search_chunks(query, chunks, index, top_k=4)
-    return jsonify(synthesize_answer(query, results))
+    resp = synthesize_answer(query, results)
+    resp["sources"] = annotate_openable(resp.get("sources", []))
+    return jsonify(resp)
 
 
 @app.route("/clear", methods=["POST"])
@@ -956,13 +1128,41 @@ def clear():
             store.clear()
         SESSION_ACCESS.pop(sid, None)
         HASH_STORE.pop(sid, None)
+        _cleanup_session_files(sid)
     return jsonify({"ok": True})
+
+
+@app.route("/remove", methods=["POST"])
+def remove_doc():
+    """Remove a single document: its chunks, its retained file, and its manifest entry."""
+    sid = session.get("session_id")
+    if not sid:
+        return jsonify({"error": "No active session"}), 400
+    data = request.get_json(silent=True) or {}
+    doc_id = (data.get("doc_id") or "").strip()
+    if not doc_id:
+        return jsonify({"error": "Missing doc_id"}), 400
+
+    removed_chunks = 0
+    store = _get_store(sid)
+    if any(c["doc_id"] == doc_id for c in store.chunks):
+        removed_chunks = store.remove_doc(doc_id)
+
+    files = SESSION_FILES.get(sid, {})
+    info = files.pop(doc_id, None)
+    if info:
+        info["path"].unlink(missing_ok=True)
+    _save_session_manifest(sid)
+
+    return jsonify({"ok": True, "removed_chunks": removed_chunks})
 
 
 @app.route("/status", methods=["GET"])
 def status():
     sid = session.get("session_id")
     chunks = _get_store(sid).chunks if sid else []
+
+    session_files = SESSION_FILES.get(sid, {})
 
     docs_seen: dict[str, dict] = {}
     for c in chunks:
@@ -972,12 +1172,14 @@ def status():
                 "doc_id": c["doc_id"],
                 "chunk_count": 0,
                 "method": c["method"],
+                "openable": c["doc_id"] in session_files,
             }
         docs_seen[c["doc_id"]]["chunk_count"] += 1
 
     return jsonify({
         "total_chunks": len(chunks),
         "documents": list(docs_seen.values()),
+        "mode": "TF-IDF",
     })
 
 

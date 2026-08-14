@@ -62,6 +62,9 @@
       -webkit-font-smoothing: antialiased;
     }
 
+    /* ── Layout ──────────────────────────────────────────────── */
+    html, body { height: 100vh; overflow: hidden; }
+
     /* ── Subtle noise ─────────────────────────────────────── */
     body::before {
       content:'';
@@ -124,6 +127,13 @@
       border: 1px solid var(--border);
       border-radius: 100px;
       padding: 4px 12px;
+    }
+
+    .topbar-mode {
+      font-size: .64rem; color: var(--accent);
+      background: var(--accent-dim);
+      padding: 1px 8px; border-radius: 100px;
+      white-space: nowrap;
     }
 
     .status-dot {
@@ -190,15 +200,49 @@
 
     /* ── Chunk Mode ───────────────────────────────────────── */
     .chunk-mode-group {
-      display: flex; flex-direction: column; gap: 6px;
+      display: none; flex-direction: column; gap: 5px;
+      margin-top: 6px;
+      border: 1px solid var(--border);
+      border-radius: var(--radius-md);
+      padding: 5px;
+      background: var(--bg-surface);
+    }
+
+    .chunk-mode-group.open {
+      display: flex;
+    }
+
+    .strategy-dropdown {
+      display: flex; align-items: center; justify-content: space-between;
+      background: var(--bg-raised);
+      border: 1px solid var(--border-mid);
+      border-radius: var(--radius-md);
+      padding: 11px 13px;
+      cursor: pointer;
+      transition: all var(--ease);
+      width: 100%;
+    }
+
+    .strategy-dropdown:hover {
+      border-color: var(--accent);
+      background: var(--bg-hover);
+    }
+
+    .strategy-value {
+      font-size: .82rem; font-weight: 600;
+      color: var(--text-primary);
+    }
+
+    .strategy-caret {
+      font-size: .7rem; color: var(--text-muted);
     }
 
     .chunk-mode-btn {
       display: flex; align-items: center; gap: 10px;
-      background: var(--bg-raised);
-      border: 1px solid var(--border);
-      border-radius: var(--radius-md);
-      padding: 10px 12px;
+      background: transparent;
+      border: 1px solid transparent;
+      border-radius: var(--radius-sm);
+      padding: 8px 10px;
       cursor: pointer;
       transition: all var(--ease);
       text-align: left;
@@ -206,18 +250,18 @@
     }
 
     .chunk-mode-btn:hover {
-      border-color: var(--border-mid);
+      border-color: var(--border);
       background: var(--bg-hover);
     }
 
     .chunk-mode-btn.active {
-      border-color: hsla(142,71%,45%,.4);
       background: var(--green-dim);
+      border-color: hsla(142,71%,45%,.4);
     }
 
     .chunk-mode-btn.active.fixed-mode {
-      border-color: hsla(217,91%,60%,.4);
       background: var(--accent-dim);
+      border-color: hsla(217,91%,60%,.4);
     }
 
     .chunk-mode-radio {
@@ -251,11 +295,64 @@
     .chunk-mode-label {
       font-size: .8rem; font-weight: 600;
       color: var(--text-primary);
+      flex: 1;
     }
 
-    .chunk-mode-desc {
+    .rec-badge {
+      font-size: .6rem; font-weight: 600;
+      color: var(--green);
+      background: var(--green-dim);
+      border: 1px solid hsla(142,71%,45%,.25);
+      padding: 2px 7px; border-radius: 100px;
+      white-space: nowrap;
+    }
+
+    .compare-toggle {
+      display: flex; align-items: center; gap: 6px;
+      margin-top: 8px;
       font-size: .68rem; color: var(--text-muted);
-      margin-top: 1px;
+      cursor: pointer; user-select: none;
+      padding: 4px 6px;
+      border-radius: var(--radius-sm);
+      width: fit-content;
+      transition: color var(--ease);
+    }
+
+    .compare-toggle:hover { color: var(--accent); }
+
+    .compare-caret {
+      font-size: .62rem;
+    }
+
+    .chunk-compare {
+      display: none;
+      margin-top: 6px;
+      background: var(--bg-raised);
+      border: 1px dashed var(--border-mid);
+      border-radius: var(--radius-md);
+      padding: 10px 12px;
+    }
+
+    .chunk-compare-row {
+      display: flex; align-items: baseline; gap: 8px;
+      padding: 3px 0;
+    }
+
+    .chunk-compare-row .cc-name {
+      font-size: .66rem; font-family: var(--mono);
+      color: var(--accent); flex-shrink: 0;
+      min-width: 58px;
+    }
+
+    .chunk-compare-row .cc-desc {
+      font-size: .66rem; color: var(--text-secondary);
+      line-height: 1.4;
+    }
+
+    .chunk-compare-row .cc-count {
+      font-size: .66rem; font-family: var(--mono);
+      color: var(--green); margin-left: auto;
+      white-space: nowrap;
     }
 
     /* ── Upload Button ────────────────────────────────────── */
@@ -321,6 +418,11 @@
       color: var(--text-muted); margin-top: 2px;
     }
 
+    .doc-indexed {
+      font-size: .66rem; color: var(--green);
+      margin-top: 3px;
+    }
+
     .doc-badge {
       font-size: .6rem; font-family: var(--mono);
       padding: 2px 7px; border-radius: 100px;
@@ -328,6 +430,45 @@
       color: var(--green);
       border: 1px solid hsla(142,71%,45%,.25);
       flex-shrink: 0;
+    }
+
+    .doc-open {
+      display: inline-flex; align-items: center; justify-content: center; gap: 4px;
+      min-width: 26px; height: 26px;
+      padding: 0 8px;
+      border-radius: var(--radius-sm);
+      background: var(--bg-hover);
+      border: 1px solid var(--border);
+      color: var(--text-secondary);
+      text-decoration: none;
+      flex-shrink: 0;
+      font-size: .7rem; font-weight: 600;
+      transition: all var(--ease);
+    }
+
+    .doc-open:hover {
+      border-color: var(--accent);
+      color: var(--accent);
+      background: var(--accent-dim);
+    }
+
+    .doc-remove {
+      display: inline-flex; align-items: center; justify-content: center;
+      width: 26px; height: 26px;
+      border-radius: var(--radius-sm);
+      background: transparent;
+      border: 1px solid var(--border);
+      color: var(--text-muted);
+      cursor: pointer;
+      flex-shrink: 0;
+      font-size: .72rem;
+      transition: all var(--ease);
+    }
+
+    .doc-remove:hover {
+      border-color: var(--red);
+      color: var(--red);
+      background: var(--red-dim);
     }
 
     .sidebar-clear {
@@ -355,7 +496,30 @@
     /* ── Main ─────────────────────────────────────────────── */
     .main {
       display: flex; flex-direction: column;
-      overflow: hidden;
+      height: 100%; overflow: hidden;
+    }
+
+    /* Empty chat: keep the 4 steps + center the composer like ChatGPT */
+    .main.chat-empty {
+      justify-content: center;
+    }
+
+    .main.chat-empty .chat-area {
+      flex: 0 1 auto;
+      overflow: visible;
+      padding: 28px 32px 8px;
+    }
+
+    .main.chat-empty .empty-state {
+      flex: 0 1 auto;
+      min-height: 0;
+      padding: 20px;
+    }
+
+    .main.chat-empty .input-bar {
+      flex: 0 0 auto;
+      border-top: none;
+      align-items: center;
     }
 
     /* ── Chat Area ────────────────────────────────────────── */
@@ -363,6 +527,7 @@
       flex: 1; overflow-y: auto;
       padding: 28px 32px;
       display: flex; flex-direction: column; gap: 20px;
+      align-items: center;
     }
 
     .chat-area::-webkit-scrollbar { width: 6px; }
@@ -374,6 +539,7 @@
       align-items: center; justify-content: center;
       text-align: center; padding: 40px 20px;
       color: var(--text-muted);
+      min-height: 0;
     }
 
     .empty-icon { font-size: 3rem; margin-bottom: 16px; opacity: .6; }
@@ -401,7 +567,11 @@
       border-radius: var(--radius-md);
       padding: 10px 14px;
       font-size: .8rem; color: var(--text-secondary);
+      transition: all var(--ease);
     }
+
+    .step.done { border-color: hsla(142,71%,45%,.3); color: var(--text-primary); }
+    .step.current { border-color: var(--accent); color: var(--text-primary); box-shadow: 0 0 0 1px var(--accent-dim); }
 
     .step-num {
       width: 22px; height: 22px; border-radius: 50%;
@@ -412,8 +582,19 @@
       flex-shrink: 0;
     }
 
+    .step.done .step-num {
+      background: var(--green-dim);
+      border-color: hsla(142,71%,45%,.35);
+      color: var(--green);
+    }
+
+    .step.pending .step-num { color: var(--text-muted); opacity: .6; }
+
     /* ── Message Bubbles ──────────────────────────────────── */
-    .msg { display: flex; gap: 12px; animation: fadeIn .2s ease; }
+    .msg {
+      display: flex; gap: 12px; animation: fadeIn .2s ease;
+      width: 100%; max-width: 760px;
+    }
 
     .msg.user { flex-direction: row-reverse; }
 
@@ -481,6 +662,89 @@
       border-color: var(--border-mid);
       transform: translateY(-1px);
     }
+
+    .ctx-toggle {
+      display: inline-flex; align-items: center; gap: 6px;
+      margin-top: 8px;
+      font-size: .7rem; color: var(--accent);
+      cursor: pointer; user-select: none;
+      padding: 4px 8px;
+      border-radius: var(--radius-sm);
+      background: var(--accent-dim);
+      transition: background var(--ease);
+      width: fit-content;
+    }
+
+    .ctx-toggle:hover { background: var(--accent); color: hsl(220,40%,8%); }
+
+    .ctx-toggle-icon {
+      font-size: .66rem; transition: transform var(--ease);
+    }
+
+    .answer-label, .sources-label {
+      font-size: .66rem; font-weight: 600;
+      letter-spacing: .08em; text-transform: uppercase;
+      color: var(--text-muted);
+      margin-bottom: 5px;
+    }
+
+    .sources-label {
+      margin-top: 12px;
+    }
+
+    .not-found-hint {
+      font-size: .8rem; color: var(--text-secondary);
+      margin-top: 6px; line-height: 1.5;
+    }
+
+    .retrieval-toggle {
+      display: inline-flex; align-items: center; gap: 6px;
+      margin-top: 10px;
+      font-size: .7rem; color: var(--accent);
+      cursor: pointer; user-select: none;
+      padding: 4px 8px;
+      border-radius: var(--radius-sm);
+      background: var(--accent-dim);
+      transition: background var(--ease);
+      width: fit-content;
+    }
+
+    .retrieval-toggle:hover { background: var(--accent); color: hsl(220,40%,8%); }
+
+    .retrieval-caret { font-size: .62rem; }
+
+    .retrieved-list {
+      margin-top: 6px;
+      background: var(--bg-raised);
+      border: 1px solid var(--border);
+      border-radius: var(--radius-md);
+      padding: 10px 12px;
+    }
+
+    .retrieved-title {
+      font-size: .62rem; font-weight: 600;
+      letter-spacing: .08em; text-transform: uppercase;
+      color: var(--text-muted); margin-bottom: 6px;
+    }
+
+    .retrieved-item {
+      display: flex; align-items: baseline; gap: 6px;
+      padding: 3px 0;
+      font-size: .7rem; font-family: var(--mono);
+      color: var(--text-secondary);
+    }
+
+    .ri-num { color: var(--accent); font-weight: 700; flex-shrink: 0; }
+    .ri-file { color: var(--text-primary); overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
+    .ri-page { flex-shrink: 0; }
+    .ri-sim { margin-left: auto; color: var(--green); flex-shrink: 0; }
+
+    .source-open {
+      font-size: .68rem; color: var(--accent);
+      text-decoration: none; white-space: nowrap;
+    }
+
+    .source-open:hover { text-decoration: underline; }
 
     .source-card-top {
       display: flex; align-items: center; gap: 7px;
@@ -590,14 +854,22 @@
       border-top: 1px solid var(--border);
       background: var(--bg-surface);
       padding: 16px 24px;
-      display: flex; gap: 10px; align-items: flex-end;
+      display: flex;
+      align-items: center;
+      justify-content: center;
     }
 
     .input-wrap {
-      flex: 1; position: relative;
+      display: flex;
+      align-items: flex-end;
+      gap: 10px;
+      width: 100%;
+      max-width: 760px;
+      position: relative;
       background: var(--bg-raised);
       border: 1px solid var(--border);
-      border-radius: var(--radius-lg);
+      border-radius: var(--radius-xl);
+      padding: 8px 10px;
       transition: border-color var(--ease), box-shadow var(--ease);
     }
 
@@ -607,12 +879,12 @@
     }
 
     .chat-input {
-      width: 100%; background: transparent;
+      flex: 1; background: transparent;
       border: none; outline: none;
-      padding: 12px 16px; resize: none;
+      padding: 8px 10px; resize: none;
       font-size: .9rem; font-family: var(--font);
       color: var(--text-primary); caret-color: var(--accent);
-      min-height: 48px; max-height: 140px;
+      min-height: 40px; max-height: 140px;
       line-height: 1.5;
     }
 
@@ -621,7 +893,7 @@
     .send-btn {
       background: var(--accent);
       border: none; border-radius: var(--radius-md);
-      width: 44px; height: 44px;
+      width: 40px; height: 40px;
       display: flex; align-items: center; justify-content: center;
       cursor: pointer; flex-shrink: 0;
       transition: background var(--ease), box-shadow var(--ease), transform var(--ease);
@@ -693,6 +965,7 @@
       }
       .chat-area { padding: 16px; }
       .input-bar { padding: 12px 16px; }
+      .topbar-mode { display: none; }
     }
   </style>
 </head>
@@ -716,7 +989,8 @@
     <div class="topbar-spacer"></div>
     <div class="topbar-stat" id="topbarStat">
       <div class="status-dot" id="statusDot"></div>
-      <span id="statLabel">No documents loaded</span>
+      <span id="statLabel">Documents: 0</span>
+      <span class="topbar-mode" id="modeLabel">Retrieval: TF-IDF</span>
     </div>
   </header>
 
@@ -735,41 +1009,43 @@
 
       <!-- Chunk Mode -->
       <div style="margin-top: 14px;">
-        <div class="sidebar-label">Chunking Mode</div>
+        <div class="sidebar-label">Chunking Strategy</div>
+        <div class="strategy-dropdown" id="strategyDropdown" onclick="toggleStrategyMenu()">
+          <span class="strategy-value" id="strategyValue">Structured</span>
+          <span class="strategy-caret" id="strategyCaret">▼</span>
+        </div>
         <div class="chunk-mode-group" id="chunkModeGroup">
           <button class="chunk-mode-btn active" data-mode="structured" onclick="selectMode(this)">
             <div class="chunk-mode-radio"></div>
-            <div>
-              <div class="chunk-mode-label">✦ Structured</div>
-              <div class="chunk-mode-desc">Splits by headings & paragraphs</div>
-            </div>
-          </button>
-          <button class="chunk-mode-btn fixed-mode" data-mode="256" onclick="selectMode(this)">
-            <div class="chunk-mode-radio"></div>
-            <div>
-              <div class="chunk-mode-label">256 words (fixed)</div>
-              <div class="chunk-mode-desc">Overlapping word windows</div>
-            </div>
+            <span class="chunk-mode-label">Structured</span>
+            <span class="rec-badge">Recommended</span>
           </button>
           <button class="chunk-mode-btn fixed-mode" data-mode="128" onclick="selectMode(this)">
             <div class="chunk-mode-radio"></div>
-            <div>
-              <div class="chunk-mode-label">128 words (fixed)</div>
-              <div class="chunk-mode-desc">Smaller, more granular chunks</div>
-            </div>
+            <span class="chunk-mode-label">128 words</span>
+          </button>
+          <button class="chunk-mode-btn fixed-mode" data-mode="256" onclick="selectMode(this)">
+            <div class="chunk-mode-radio"></div>
+            <span class="chunk-mode-label">256 words</span>
           </button>
           <button class="chunk-mode-btn fixed-mode" data-mode="512" onclick="selectMode(this)">
             <div class="chunk-mode-radio"></div>
-            <div>
-              <div class="chunk-mode-label">512 words (fixed)</div>
-              <div class="chunk-mode-desc">Larger context windows</div>
-            </div>
+            <span class="chunk-mode-label">512 words</span>
           </button>
+        </div>
+        <div class="compare-toggle" onclick="toggleCompare()">
+          <span class="compare-caret">▸</span> Compare chunk sizes
+        </div>
+        <div class="chunk-compare" id="chunkCompare">
+          <div class="chunk-compare-row"><span class="cc-name">✦ Structured</span><span class="cc-desc">Preserves headings and paragraphs</span><span class="cc-count" data-strategy="structured">—</span></div>
+          <div class="chunk-compare-row"><span class="cc-name">128</span><span class="cc-desc">Smaller, more granular chunks</span><span class="cc-count" data-strategy="128">—</span></div>
+          <div class="chunk-compare-row"><span class="cc-name">256</span><span class="cc-desc">Balanced chunk size</span><span class="cc-count" data-strategy="256">—</span></div>
+          <div class="chunk-compare-row"><span class="cc-name">512</span><span class="cc-desc">Larger context per chunk</span><span class="cc-count" data-strategy="512">—</span></div>
         </div>
       </div>
 
       <button class="upload-btn" id="uploadBtn" onclick="uploadFiles()" disabled>
-        <span>⬆</span> Upload & Index
+        <span>⬆</span> Upload & Index document
       </button>
       <div class="upload-progress" id="uploadProgress">
         Indexing document…
@@ -796,10 +1072,9 @@
     </div>
 
     <!-- Uploaded Docs List -->
+    <div class="sidebar-label" id="docSectionLabel">Documents</div>
     <div class="doc-list" id="docList">
-      <div style="font-size:.75rem; color:var(--text-muted); text-align:center; padding:12px 0;">
-        No documents yet
-      </div>
+      <div style="font-size:.75rem; color:var(--text-muted); text-align:center; padding:12px 0;" data-empty>No documents loaded</div>
     </div>
 
     <div class="sidebar-clear">
@@ -815,24 +1090,24 @@
       <!-- Empty state -->
       <div class="empty-state" id="emptyState">
         <div class="empty-icon">💬</div>
-        <h2>Ask anything about your documents</h2>
-        <p>Upload one or more PDFs, then type your question below. Answers are sourced directly from your documents.</p>
+        <h2>Ask questions about your documents</h2>
+        <p>Answers are based only on your indexed documents and include source references.</p>
         <div class="empty-steps">
           <div class="step">
             <div class="step-num">1</div>
-            Drop a PDF into the sidebar
+            Upload your document
           </div>
           <div class="step">
             <div class="step-num">2</div>
-            Choose a chunking mode
+            Choose a chunking strategy
           </div>
           <div class="step">
             <div class="step-num">3</div>
-            Click "Upload &amp; Index"
+            Upload &amp; Index
           </div>
           <div class="step">
             <div class="step-num">4</div>
-            Ask your question below
+            Ask a question
           </div>
         </div>
       </div>
@@ -849,10 +1124,10 @@
           onkeydown="handleKey(event)"
           oninput="autoResize(this)"
         ></textarea>
+        <button class="send-btn" id="sendBtn" onclick="sendQuestion()" title="Send (Enter)">
+          ➤
+        </button>
       </div>
-      <button class="send-btn" id="sendBtn" onclick="sendQuestion()" title="Send (Enter)">
-        ➤
-      </button>
     </div>
 
   </main>
@@ -925,7 +1200,46 @@ function selectMode(btn) {
   document.querySelectorAll('.chunk-mode-btn').forEach(b => b.classList.remove('active'));
   btn.classList.add('active');
   currentMode = btn.dataset.mode;
+  const value = document.getElementById('strategyValue');
+  const label = btn.querySelector('.chunk-mode-label').textContent.trim();
+  value.textContent = label;
+  closeStrategyMenu();
 }
+
+function toggleStrategyMenu() {
+  document.getElementById('chunkModeGroup').classList.toggle('open');
+  document.getElementById('strategyCaret').textContent =
+    document.getElementById('chunkModeGroup').classList.contains('open') ? '▲' : '▼';
+}
+
+function closeStrategyMenu() {
+  document.getElementById('chunkModeGroup').classList.remove('open');
+  document.getElementById('strategyCaret').textContent = '▼';
+}
+
+function toggleCompare() {
+  const panel = document.getElementById('chunkCompare');
+  const caret = document.querySelector('.compare-caret');
+  const open = panel.style.display !== 'none';
+  panel.style.display = open ? 'none' : 'block';
+  caret.textContent = open ? '▸' : '▾';
+}
+
+function updateChunkComparison(data) {
+  if (!data) return;
+  document.querySelectorAll('.cc-count').forEach(el => {
+    const n = data[el.dataset.strategy];
+    el.textContent = (typeof n === 'number' && n > 0) ? n + ' chunks' : '—';
+  });
+}
+
+document.addEventListener('click', (e) => {
+  const group = document.getElementById('chunkModeGroup');
+  const dropdown = document.getElementById('strategyDropdown');
+  if (group.classList.contains('open') && dropdown && !dropdown.contains(e.target) && !group.contains(e.target)) {
+    closeStrategyMenu();
+  }
+});
 
 // ─────────────────────────────────────────────────────────────────────────────
 //  Upload & Index
@@ -964,9 +1278,11 @@ async function uploadFiles() {
       });
       chunkCount = data.total_chunks;
       updateStatus();
+      updateChunkComparison(data.chunk_comparison);
       if (indexed > 0) {
         showToast(`✅ Indexed ${indexed} doc(s) → ${data.total_chunks} chunks`, 'success');
       }
+      if (indexed > 0) markSteps(3);
       // Reset dropzone
       dropzone.querySelector('.dropzone-title').textContent = 'Drop files here';
       dropzone.querySelector('.dropzone-sub').textContent = 'PDF, TXT, or Markdown';
@@ -1006,6 +1322,8 @@ async function loadUrl() {
     });
     chunkCount = data.total_chunks;
     updateStatus();
+    updateChunkComparison(data.chunk_comparison);
+    if ((data.documents || []).length > 0) markSteps(3);
     showToast(`✅ Indexed ${data.documents.length} doc(s) → ${data.total_chunks} chunks`, 'success');
     input.value = '';
   } catch (err) {
@@ -1022,16 +1340,30 @@ function addDocToList(doc) {
 
   const ext = doc.filename.split('.').pop().toUpperCase();
   const icon = ext === 'PDF' ? '📕' : '📄';
-  const modeLabel = doc.method === 'structured' ? '✦ structured' : `${doc.method}-word`;
+
+  const openLink = doc.openable && doc.doc_id
+    ? `<a class="doc-open" href="#" onclick="openDoc('${encodeURIComponent(doc.doc_id)}'); return false;" title="Open ${doc.filename} in a new tab">Open ↗</a>`
+    : '';
+
+  const removeBtn = doc.doc_id
+    ? `<button class="doc-remove" onclick="removeDoc('${encodeURIComponent(doc.doc_id)}')" title="Remove ${doc.filename} and its chunks">✕</button>`
+    : '';
+
+  const strategyLabel = doc.method === 'structured' ? 'Structured' : `${doc.method}-word`;
 
   const item = document.createElement('div');
   item.className = 'doc-item';
+  item.dataset.docId = doc.doc_id || '';
+  item.dataset.chunks = doc.chunks || 0;
   item.innerHTML = `
     <div class="doc-icon">${icon}</div>
     <div class="doc-info">
       <div class="doc-name" title="${doc.filename}">${doc.filename}</div>
-      <div class="doc-meta">${doc.pages} pages · ${doc.chunks} chunks · ${modeLabel}</div>
+      <div class="doc-meta">${doc.pages} pages · ${doc.chunks} chunks</div>
+      <div class="doc-indexed">${strategyLabel} ✓ · Indexed ✓</div>
     </div>
+    ${openLink}
+    ${removeBtn}
     <div class="doc-badge">${ext}</div>
   `;
   list.appendChild(item);
@@ -1045,12 +1377,15 @@ function addDocToList(doc) {
 function updateStatus() {
   const dot = document.getElementById('statusDot');
   const label = document.getElementById('statLabel');
-  if (chunkCount > 0) {
+  const docSection = document.getElementById('docSectionLabel');
+  if (docCount > 0) {
     dot.classList.add('active');
-    label.textContent = `${chunkCount} chunks · ${docCount} doc${docCount !== 1 ? 's' : ''} loaded`;
+    label.textContent = `Documents: ${docCount}`;
+    if (docSection) docSection.textContent = `Documents (${docCount})`;
   } else {
     dot.classList.remove('active');
-    label.textContent = 'No documents loaded';
+    label.textContent = 'Documents: 0';
+    if (docSection) docSection.textContent = 'Documents';
   }
 }
 
@@ -1061,11 +1396,49 @@ function updateStatus() {
 async function clearDocs() {
   await fetch('/clear', { method: 'POST' });
   document.getElementById('docList').innerHTML =
-    `<div style="font-size:.75rem;color:var(--text-muted);text-align:center;padding:12px 0;" data-empty>No documents yet</div>`;
+    `<div style="font-size:.75rem;color:var(--text-muted);text-align:center;padding:12px 0;" data-empty>No documents loaded</div>`;
   docCount = 0;
   chunkCount = 0;
   updateStatus();
   showToast('All documents cleared.', 'success');
+}
+
+function openDoc(docId, pageNum, hlQuery) {
+  const params = new URLSearchParams();
+  if (pageNum) params.append('page', pageNum);
+  if (hlQuery) params.append('hl', hlQuery);
+  const url = `/file/${docId}${
+    params.toString() ? '?' + params.toString() : ''
+  }`;
+  window.open(url, '_blank');
+}
+
+async function removeDoc(docId) {
+  const item = document.querySelector(`.doc-item[data-doc-id="${docId}"]`);
+  const chunks = item ? parseInt(item.dataset.chunks || '0', 10) : 0;
+  try {
+    const res = await fetch('/remove', {
+      method: 'POST',
+      headers: { 'Content-Type': 'application/json' },
+      body: JSON.stringify({ doc_id: docId }),
+    });
+    const data = await res.json();
+    if (!res.ok || !data.ok) {
+      showToast(data.error || 'Failed to remove document', 'error');
+      return;
+    }
+    if (item) item.remove();
+    docCount = Math.max(0, docCount - 1);
+    chunkCount = Math.max(0, chunkCount - chunks);
+    if (!document.querySelector('.doc-item')) {
+      document.getElementById('docList').innerHTML =
+    `<div style="font-size:.75rem;color:var(--text-muted);text-align:center;padding:12px 0;" data-empty>No documents loaded</div>`;
+    }
+    updateStatus();
+    showToast(`Removed document and ${data.removed_chunks} chunk(s).`, 'success');
+  } catch (err) {
+    showToast('Error: ' + err.message, 'error');
+  }
 }
 
 // ─────────────────────────────────────────────────────────────────────────────
@@ -1089,6 +1462,29 @@ function hideEmptyState() {
   if (es) es.remove();
 }
 
+function setChatEmpty(empty) {
+  document.querySelector('.main').classList.toggle('chat-empty', empty);
+}
+
+function markSteps(done) {
+  const steps = document.querySelectorAll('.empty-state .step');
+  steps.forEach((step, idx) => {
+    const num = step.querySelector('.step-num');
+    const i = idx + 1;
+    step.classList.remove('done', 'current', 'pending');
+    if (i <= done) {
+      num.textContent = '✓';
+      step.classList.add('done');
+    } else if (i === done + 1) {
+      num.textContent = '●';
+      step.classList.add('current');
+    } else {
+      num.textContent = '○';
+      step.classList.add('pending');
+    }
+  });
+}
+
 async function sendQuestion() {
   const input = document.getElementById('chatInput');
   const query = input.value.trim();
@@ -1097,6 +1493,7 @@ async function sendQuestion() {
   input.value = '';
   input.style.height = 'auto';
   hideEmptyState();
+  setChatEmpty(false);
 
   // Add user message
   appendMessage('user', query);
@@ -1145,6 +1542,7 @@ function appendMessage(role, text) {
   `;
   chatArea.appendChild(msg);
   chatArea.scrollTop = chatArea.scrollHeight;
+  setChatEmpty(false);
 }
 
 function appendThinking(id) {
@@ -1171,13 +1569,14 @@ function appendAnswer(data) {
   const msg = document.createElement('div');
   msg.className = 'msg bot';
 
-  const statusHtml = `
-    <div class="msg-status ${data.found ? 'found' : 'not-found'}">
-      ${data.found ? '✅ Found in documents' : '🤷 Not in documents'}
-    </div>`;
+  const answerHtml = data.found
+    ? `<div class="msg-bubble">${formatAnswer(data.answer)}</div>`
+    : `<div class="msg-status not-found">🤷 Not in the documents.</div>
+       <div class="not-found-hint">I couldn't find this information in the indexed documents.<br>Try asking a question related to the uploaded content.</div>`;
 
   const sourcesHtml = (data.sources || []).length > 0 ? `
-    <div class="source-grid" style="margin-top:2px;">
+    <div class="sources-label">Sources</div>
+    <div class="source-grid">
       ${data.sources.map(s => {
         const sectionHtml = s.section
           ? `<div class="source-section">
@@ -1189,6 +1588,9 @@ function appendAnswer(data) {
         const pageLabel = (s.page_end && s.page_end !== s.page)
           ? `Page ${s.page}–${s.page_end}`
           : `Page ${s.page}`;
+const openLink = s.openable && s.doc_id
+      ? `<a class="source-open" href="#" onclick="openDoc('${encodeURIComponent(s.doc_id)}', ${s.page}, '${escapeHtml(s.text.substring(0, 60).replace(/[<>&"']/g, '')}')"); return false;" title="Open ${escapeHtml(s.filename)} in a new tab">Open ↗</a>`
+      : '';
         return `
           <div class="source-card">
             <div class="source-card-top">
@@ -1196,7 +1598,7 @@ function appendAnswer(data) {
               <span class="source-score">${Math.round(s.score * 100)}%</span>
             </div>
             ${sectionHtml}
-            <div class="source-page">📄 ${pageLabel}</div>
+            <div class="source-page">📄 ${pageLabel}${openLink ? ' &nbsp;·&nbsp; ' + openLink : ''}</div>
             <div class="source-excerpt" style="margin-top:5px;">${escapeHtml(s.text.substring(0, 180))}…</div>
             <div class="score-bar" style="margin-top:6px;">
               <div class="score-bar-fill" style="width:${pct}%"></div>
@@ -1205,17 +1607,40 @@ function appendAnswer(data) {
       }).join('')}
     </div>` : '';
 
+  const retrievedHtml = (data.sources || []).length > 0 ? `
+    <div class="retrieval-toggle" onclick="toggleRetrieved(this)">
+      <span class="retrieval-caret">▸</span> View retrieved context
+    </div>
+    <div class="retrieved-list" style="display:none;">
+      <div class="retrieved-title">Retrieved chunks</div>
+      ${data.sources.map((s, i) => `
+        <div class="retrieved-item">
+          <span class="ri-num">${i + 1}.</span>
+          <span class="ri-file" title="${escapeHtml(s.filename)}">${escapeHtml(s.filename)}</span>
+          <span class="ri-page">— Page ${s.page}</span>
+          <span class="ri-sim">Similarity: ${Number(s.score).toFixed(2)}</span>
+        </div>`).join('')}
+    </div>` : '';
+
   msg.innerHTML = `
     <div class="msg-avatar">🤖</div>
     <div class="msg-body">
-      ${statusHtml}
-      <div class="msg-bubble">${formatAnswer(data.answer)}</div>
+      <div class="answer-label">Answer</div>
+      ${answerHtml}
       ${sourcesHtml}
+      ${retrievedHtml}
     </div>
   `;
 
   chatArea.appendChild(msg);
   chatArea.scrollTop = chatArea.scrollHeight;
+}
+
+function toggleRetrieved(el) {
+  const list = el.nextElementSibling;
+  const open = list.style.display !== 'none';
+  list.style.display = open ? 'none' : 'block';
+  el.querySelector('.retrieval-caret').textContent = open ? '▸' : '▾';
 }
 
 // ─────────────────────────────────────────────────────────────────────────────
@@ -1250,21 +1675,27 @@ function showToast(msg, type = '') {
 // ─────────────────────────────────────────────────────────────────────────────
 
 (async () => {
+  setChatEmpty(true);
+  markSteps(0);
   try {
     const res = await fetch('/status');
     const data = await res.json();
+    const modeEl = document.getElementById('modeLabel');
+    if (modeEl && data.mode) modeEl.textContent = 'Retrieval: ' + data.mode;
     if (data.total_chunks > 0) {
       chunkCount = data.total_chunks;
       data.documents.forEach(doc => {
         addDocToList({
           filename: doc.filename,
+          doc_id: doc.doc_id,
+          openable: doc.openable,
           pages: '?',
           chunks: doc.chunk_count,
           method: doc.method,
         });
       });
-      updateStatus();
     }
+    updateStatus();
   } catch (_) {}
 })();
 </script>

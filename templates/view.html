@@ -1,0 +1,390 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+  <meta charset="UTF-8" />
+  <meta name="viewport" content="width=device-width, initial-scale=1.0"/>
+  <title>Open document — {{ filename }}</title>
+  <link rel="preconnect" href="https://fonts.googleapis.com"/>
+  <link rel="preconnect" href="https://fonts.gstatic.com" crossorigin/>
+  <link href="https://fonts.googleapis.com/css2?family=Inter:wght@400;500;600;700&family=JetBrains+Mono:wght@400;500&display=swap" rel="stylesheet"/>
+  <style>
+    *,*::before,*::after { box-sizing: border-box; margin: 0; padding: 0; }
+    :root {
+      --bg:           hsl(220, 16%, 8%);
+      --bg-surface:   hsl(220, 14%, 11%);
+      --bg-raised:    hsl(220, 13%, 14%);
+      --border:       hsl(220, 12%, 20%);
+      --text-primary: hsl(220, 20%, 94%);
+      --text-secondary: hsl(220, 12%, 60%);
+      --text-muted:   hsl(220, 10%, 42%);
+      --accent:       hsl(217, 91%, 60%);
+      --accent-dim:   hsla(217, 91%, 60%, 0.14);
+      --accent-hover: hsl(217, 91%, 68%);
+      --red:          hsl(0, 84%, 60%);
+      --red-dim:      hsla(0, 84%, 60%, 0.12);
+      --green:        hsl(142, 71%, 45%);
+      --green-dim:    hsla(142, 71%, 45%, 0.12);
+      --hl:           hsla(48, 100%, 60%, 0.35);
+      --radius-sm: 6px; --radius-md: 10px;
+      --font: 'Inter', system-ui, sans-serif;
+      --mono: 'JetBrains Mono', monospace;
+      --ease: 180ms cubic-bezier(.4,0,.2,1);
+    }
+    html, body { height: 100%; }
+    body {
+      font-family: var(--font);
+      background: var(--bg);
+      color: var(--text-primary);
+      display: flex; flex-direction: column;
+    }
+    header {
+      display: flex; align-items: center; gap: 12px;
+      padding: 0 20px; height: 58px;
+      background: var(--bg-surface);
+      border-bottom: 1px solid var(--border);
+      flex-shrink: 0;
+    }
+    .back-btn {
+      display: inline-flex; align-items: center; gap: 6px;
+      background: transparent;
+      border: 1px solid var(--border);
+      border-radius: var(--radius-md);
+      padding: 7px 12px;
+      font-size: .78rem; font-weight: 600;
+      font-family: var(--font);
+      color: var(--text-secondary);
+      cursor: pointer;
+      text-decoration: none;
+      transition: all var(--ease);
+      flex-shrink: 0;
+    }
+    .back-btn:hover {
+      border-color: var(--accent);
+      color: var(--text-primary);
+      background: var(--accent-dim);
+    }
+    .badge {
+      display: inline-flex; align-items: center; gap: 8px;
+      font-size: .72rem; font-family: var(--mono);
+      color: var(--green);
+      background: var(--green-dim);
+      border: 1px solid hsla(142,71%,45%,.25);
+      border-radius: 100px;
+      padding: 4px 12px;
+      flex-shrink: 0;
+    }
+    .badge-icon { font-size: .8rem; }
+    .filename {
+      flex: 1; min-width: 0;
+      font-size: .85rem; font-weight: 600;
+      white-space: nowrap; overflow: hidden; text-overflow: ellipsis;
+    }
+    .page-indicator {
+      font-size: .7rem; font-family: var(--mono);
+      color: var(--text-muted);
+      white-space: nowrap;
+      display: none;
+      align-items: center; gap: 6px;
+    }
+    .page-nav {
+      display: none;
+      align-items: center; gap: 6px;
+      background: var(--bg-raised);
+      border: 1px solid var(--border);
+      border-radius: var(--radius-md);
+      padding: 4px 8px;
+    }
+    .page-nav button {
+      background: transparent; border: none;
+      color: var(--text-secondary);
+      font-size: .8rem; cursor: pointer;
+      padding: 2px 6px; border-radius: var(--radius-sm);
+      font-family: var(--font);
+    }
+    .page-nav button:hover { color: var(--accent); background: var(--accent-dim); }
+    .page-nav span {
+      font-size: .68rem; font-family: var(--mono);
+      color: var(--text-muted); min-width: 60px; text-align: center;
+    }
+    .toolbar-right {
+      display: flex; align-items: center; gap: 8px;
+      flex-shrink: 0;
+    }
+    .search-box {
+      display: none;
+      align-items: center; gap: 6px;
+      background: var(--bg-raised);
+      border: 1px solid var(--border);
+      border-radius: 100px;
+      padding: 4px 6px 4px 10px;
+    }
+    .search-box input {
+      background: transparent; border: none; outline: none;
+      font-family: var(--font); font-size: .75rem;
+      color: var(--text-primary); width: 150px;
+    }
+    .search-box input::placeholder { color: var(--text-muted); }
+    .search-box button {
+      background: var(--accent); border: none;
+      border-radius: 50%; width: 22px; height: 22px;
+      color: hsl(220,40%,8%); font-size: .7rem;
+      cursor: pointer; font-weight: 700;
+    }
+    .search-count {
+      font-size: .64rem; font-family: var(--mono);
+      color: var(--green); min-width: 90px;
+    }
+    .zoom-group {
+      display: none;
+      align-items: center; gap: 4px;
+      background: var(--bg-raised);
+      border: 1px solid var(--border);
+      border-radius: var(--radius-md);
+      padding: 3px 6px;
+    }
+    .zoom-group button {
+      background: transparent; border: none;
+      color: var(--text-secondary);
+      font-size: .85rem; cursor: pointer;
+      padding: 0 6px; font-family: var(--font);
+    }
+    .zoom-group button:hover { color: var(--accent); }
+    .zoom-group span {
+      font-size: .66rem; font-family: var(--mono);
+      color: var(--text-muted); min-width: 42px; text-align: center;
+    }
+    .close-btn {
+      display: inline-flex; align-items: center; gap: 6px;
+      background: var(--red-dim);
+      border: 1px solid hsla(0, 84%, 60%, .4);
+      border-radius: var(--radius-md);
+      padding: 8px 16px;
+      font-size: .8rem; font-weight: 600;
+      font-family: var(--font);
+      color: var(--red);
+      cursor: pointer;
+      text-decoration: none;
+      transition: all var(--ease);
+      flex-shrink: 0;
+    }
+    .close-btn:hover { background: var(--red); color: hsl(0, 0%, 100%); }
+    .close-btn:active { transform: scale(.97); }
+
+    main {
+      flex: 1; min-height: 0;
+      overflow-y: auto;
+      padding: 20px;
+      display: flex; flex-direction: column;
+      align-items: center;
+      gap: 14px;
+    }
+    .pdf-frame {
+      width: 100%; height: 100%;
+      border: 1px solid var(--border);
+      border-radius: var(--radius-md);
+      background: var(--bg-raised);
+      display: none;
+    }
+    .doc-page {
+      display: none;
+      width: 100%; max-width: 820px;
+      background: hsl(220, 30%, 96%);
+      color: hsl(220, 30%, 14%);
+      border: 1px solid var(--border);
+      border-radius: var(--radius-md);
+      padding: 34px 40px;
+      font-size: .95rem; line-height: 1.7;
+      white-space: pre-wrap;
+      word-wrap: break-word;
+      box-shadow: 0 8px 30px rgba(0,0,0,.35);
+    }
+    .doc-page mark {
+      background: var(--hl);
+      color: inherit;
+      border-radius: 2px;
+      padding: 0 1px;
+    }
+    .doc-page .page-tag {
+      display: block;
+      text-align: right;
+      font-size: .7rem; font-family: var(--mono);
+      color: hsl(220, 20%, 45%);
+      margin-bottom: 10px;
+      border-bottom: 1px solid hsl(220, 20%, 85%);
+      padding-bottom: 6px;
+    }
+    .status-line {
+      display: none;
+      font-size: .74rem; color: var(--text-muted);
+    }
+    .viewer-empty {
+      text-align: center; color: var(--text-muted);
+      font-size: .85rem; margin: auto;
+    }
+  </style>
+</head>
+<body>
+  <header>
+    <button class="back-btn" onclick="goBack()">← Back</button>
+    <span class="badge"><span class="badge-icon">📄</span> Open document</span>
+    <span class="filename" id="filename" title="{{ filename }}">{{ filename }}</span>
+
+    <div class="page-nav" id="pageNav">
+      <button onclick="prevPage()">←</button>
+      <span id="pageInfo">Page 1 of 1</span>
+      <button onclick="nextPage()">→</button>
+    </div>
+
+    <div class="toolbar-right">
+      <div class="search-box" id="searchBox">
+        <input id="searchInput" type="text" placeholder="🔍 Search in document…"
+               onkeydown="if(event.key==='Enter'){event.preventDefault();searchDoc();}"/>
+        <button onclick="searchDoc()" title="Search">↵</button>
+      </div>
+      <span class="search-count" id="searchCount"></span>
+      <div class="zoom-group" id="zoomGroup">
+        <button onclick="zoomDoc(-0.1)">−</button>
+        <span id="zoomPct">100%</span>
+        <button onclick="zoomDoc(0.1)">+</button>
+      </div>
+    </div>
+
+    <a class="close-btn" href="#" onclick="window.close(); return false;" title="Close this document view">
+      <span>✕</span> Close
+    </a>
+  </header>
+
+  <main id="main">
+    <div class="status-line" id="statusLine"></div>
+  </main>
+</body>
+<script>
+  const DOC_ID = {{ doc_id|tojson }};
+  const INIT_PAGE = new URLSearchParams(location.search).get('page');
+  let HL_QUERY = new URLSearchParams(location.search).get('hl');
+  const MAIN = document.getElementById('main');
+  const pageNav = document.getElementById('pageNav');
+  const searchBox = document.getElementById('searchBox');
+  const searchCount = document.getElementById('searchCount');
+  const zoomGroup = document.getElementById('zoomGroup');
+  const pageInfo = document.getElementById('pageInfo');
+
+  let pages = [];
+  let curPage = 1;
+  let zoom = 1;
+
+  function goBack() {
+    if (history.length > 1) { history.back(); } else { window.close(); }
+  }
+
+  function escapeHtml(str) {
+    return String(str)
+      .replace(/&/g, '&amp;')
+      .replace(/</g, '&lt;')
+      .replace(/>/g, '&gt;')
+      .replace(/"/g, '&quot;');
+  }
+
+  function highlightText(text, query) {
+    if (!query) return escapeHtml(text);
+    const q = query.replace(/[.*+?^${}()|[\]\\]/g, '\\$&');
+    const re = new RegExp('(' + q + ')', 'ig');
+    return escapeHtml(text).replace(re, '<mark>$1</mark>');
+  }
+
+function renderTextPage() {
+    const p = pages[curPage - 1];
+    if (!p) return;
+    const el = document.createElement('div');
+    el.className = 'doc-page';
+    el.style.display = 'block';
+    el.style.transform = 'scale(' + zoom + ')';
+    el.style.transformOrigin = 'top center';
+    const ext = '{{ ext|tojson }}';
+    const pageLabel = ext === 'pdf' ? 'Page ' : 'Section ';
+    el.innerHTML = '<span class="page-tag">' + pageLabel + p.num + ' of ' + pages.length + '</span>' +
+      highlightText(p.text, HL_QUERY || '');
+    MAIN.innerHTML = '';
+    MAIN.appendChild(el);
+    pageInfo.textContent = pageLabel + p.num + ' of ' + pages.length;
+    if (HL_QUERY) {
+      const m = el.querySelector('mark');
+      if (m) {
+        m.scrollIntoView({ block: 'center', behavior: 'smooth' });
+        m.animate([{ backgroundColor: 'var(--hl)' }, { backgroundColor: 'transparent' }], { duration: 2500 });
+      }
+    }
+  }
+    }
+  }
+
+  function showPdf() {
+    MAIN.innerHTML = '<embed class="pdf-frame" type="application/pdf" src="/file/' + DOC_ID + '/raw"/>';
+    const emb = MAIN.querySelector('embed');
+    emb.style.display = 'block';
+    emb.style.transform = 'scale(' + zoom + ')';
+    emb.style.transformOrigin = 'top center';
+    emb.style.width = (100 / zoom) + '%';
+    emb.style.height = (100 / zoom) + '%';
+    pageInfo.textContent = 'PDF document';
+  }
+
+  function prevPage() { if (curPage > 1) { curPage--; renderTextPage(); } }
+  function nextPage() { if (curPage < pages.length) { curPage++; renderTextPage(); } }
+
+  function zoomDoc(delta) {
+    zoom = Math.min(2, Math.max(0.5, zoom + delta));
+    document.getElementById('zoomPct').textContent = Math.round(zoom * 100) + '%';
+    if (pages.length > 0) renderTextPage();
+    else showPdf();
+  }
+
+  function searchDoc() {
+    const q = document.getElementById('searchInput').value.trim();
+    if (!q || pages.length === 0) return;
+    const results = [];
+    pages.forEach((p, idx) => {
+      const re = new RegExp(q.replace(/[.*+?^${}()|[\]\\]/g, '\\$&'), 'ig');
+      const matches = p.text.match(re);
+      if (matches) results.push({ idx: idx + 1, count: matches.length });
+    });
+    searchCount.textContent = 'Results: ' + results.reduce((a, r) => a + r.count, 0) + ' matches';
+    if (results.length > 0) {
+      curPage = results[0].idx;
+      HL_QUERY = q;
+      renderTextPage();
+    }
+  }
+
+  (async () => {
+    try {
+      const res = await fetch('/file/' + DOC_ID + '/pages');
+      const data = await res.json();
+      if (!res.ok || !data.pages) {
+        MAIN.innerHTML = '<div class="viewer-empty">' + escapeHtml(data.error || 'Could not read document') + '</div>';
+        return;
+      }
+      pages = data.pages;
+      const isPdf = data.ext === 'pdf';
+      document.getElementById('statusLine').style.display = 'none';
+
+      if (isPdf) {
+        pageNav.style.display = 'none';
+        searchBox.style.display = 'none';
+        searchCount.style.display = 'none';
+        zoomGroup.style.display = 'flex';
+        showPdf();
+      } else {
+        pageNav.style.display = 'flex';
+        searchBox.style.display = 'flex';
+        zoomGroup.style.display = 'flex';
+        if (INIT_PAGE && INIT_PAGE > 0 && INIT_PAGE <= pages.length) curPage = parseInt(INIT_PAGE, 10);
+        renderTextPage();
+      }
+    } catch (e) {
+      MAIN.innerHTML = '<div class="viewer-empty">Could not load document.</div>';
+    }
+  })();
+</script>
+</body>
+</html>
