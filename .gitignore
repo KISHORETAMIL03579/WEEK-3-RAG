@@ -1,0 +1,6 @@
+.env
+vectorstore/
+uploads/
+__pycache__/
+server.log
+server.err.log

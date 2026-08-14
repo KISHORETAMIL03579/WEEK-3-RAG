@@ -1,0 +1,1272 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+  <meta charset="UTF-8" />
+  <meta name="viewport" content="width=device-width, initial-scale=1.0"/>
+  <title>Ask My Docs — PDF Question Answering</title>
+  <meta name="description" content="Upload PDF documents and ask questions. Answers are sourced directly from your documents using structured chunking and TF-IDF retrieval."/>
+  <link rel="preconnect" href="https://fonts.googleapis.com"/>
+  <link rel="preconnect" href="https://fonts.gstatic.com" crossorigin/>
+  <link href="https://fonts.googleapis.com/css2?family=Inter:wght@300;400;500;600;700&family=JetBrains+Mono:wght@400;500&display=swap" rel="stylesheet"/>
+  <style>
+    /* ── Tokens ───────────────────────────────────────────── */
+    :root {
+      --bg:           hsl(220, 16%, 8%);
+      --bg-surface:   hsl(220, 14%, 11%);
+      --bg-raised:    hsl(220, 13%, 14%);
+      --bg-hover:     hsl(220, 12%, 17%);
+      --border:       hsl(220, 12%, 20%);
+      --border-mid:   hsl(220, 10%, 26%);
+
+      --text-primary:   hsl(220, 20%, 94%);
+      --text-secondary: hsl(220, 12%, 60%);
+      --text-muted:     hsl(220, 10%, 42%);
+
+      --accent:         hsl(217, 91%, 60%);
+      --accent-dim:     hsla(217, 91%, 60%, 0.14);
+      --accent-glow:    hsla(217, 91%, 60%, 0.08);
+      --accent-hover:   hsl(217, 91%, 68%);
+
+      --green:          hsl(142, 71%, 45%);
+      --green-dim:      hsla(142, 71%, 45%, 0.12);
+      --amber:          hsl(38, 92%, 55%);
+      --amber-dim:      hsla(38, 92%, 55%, 0.12);
+      --red:            hsl(0, 84%, 60%);
+      --red-dim:        hsla(0, 84%, 60%, 0.12);
+      --purple:         hsl(270, 70%, 65%);
+      --purple-dim:     hsla(270, 70%, 65%, 0.12);
+
+      --radius-sm:  6px;
+      --radius-md:  10px;
+      --radius-lg:  14px;
+      --radius-xl:  20px;
+
+      --shadow-sm: 0 1px 3px hsla(0,0%,0%,.3);
+      --shadow-md: 0 4px 14px hsla(0,0%,0%,.35);
+      --shadow-lg: 0 12px 40px hsla(0,0%,0%,.5);
+
+      --font: 'Inter', system-ui, sans-serif;
+      --mono: 'JetBrains Mono', monospace;
+      --ease: 180ms cubic-bezier(.4,0,.2,1);
+    }
+
+    /* ── Reset ────────────────────────────────────────────── */
+    *,*::before,*::after { box-sizing:border-box; margin:0; padding:0; }
+    html { font-size:16px; scroll-behavior:smooth; }
+    body {
+      font-family: var(--font);
+      background: var(--bg);
+      color: var(--text-primary);
+      min-height: 100vh;
+      line-height: 1.6;
+      -webkit-font-smoothing: antialiased;
+    }
+
+    /* ── Subtle noise ─────────────────────────────────────── */
+    body::before {
+      content:'';
+      position:fixed; inset:0;
+      background-image: url("data:image/svg+xml,%3Csvg viewBox='0 0 200 200' xmlns='http://www.w3.org/2000/svg'%3E%3Cfilter id='n'%3E%3CfeTurbulence type='fractalNoise' baseFrequency='0.85' numOctaves='4' stitchTiles='stitch'/%3E%3C/filter%3E%3Crect width='100%25' height='100%25' filter='url(%23n)' opacity='0.04'/%3E%3C/svg%3E");
+      pointer-events:none; z-index:0;
+    }
+
+    /* ── Layout ───────────────────────────────────────────── */
+    .layout {
+      position: relative; z-index:1;
+      display: grid;
+      grid-template-columns: 300px 1fr;
+      grid-template-rows: auto 1fr;
+      min-height: 100vh;
+    }
+
+    /* ── Top Bar ──────────────────────────────────────────── */
+    .topbar {
+      grid-column: 1 / -1;
+      display: flex;
+      align-items: center;
+      gap: 14px;
+      padding: 0 28px;
+      height: 60px;
+      border-bottom: 1px solid var(--border);
+      background: var(--bg-surface);
+    }
+
+    .topbar-logo {
+      display: flex; align-items: center; gap: 10px;
+    }
+
+    .logo-icon {
+      width: 32px; height: 32px;
+      background: var(--accent-dim);
+      border: 1px solid hsla(217,91%,60%,.3);
+      border-radius: var(--radius-md);
+      display: flex; align-items: center; justify-content: center;
+      font-size: 15px;
+    }
+
+    .logo-name {
+      font-size: .95rem; font-weight: 600;
+      letter-spacing: -.02em; color: var(--text-primary);
+    }
+
+    .logo-version {
+      font-size: .68rem; font-family: var(--mono);
+      color: var(--text-muted); margin-left: 2px;
+    }
+
+    .topbar-spacer { flex: 1; }
+
+    .topbar-stat {
+      display: flex; align-items: center; gap: 6px;
+      font-size: .72rem; font-family: var(--mono);
+      color: var(--text-secondary);
+      background: var(--bg-raised);
+      border: 1px solid var(--border);
+      border-radius: 100px;
+      padding: 4px 12px;
+    }
+
+    .status-dot {
+      width: 6px; height: 6px; border-radius: 50%;
+      background: var(--text-muted);
+      transition: background var(--ease), box-shadow var(--ease);
+    }
+    .status-dot.active {
+      background: var(--green);
+      box-shadow: 0 0 6px var(--green);
+    }
+
+    /* ── Sidebar ──────────────────────────────────────────── */
+    .sidebar {
+      border-right: 1px solid var(--border);
+      background: var(--bg-surface);
+      display: flex; flex-direction: column;
+      overflow: hidden;
+    }
+
+    .sidebar-section {
+      padding: 20px;
+      border-bottom: 1px solid var(--border);
+    }
+
+    .sidebar-label {
+      font-size: .65rem; font-weight: 600;
+      letter-spacing: .1em; text-transform: uppercase;
+      color: var(--text-muted); margin-bottom: 12px;
+    }
+
+    /* ── Drop Zone ────────────────────────────────────────── */
+    .dropzone {
+      border: 1.5px dashed var(--border-mid);
+      border-radius: var(--radius-lg);
+      padding: 24px 16px;
+      text-align: center;
+      cursor: pointer;
+      transition: all var(--ease);
+      background: var(--bg-raised);
+      position: relative;
+    }
+
+    .dropzone:hover, .dropzone.drag-over {
+      border-color: var(--accent);
+      background: var(--accent-glow);
+    }
+
+    .dropzone input[type="file"] {
+      position: absolute; inset: 0;
+      opacity: 0; cursor: pointer; width: 100%; height: 100%;
+    }
+
+    .dropzone-icon { font-size: 1.8rem; margin-bottom: 8px; }
+
+    .dropzone-title {
+      font-size: .82rem; font-weight: 600;
+      color: var(--text-primary); margin-bottom: 3px;
+    }
+
+    .dropzone-sub {
+      font-size: .72rem; color: var(--text-muted);
+    }
+
+    /* ── Chunk Mode ───────────────────────────────────────── */
+    .chunk-mode-group {
+      display: flex; flex-direction: column; gap: 6px;
+    }
+
+    .chunk-mode-btn {
+      display: flex; align-items: center; gap: 10px;
+      background: var(--bg-raised);
+      border: 1px solid var(--border);
+      border-radius: var(--radius-md);
+      padding: 10px 12px;
+      cursor: pointer;
+      transition: all var(--ease);
+      text-align: left;
+      width: 100%;
+    }
+
+    .chunk-mode-btn:hover {
+      border-color: var(--border-mid);
+      background: var(--bg-hover);
+    }
+
+    .chunk-mode-btn.active {
+      border-color: hsla(142,71%,45%,.4);
+      background: var(--green-dim);
+    }
+
+    .chunk-mode-btn.active.fixed-mode {
+      border-color: hsla(217,91%,60%,.4);
+      background: var(--accent-dim);
+    }
+
+    .chunk-mode-radio {
+      width: 14px; height: 14px; border-radius: 50%;
+      border: 2px solid var(--border-mid);
+      flex-shrink: 0;
+      transition: all var(--ease);
+      position: relative;
+    }
+
+    .chunk-mode-btn.active .chunk-mode-radio {
+      border-color: var(--green);
+    }
+
+    .chunk-mode-btn.active.fixed-mode .chunk-mode-radio {
+      border-color: var(--accent);
+    }
+
+    .chunk-mode-btn.active .chunk-mode-radio::after {
+      content: '';
+      position: absolute;
+      inset: 2px;
+      border-radius: 50%;
+      background: var(--green);
+    }
+
+    .chunk-mode-btn.active.fixed-mode .chunk-mode-radio::after {
+      background: var(--accent);
+    }
+
+    .chunk-mode-label {
+      font-size: .8rem; font-weight: 600;
+      color: var(--text-primary);
+    }
+
+    .chunk-mode-desc {
+      font-size: .68rem; color: var(--text-muted);
+      margin-top: 1px;
+    }
+
+    /* ── Upload Button ────────────────────────────────────── */
+    .upload-btn {
+      width: 100%; margin-top: 12px;
+      background: var(--accent);
+      border: none; border-radius: var(--radius-md);
+      padding: 10px 16px;
+      font-size: .82rem; font-weight: 600;
+      font-family: var(--font);
+      color: hsl(220,40%,8%);
+      cursor: pointer;
+      transition: background var(--ease), box-shadow var(--ease), transform var(--ease);
+      display: flex; align-items: center; justify-content: center; gap: 7px;
+    }
+
+    .upload-btn:hover {
+      background: var(--accent-hover);
+      box-shadow: 0 4px 12px hsla(217,91%,60%,.3);
+    }
+
+    .upload-btn:active { transform: scale(.98); }
+
+    .upload-btn:disabled {
+      opacity: .5; cursor: not-allowed; box-shadow: none;
+    }
+
+    /* ── Uploaded Doc List ────────────────────────────────── */
+    .doc-list {
+      flex: 1; overflow-y: auto;
+      padding: 16px;
+      display: flex; flex-direction: column; gap: 8px;
+    }
+
+    .doc-list::-webkit-scrollbar { width: 4px; }
+    .doc-list::-webkit-scrollbar-thumb { background: var(--border); border-radius: 2px; }
+
+    .doc-item {
+      background: var(--bg-raised);
+      border: 1px solid var(--border);
+      border-radius: var(--radius-md);
+      padding: 10px 12px;
+      display: flex; align-items: flex-start; gap: 9px;
+      animation: fadeIn .2s ease;
+    }
+
+    @keyframes fadeIn { from { opacity:0; transform: translateY(4px); } to { opacity:1; transform: none; } }
+
+    .doc-icon {
+      font-size: .9rem; flex-shrink: 0; margin-top: 1px;
+    }
+
+    .doc-info { flex: 1; min-width: 0; }
+
+    .doc-name {
+      font-size: .78rem; font-weight: 600;
+      color: var(--text-primary);
+      white-space: nowrap; overflow: hidden; text-overflow: ellipsis;
+    }
+
+    .doc-meta {
+      font-size: .68rem; font-family: var(--mono);
+      color: var(--text-muted); margin-top: 2px;
+    }
+
+    .doc-badge {
+      font-size: .6rem; font-family: var(--mono);
+      padding: 2px 7px; border-radius: 100px;
+      background: var(--green-dim);
+      color: var(--green);
+      border: 1px solid hsla(142,71%,45%,.25);
+      flex-shrink: 0;
+    }
+
+    .sidebar-clear {
+      padding: 12px 16px;
+      border-top: 1px solid var(--border);
+    }
+
+    .clear-btn {
+      width: 100%; background: transparent;
+      border: 1px solid var(--border);
+      border-radius: var(--radius-md);
+      padding: 8px;
+      font-size: .75rem; font-family: var(--font);
+      color: var(--text-muted);
+      cursor: pointer;
+      transition: all var(--ease);
+    }
+
+    .clear-btn:hover {
+      border-color: var(--red);
+      color: var(--red);
+      background: var(--red-dim);
+    }
+
+    /* ── Main ─────────────────────────────────────────────── */
+    .main {
+      display: flex; flex-direction: column;
+      overflow: hidden;
+    }
+
+    /* ── Chat Area ────────────────────────────────────────── */
+    .chat-area {
+      flex: 1; overflow-y: auto;
+      padding: 28px 32px;
+      display: flex; flex-direction: column; gap: 20px;
+    }
+
+    .chat-area::-webkit-scrollbar { width: 6px; }
+    .chat-area::-webkit-scrollbar-thumb { background: var(--border); border-radius: 3px; }
+
+    /* ── Empty State ──────────────────────────────────────── */
+    .empty-state {
+      flex: 1; display: flex; flex-direction: column;
+      align-items: center; justify-content: center;
+      text-align: center; padding: 40px 20px;
+      color: var(--text-muted);
+    }
+
+    .empty-icon { font-size: 3rem; margin-bottom: 16px; opacity: .6; }
+
+    .empty-state h2 {
+      font-size: 1.1rem; font-weight: 600;
+      color: var(--text-secondary); margin-bottom: 8px;
+    }
+
+    .empty-state p {
+      font-size: .84rem; max-width: 360px;
+      line-height: 1.65;
+    }
+
+    .empty-steps {
+      display: flex; flex-direction: column; gap: 8px;
+      margin-top: 24px; text-align: left;
+      width: 100%; max-width: 320px;
+    }
+
+    .step {
+      display: flex; align-items: center; gap: 10px;
+      background: var(--bg-surface);
+      border: 1px solid var(--border);
+      border-radius: var(--radius-md);
+      padding: 10px 14px;
+      font-size: .8rem; color: var(--text-secondary);
+    }
+
+    .step-num {
+      width: 22px; height: 22px; border-radius: 50%;
+      background: var(--accent-dim);
+      border: 1px solid hsla(217,91%,60%,.3);
+      display: flex; align-items: center; justify-content: center;
+      font-size: .65rem; font-weight: 700; color: var(--accent);
+      flex-shrink: 0;
+    }
+
+    /* ── Message Bubbles ──────────────────────────────────── */
+    .msg { display: flex; gap: 12px; animation: fadeIn .2s ease; }
+
+    .msg.user { flex-direction: row-reverse; }
+
+    .msg-avatar {
+      width: 32px; height: 32px; border-radius: 50%;
+      display: flex; align-items: center; justify-content: center;
+      font-size: 14px; flex-shrink: 0;
+      border: 1px solid var(--border);
+    }
+
+    .msg.user .msg-avatar {
+      background: var(--accent-dim);
+      border-color: hsla(217,91%,60%,.3);
+    }
+
+    .msg.bot .msg-avatar {
+      background: var(--bg-raised);
+    }
+
+    .msg-body { max-width: 80%; display: flex; flex-direction: column; gap: 6px; }
+
+    .msg-bubble {
+      padding: 12px 16px;
+      border-radius: var(--radius-lg);
+      font-size: .88rem; line-height: 1.7;
+    }
+
+    .msg.user .msg-bubble {
+      background: var(--accent);
+      color: hsl(220,40%,8%);
+      border-radius: var(--radius-lg) var(--radius-sm) var(--radius-lg) var(--radius-lg);
+    }
+
+    .msg.bot .msg-bubble {
+      background: var(--bg-surface);
+      border: 1px solid var(--border);
+      color: var(--text-primary);
+      border-radius: var(--radius-sm) var(--radius-lg) var(--radius-lg) var(--radius-lg);
+    }
+
+    .msg-bubble code {
+      font-family: var(--mono); font-size: .78rem;
+      background: var(--bg-raised);
+      border: 1px solid var(--border);
+      border-radius: 4px; padding: 1px 6px;
+      color: var(--accent);
+    }
+
+    /* ── Source Cards ─────────────────────────────────────── */
+    .source-grid {
+      display: grid;
+      grid-template-columns: repeat(auto-fill, minmax(200px, 1fr));
+      gap: 8px;
+    }
+
+    .source-card {
+      background: var(--bg-raised);
+      border: 1px solid var(--border);
+      border-radius: var(--radius-md);
+      padding: 10px 12px;
+      transition: border-color var(--ease), transform var(--ease);
+    }
+
+    .source-card:hover {
+      border-color: var(--border-mid);
+      transform: translateY(-1px);
+    }
+
+    .source-card-top {
+      display: flex; align-items: center; gap: 7px;
+      margin-bottom: 4px;
+    }
+
+    .source-file {
+      font-size: .72rem; font-family: var(--mono);
+      font-weight: 600; color: var(--text-primary);
+      white-space: nowrap; overflow: hidden; text-overflow: ellipsis;
+      flex: 1;
+    }
+
+    .source-score {
+      font-size: .65rem; font-family: var(--mono);
+      color: var(--accent); background: var(--accent-dim);
+      padding: 1px 6px; border-radius: 100px; flex-shrink: 0;
+    }
+
+    .source-section {
+      display: flex; align-items: center; gap: 5px;
+      margin-bottom: 5px;
+    }
+
+    .block-badge {
+      font-size: .58rem; font-family: var(--mono);
+      padding: 1px 6px; border-radius: 100px; flex-shrink: 0;
+    }
+
+    .block-badge.paragraph {
+      background: var(--bg-hover); color: var(--text-muted);
+      border: 1px solid var(--border);
+    }
+
+    .block-badge.code {
+      background: var(--amber-dim); color: var(--amber);
+      border: 1px solid hsla(38,92%,55%,.2);
+    }
+
+    .block-badge.table {
+      background: var(--purple-dim); color: var(--purple);
+      border: 1px solid hsla(270,70%,65%,.2);
+    }
+
+    .source-section-name {
+      font-size: .67rem; font-family: var(--mono);
+      color: var(--text-muted);
+      white-space: nowrap; overflow: hidden; text-overflow: ellipsis;
+    }
+
+    .source-page {
+      font-size: .67rem; font-family: var(--mono);
+      color: var(--text-muted);
+    }
+
+    .source-excerpt {
+      font-size: .72rem; color: var(--text-secondary);
+      line-height: 1.5;
+      display: -webkit-box;
+      -webkit-line-clamp: 3;
+      -webkit-box-orient: vertical;
+      overflow: hidden;
+    }
+
+    .score-bar { height: 2px; background: var(--bg-hover); border-radius: 2px; margin-top: 7px; overflow: hidden; }
+    .score-bar-fill { height: 100%; background: var(--accent); border-radius: 2px; transition: width .5s ease; }
+
+    /* ── Status tags ──────────────────────────────────────── */
+    .msg-status {
+      display: flex; align-items: center; gap: 6px;
+      font-size: .7rem; font-family: var(--mono);
+      padding: 3px 10px; border-radius: 100px;
+      align-self: flex-start;
+    }
+
+    .msg-status.found {
+      background: var(--green-dim); color: var(--green);
+      border: 1px solid hsla(142,71%,45%,.25);
+    }
+
+    .msg-status.not-found {
+      background: var(--amber-dim); color: var(--amber);
+      border: 1px solid hsla(38,92%,55%,.25);
+    }
+
+    /* ── Thinking indicator ───────────────────────────────── */
+    .thinking {
+      display: flex; gap: 5px; align-items: center; padding: 4px 0;
+    }
+
+    .thinking span {
+      width: 7px; height: 7px; border-radius: 50%;
+      background: var(--text-muted);
+      animation: bounce .9s ease infinite;
+    }
+
+    .thinking span:nth-child(2) { animation-delay: .15s; }
+    .thinking span:nth-child(3) { animation-delay: .3s; }
+
+    @keyframes bounce {
+      0%, 60%, 100% { transform: translateY(0); }
+      30%            { transform: translateY(-6px); }
+    }
+
+    /* ── Input Bar ────────────────────────────────────────── */
+    .input-bar {
+      border-top: 1px solid var(--border);
+      background: var(--bg-surface);
+      padding: 16px 24px;
+      display: flex; gap: 10px; align-items: flex-end;
+    }
+
+    .input-wrap {
+      flex: 1; position: relative;
+      background: var(--bg-raised);
+      border: 1px solid var(--border);
+      border-radius: var(--radius-lg);
+      transition: border-color var(--ease), box-shadow var(--ease);
+    }
+
+    .input-wrap:focus-within {
+      border-color: hsla(217,91%,60%,.5);
+      box-shadow: 0 0 0 3px var(--accent-glow);
+    }
+
+    .chat-input {
+      width: 100%; background: transparent;
+      border: none; outline: none;
+      padding: 12px 16px; resize: none;
+      font-size: .9rem; font-family: var(--font);
+      color: var(--text-primary); caret-color: var(--accent);
+      min-height: 48px; max-height: 140px;
+      line-height: 1.5;
+    }
+
+    .chat-input::placeholder { color: var(--text-muted); }
+
+    .send-btn {
+      background: var(--accent);
+      border: none; border-radius: var(--radius-md);
+      width: 44px; height: 44px;
+      display: flex; align-items: center; justify-content: center;
+      cursor: pointer; flex-shrink: 0;
+      transition: background var(--ease), box-shadow var(--ease), transform var(--ease);
+      font-size: 1rem;
+    }
+
+    .send-btn:hover {
+      background: var(--accent-hover);
+      box-shadow: 0 4px 12px hsla(217,91%,60%,.3);
+    }
+
+    .send-btn:active { transform: scale(.95); }
+    .send-btn:disabled { opacity: .4; cursor: not-allowed; box-shadow: none; }
+
+    /* ── Upload progress ──────────────────────────────────── */
+    .upload-progress {
+      margin-top: 8px;
+      font-size: .72rem; font-family: var(--mono);
+      color: var(--text-muted);
+      display: none;
+    }
+
+    .progress-bar {
+      height: 3px; background: var(--border);
+      border-radius: 2px; margin-top: 4px; overflow: hidden;
+    }
+
+    .progress-fill {
+      height: 100%; background: var(--accent);
+      border-radius: 2px;
+      animation: progress-anim 1.2s ease infinite;
+      width: 40%;
+    }
+
+    @keyframes progress-anim {
+      0%   { transform: translateX(-100%); }
+      100% { transform: translateX(350%); }
+    }
+
+    /* ── Toast ────────────────────────────────────────────── */
+    .toast-wrap {
+      position: fixed; bottom: 24px; right: 24px;
+      display: flex; flex-direction: column; gap: 8px;
+      z-index: 1000;
+    }
+
+    .toast {
+      background: var(--bg-surface);
+      border: 1px solid var(--border);
+      border-radius: var(--radius-md);
+      padding: 10px 16px;
+      font-size: .8rem; color: var(--text-primary);
+      box-shadow: var(--shadow-md);
+      animation: fadeIn .2s ease;
+      max-width: 320px;
+    }
+
+    .toast.error { border-color: var(--red); color: var(--red); }
+    .toast.success { border-color: var(--green); color: var(--green); }
+
+    /* ── Responsive ───────────────────────────────────────── */
+    @media (max-width: 700px) {
+      .layout { grid-template-columns: 1fr; }
+      .sidebar {
+        grid-row: 3;
+        border-right: none;
+        border-top: 1px solid var(--border);
+        max-height: 340px;
+      }
+      .chat-area { padding: 16px; }
+      .input-bar { padding: 12px 16px; }
+    }
+  </style>
+</head>
+<body>
+
+<div class="layout">
+
+  <!-- ── Top Bar ──────────────────────────────────────────── -->
+  <header class="topbar">
+    <div class="topbar-logo">
+      <div class="logo-icon">
+        <svg width="20" height="20" viewBox="0 0 24 24" fill="none" xmlns="http://www.w3.org/2000/svg" aria-hidden="true">
+          <path d="M4 4.5A2.5 2.5 0 0 1 6.5 2H20v17.5H6.5A2.5 2.5 0 0 0 4 22V4.5Z" fill="hsl(217, 91%, 60%)" fill-opacity="0.25"/>
+          <path d="M6.5 2A2.5 2.5 0 0 0 4 4.5V22a2.5 2.5 0 0 1 2.5-2.5H20V2H6.5Z" fill="hsl(217, 91%, 60%)"/>
+          <path d="M8.5 6.5h7M8.5 10h7M8.5 13.5h4.5" stroke="hsl(220, 40%, 8%)" stroke-width="1.6" stroke-linecap="round"/>
+        </svg>
+      </div>
+      <span class="logo-name">Ask My Docs</span>
+      <span class="logo-version">v1 · Python</span>
+    </div>
+    <div class="topbar-spacer"></div>
+    <div class="topbar-stat" id="topbarStat">
+      <div class="status-dot" id="statusDot"></div>
+      <span id="statLabel">No documents loaded</span>
+    </div>
+  </header>
+
+  <!-- ── Sidebar ──────────────────────────────────────────── -->
+  <aside class="sidebar">
+
+    <!-- Drop Zone -->
+    <div class="sidebar-section">
+      <div class="sidebar-label">Upload Documents</div>
+      <div class="dropzone" id="dropzone">
+        <input type="file" id="fileInput" multiple accept=".pdf,.txt,.md"/>
+        <div class="dropzone-icon">📂</div>
+        <div class="dropzone-title">Drop files here</div>
+        <div class="dropzone-sub">PDF, TXT, or Markdown</div>
+      </div>
+
+      <!-- Chunk Mode -->
+      <div style="margin-top: 14px;">
+        <div class="sidebar-label">Chunking Mode</div>
+        <div class="chunk-mode-group" id="chunkModeGroup">
+          <button class="chunk-mode-btn active" data-mode="structured" onclick="selectMode(this)">
+            <div class="chunk-mode-radio"></div>
+            <div>
+              <div class="chunk-mode-label">✦ Structured</div>
+              <div class="chunk-mode-desc">Splits by headings & paragraphs</div>
+            </div>
+          </button>
+          <button class="chunk-mode-btn fixed-mode" data-mode="256" onclick="selectMode(this)">
+            <div class="chunk-mode-radio"></div>
+            <div>
+              <div class="chunk-mode-label">256 words (fixed)</div>
+              <div class="chunk-mode-desc">Overlapping word windows</div>
+            </div>
+          </button>
+          <button class="chunk-mode-btn fixed-mode" data-mode="128" onclick="selectMode(this)">
+            <div class="chunk-mode-radio"></div>
+            <div>
+              <div class="chunk-mode-label">128 words (fixed)</div>
+              <div class="chunk-mode-desc">Smaller, more granular chunks</div>
+            </div>
+          </button>
+          <button class="chunk-mode-btn fixed-mode" data-mode="512" onclick="selectMode(this)">
+            <div class="chunk-mode-radio"></div>
+            <div>
+              <div class="chunk-mode-label">512 words (fixed)</div>
+              <div class="chunk-mode-desc">Larger context windows</div>
+            </div>
+          </button>
+        </div>
+      </div>
+
+      <button class="upload-btn" id="uploadBtn" onclick="uploadFiles()" disabled>
+        <span>⬆</span> Upload & Index
+      </button>
+      <div class="upload-progress" id="uploadProgress">
+        Indexing document…
+        <div class="progress-bar"><div class="progress-fill"></div></div>
+      </div>
+    </div>
+
+    <!-- Load Web Page -->
+    <div class="sidebar-section">
+      <div class="sidebar-label">Or Load a Web Page</div>
+      <div class="input-wrap" style="margin-bottom:8px;">
+        <input
+          type="url"
+          id="urlInput"
+          class="chat-input"
+          style="min-height:44px; padding:10px 14px;"
+          placeholder="https://example.com/article"
+          onkeydown="if(event.key==='Enter'){event.preventDefault();loadUrl();}"
+        />
+      </div>
+      <button class="upload-btn" id="loadUrlBtn" onclick="loadUrl()" style="background:var(--green);">
+        <span>🌐</span> Fetch & Index
+      </button>
+    </div>
+
+    <!-- Uploaded Docs List -->
+    <div class="doc-list" id="docList">
+      <div style="font-size:.75rem; color:var(--text-muted); text-align:center; padding:12px 0;">
+        No documents yet
+      </div>
+    </div>
+
+    <div class="sidebar-clear">
+      <button class="clear-btn" onclick="clearDocs()">🗑 Clear all documents</button>
+    </div>
+
+  </aside>
+
+  <!-- ── Main Chat ─────────────────────────────────────────── -->
+  <main class="main">
+
+    <div class="chat-area" id="chatArea">
+      <!-- Empty state -->
+      <div class="empty-state" id="emptyState">
+        <div class="empty-icon">💬</div>
+        <h2>Ask anything about your documents</h2>
+        <p>Upload one or more PDFs, then type your question below. Answers are sourced directly from your documents.</p>
+        <div class="empty-steps">
+          <div class="step">
+            <div class="step-num">1</div>
+            Drop a PDF into the sidebar
+          </div>
+          <div class="step">
+            <div class="step-num">2</div>
+            Choose a chunking mode
+          </div>
+          <div class="step">
+            <div class="step-num">3</div>
+            Click "Upload &amp; Index"
+          </div>
+          <div class="step">
+            <div class="step-num">4</div>
+            Ask your question below
+          </div>
+        </div>
+      </div>
+    </div>
+
+    <!-- Input Bar -->
+    <div class="input-bar">
+      <div class="input-wrap">
+        <textarea
+          id="chatInput"
+          class="chat-input"
+          placeholder="Ask a question about your documents…"
+          rows="1"
+          onkeydown="handleKey(event)"
+          oninput="autoResize(this)"
+        ></textarea>
+      </div>
+      <button class="send-btn" id="sendBtn" onclick="sendQuestion()" title="Send (Enter)">
+        ➤
+      </button>
+    </div>
+
+  </main>
+
+</div>
+
+<!-- Toast container -->
+<div class="toast-wrap" id="toastWrap"></div>
+
+<script>
+// ─────────────────────────────────────────────────────────────────────────────
+//  State
+// ─────────────────────────────────────────────────────────────────────────────
+
+let selectedFiles = [];
+let currentMode = 'structured';
+let docCount = 0;
+let chunkCount = 0;
+
+// ─────────────────────────────────────────────────────────────────────────────
+//  File Selection
+// ─────────────────────────────────────────────────────────────────────────────
+
+const dropzone = document.getElementById('dropzone');
+const fileInput = document.getElementById('fileInput');
+
+dropzone.addEventListener('dragover', e => {
+  e.preventDefault();
+  dropzone.classList.add('drag-over');
+});
+
+dropzone.addEventListener('dragleave', () => dropzone.classList.remove('drag-over'));
+
+dropzone.addEventListener('drop', e => {
+  e.preventDefault();
+  dropzone.classList.remove('drag-over');
+  handleFiles(Array.from(e.dataTransfer.files));
+});
+
+fileInput.addEventListener('change', () => {
+  handleFiles(Array.from(fileInput.files));
+  fileInput.value = '';
+});
+
+function handleFiles(files) {
+  const valid = files.filter(f => /\.(pdf|txt|md)$/i.test(f.name));
+  if (!valid.length) {
+    showToast('Only PDF, TXT, or MD files are supported.', 'error');
+    return;
+  }
+  const seen = new Set(selectedFiles.map(f => f.name));
+  const fresh = valid.filter(f => !seen.has(f.name));
+  if (!fresh.length) {
+    showToast('Those files are already selected.', 'error');
+    return;
+  }
+  selectedFiles = selectedFiles.concat(fresh);
+  dropzone.querySelector('.dropzone-title').textContent =
+    `${selectedFiles.length} file${selectedFiles.length > 1 ? 's' : ''} ready`;
+  dropzone.querySelector('.dropzone-sub').textContent =
+    selectedFiles.map(f => f.name).join(', ');
+  document.getElementById('uploadBtn').disabled = false;
+}
+
+// ─────────────────────────────────────────────────────────────────────────────
+//  Chunk Mode Selection
+// ─────────────────────────────────────────────────────────────────────────────
+
+function selectMode(btn) {
+  document.querySelectorAll('.chunk-mode-btn').forEach(b => b.classList.remove('active'));
+  btn.classList.add('active');
+  currentMode = btn.dataset.mode;
+}
+
+// ─────────────────────────────────────────────────────────────────────────────
+//  Upload & Index
+// ─────────────────────────────────────────────────────────────────────────────
+
+async function uploadFiles() {
+  if (!selectedFiles.length) return;
+
+  const btn = document.getElementById('uploadBtn');
+  const progress = document.getElementById('uploadProgress');
+  btn.disabled = true;
+  progress.style.display = 'block';
+
+  const formData = new FormData();
+  selectedFiles.forEach(f => formData.append('files', f));
+  formData.append('chunk_mode', currentMode);
+
+  try {
+    const res = await fetch('/upload', { method: 'POST', body: formData });
+    const data = await res.json();
+
+    if (!res.ok || !data.ok) {
+      showToast(data.error || 'Upload failed', 'error');
+      (data.documents || []).forEach(d => {
+        if (d.error) showToast(`${d.filename}: ${d.error}`, 'error');
+      });
+    } else {
+      let indexed = 0;
+      (data.documents || []).forEach(doc => {
+        if (doc.error) {
+          showToast(`${doc.filename}: ${doc.error}`, 'error');
+          return;
+        }
+        indexed++;
+        addDocToList(doc);
+      });
+      chunkCount = data.total_chunks;
+      updateStatus();
+      if (indexed > 0) {
+        showToast(`✅ Indexed ${indexed} doc(s) → ${data.total_chunks} chunks`, 'success');
+      }
+      // Reset dropzone
+      dropzone.querySelector('.dropzone-title').textContent = 'Drop files here';
+      dropzone.querySelector('.dropzone-sub').textContent = 'PDF, TXT, or Markdown';
+      selectedFiles = [];
+    }
+  } catch (err) {
+    showToast('Server error: ' + err.message, 'error');
+  } finally {
+    btn.disabled = false;
+    progress.style.display = 'none';
+  }
+}
+
+async function loadUrl() {
+  const input = document.getElementById('urlInput');
+  const url = input.value.trim();
+  if (!url) return;
+  const btn = document.getElementById('loadUrlBtn');
+  btn.disabled = true;
+  try {
+    const res = await fetch('/load-url', {
+      method: 'POST',
+      headers: { 'Content-Type': 'application/json' },
+      body: JSON.stringify({ url, chunk_mode: currentMode }),
+    });
+    const data = await res.json();
+    if (!res.ok || !data.ok) {
+      showToast(data.error || 'Failed to load URL', 'error');
+      return;
+    }
+    (data.documents || []).forEach(doc => {
+      if (doc.error) {
+        showToast(`${doc.filename}: ${doc.error}`, 'error');
+        return;
+      }
+      addDocToList(doc);
+    });
+    chunkCount = data.total_chunks;
+    updateStatus();
+    showToast(`✅ Indexed ${data.documents.length} doc(s) → ${data.total_chunks} chunks`, 'success');
+    input.value = '';
+  } catch (err) {
+    showToast('Error: ' + err.message, 'error');
+  } finally {
+    btn.disabled = false;
+  }
+}
+
+function addDocToList(doc) {
+  const list = document.getElementById('docList');
+  if (list.querySelector('[data-empty]')) list.innerHTML = '';
+  docCount++;
+
+  const ext = doc.filename.split('.').pop().toUpperCase();
+  const icon = ext === 'PDF' ? '📕' : '📄';
+  const modeLabel = doc.method === 'structured' ? '✦ structured' : `${doc.method}-word`;
+
+  const item = document.createElement('div');
+  item.className = 'doc-item';
+  item.innerHTML = `
+    <div class="doc-icon">${icon}</div>
+    <div class="doc-info">
+      <div class="doc-name" title="${doc.filename}">${doc.filename}</div>
+      <div class="doc-meta">${doc.pages} pages · ${doc.chunks} chunks · ${modeLabel}</div>
+    </div>
+    <div class="doc-badge">${ext}</div>
+  `;
+  list.appendChild(item);
+  hideEmptyState();
+}
+
+// ─────────────────────────────────────────────────────────────────────────────
+//  Status Bar
+// ─────────────────────────────────────────────────────────────────────────────
+
+function updateStatus() {
+  const dot = document.getElementById('statusDot');
+  const label = document.getElementById('statLabel');
+  if (chunkCount > 0) {
+    dot.classList.add('active');
+    label.textContent = `${chunkCount} chunks · ${docCount} doc${docCount !== 1 ? 's' : ''} loaded`;
+  } else {
+    dot.classList.remove('active');
+    label.textContent = 'No documents loaded';
+  }
+}
+
+// ─────────────────────────────────────────────────────────────────────────────
+//  Clear Documents
+// ─────────────────────────────────────────────────────────────────────────────
+
+async function clearDocs() {
+  await fetch('/clear', { method: 'POST' });
+  document.getElementById('docList').innerHTML =
+    `<div style="font-size:.75rem;color:var(--text-muted);text-align:center;padding:12px 0;" data-empty>No documents yet</div>`;
+  docCount = 0;
+  chunkCount = 0;
+  updateStatus();
+  showToast('All documents cleared.', 'success');
+}
+
+// ─────────────────────────────────────────────────────────────────────────────
+//  Chat
+// ─────────────────────────────────────────────────────────────────────────────
+
+function handleKey(e) {
+  if (e.key === 'Enter' && !e.shiftKey) {
+    e.preventDefault();
+    sendQuestion();
+  }
+}
+
+function autoResize(el) {
+  el.style.height = 'auto';
+  el.style.height = Math.min(el.scrollHeight, 140) + 'px';
+}
+
+function hideEmptyState() {
+  const es = document.getElementById('emptyState');
+  if (es) es.remove();
+}
+
+async function sendQuestion() {
+  const input = document.getElementById('chatInput');
+  const query = input.value.trim();
+  if (!query) return;
+
+  input.value = '';
+  input.style.height = 'auto';
+  hideEmptyState();
+
+  // Add user message
+  appendMessage('user', query);
+
+  // Add thinking bubble
+  const thinkId = 'think-' + Date.now();
+  appendThinking(thinkId);
+
+  const sendBtn = document.getElementById('sendBtn');
+  sendBtn.disabled = true;
+
+  try {
+    const res = await fetch('/ask', {
+      method: 'POST',
+      headers: { 'Content-Type': 'application/json' },
+      body: JSON.stringify({ query }),
+    });
+    const data = await res.json();
+
+    // Remove thinking
+    document.getElementById(thinkId)?.remove();
+
+    if (!res.ok) {
+      appendMessage('bot', '⚠️ ' + (data.error || 'Something went wrong. Please try again.'));
+      return;
+    }
+
+    appendAnswer(data);
+  } catch (err) {
+    document.getElementById(thinkId)?.remove();
+    appendMessage('bot', '⚠️ Server error: ' + err.message);
+  } finally {
+    sendBtn.disabled = false;
+  }
+}
+
+function appendMessage(role, text) {
+  const chatArea = document.getElementById('chatArea');
+  const msg = document.createElement('div');
+  msg.className = `msg ${role}`;
+  msg.innerHTML = `
+    <div class="msg-avatar">${role === 'user' ? '👤' : '🤖'}</div>
+    <div class="msg-body">
+      <div class="msg-bubble">${escapeHtml(text)}</div>
+    </div>
+  `;
+  chatArea.appendChild(msg);
+  chatArea.scrollTop = chatArea.scrollHeight;
+}
+
+function appendThinking(id) {
+  const chatArea = document.getElementById('chatArea');
+  const msg = document.createElement('div');
+  msg.className = 'msg bot';
+  msg.id = id;
+  msg.innerHTML = `
+    <div class="msg-avatar">🤖</div>
+    <div class="msg-body">
+      <div class="msg-bubble">
+        <div class="thinking">
+          <span></span><span></span><span></span>
+        </div>
+      </div>
+    </div>
+  `;
+  chatArea.appendChild(msg);
+  chatArea.scrollTop = chatArea.scrollHeight;
+}
+
+function appendAnswer(data) {
+  const chatArea = document.getElementById('chatArea');
+  const msg = document.createElement('div');
+  msg.className = 'msg bot';
+
+  const statusHtml = `
+    <div class="msg-status ${data.found ? 'found' : 'not-found'}">
+      ${data.found ? '✅ Found in documents' : '🤷 Not in documents'}
+    </div>`;
+
+  const sourcesHtml = (data.sources || []).length > 0 ? `
+    <div class="source-grid" style="margin-top:2px;">
+      ${data.sources.map(s => {
+        const sectionHtml = s.section
+          ? `<div class="source-section">
+               <span class="block-badge ${s.block_type || 'paragraph'}">${s.block_type || 'text'}</span>
+               <span class="source-section-name" title="${escapeHtml(s.section)}">§ ${escapeHtml(s.section)}</span>
+             </div>`
+          : '';
+        const pct = Math.min(100, Math.round(s.score * 100 * 3));
+        const pageLabel = (s.page_end && s.page_end !== s.page)
+          ? `Page ${s.page}–${s.page_end}`
+          : `Page ${s.page}`;
+        return `
+          <div class="source-card">
+            <div class="source-card-top">
+              <span class="source-file" title="${escapeHtml(s.filename)}">${escapeHtml(s.filename)}</span>
+              <span class="source-score">${Math.round(s.score * 100)}%</span>
+            </div>
+            ${sectionHtml}
+            <div class="source-page">📄 ${pageLabel}</div>
+            <div class="source-excerpt" style="margin-top:5px;">${escapeHtml(s.text.substring(0, 180))}…</div>
+            <div class="score-bar" style="margin-top:6px;">
+              <div class="score-bar-fill" style="width:${pct}%"></div>
+            </div>
+          </div>`;
+      }).join('')}
+    </div>` : '';
+
+  msg.innerHTML = `
+    <div class="msg-avatar">🤖</div>
+    <div class="msg-body">
+      ${statusHtml}
+      <div class="msg-bubble">${formatAnswer(data.answer)}</div>
+      ${sourcesHtml}
+    </div>
+  `;
+
+  chatArea.appendChild(msg);
+  chatArea.scrollTop = chatArea.scrollHeight;
+}
+
+// ─────────────────────────────────────────────────────────────────────────────
+//  Helpers
+// ─────────────────────────────────────────────────────────────────────────────
+
+function formatAnswer(text) {
+  return escapeHtml(text)
+    .replace(/`([^`]+)`/g, '<code>$1</code>')
+    .replace(/\*\*([^*]+)\*\*/g, '<strong>$1</strong>');
+}
+
+function escapeHtml(str) {
+  return String(str)
+    .replace(/&/g, '&amp;')
+    .replace(/</g, '&lt;')
+    .replace(/>/g, '&gt;')
+    .replace(/"/g, '&quot;');
+}
+
+function showToast(msg, type = '') {
+  const wrap = document.getElementById('toastWrap');
+  const t = document.createElement('div');
+  t.className = `toast ${type}`;
+  t.textContent = msg;
+  wrap.appendChild(t);
+  setTimeout(() => t.remove(), 4000);
+}
+
+// ─────────────────────────────────────────────────────────────────────────────
+//  Init — load existing session status
+// ─────────────────────────────────────────────────────────────────────────────
+
+(async () => {
+  try {
+    const res = await fetch('/status');
+    const data = await res.json();
+    if (data.total_chunks > 0) {
+      chunkCount = data.total_chunks;
+      data.documents.forEach(doc => {
+        addDocToList({
+          filename: doc.filename,
+          pages: '?',
+          chunks: doc.chunk_count,
+          method: doc.method,
+        });
+      });
+      updateStatus();
+    }
+  } catch (_) {}
+})();
+</script>
+</body>
+</html>
