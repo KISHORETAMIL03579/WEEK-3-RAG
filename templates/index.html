@@ -1589,7 +1589,7 @@ function appendAnswer(data) {
           ? `Page ${s.page}–${s.page_end}`
           : `Page ${s.page}`;
 const openLink = s.openable && s.doc_id
-      ? `<a class="source-open" href="#" onclick="openDoc('${encodeURIComponent(s.doc_id)}', ${s.page}, '${escapeHtml(s.text.substring(0, 60).replace(/[<>&"']/g, '')}')"); return false;" title="Open ${escapeHtml(s.filename)} in a new tab">Open ↗</a>`
+      ? `<a class="source-open" href="#" onclick="openDoc('${encodeURIComponent(s.doc_id)}', ${s.page}, '${escapeHtml(s.text.substring(0, 60).replace(/[<>&"']/g, ''))}'); return false;" title="Open ${escapeHtml(s.filename)} in a new tab">Open ↗</a>`
       : '';
         return `
           <div class="source-card">
