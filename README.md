@@ -1,4 +1,3 @@
-<<<<<<< ours
 # WEEK-3-RAG
 =======
 # Ask My Docs (Python)
@@ -132,4 +131,3 @@ Server starts at **http://localhost:5000** and prints:
 - **TF-IDF is keyword-based** — no semantics/synonyms, so paraphrased questions may score lower.
 - **Short blocks (≤4 words)** are dropped by the structured parser — tiny tables or one-liners may not be indexed.
 - Uploaded files are deleted from `uploads/` after indexing; only chunk text is kept.
->>>>>>> theirs
