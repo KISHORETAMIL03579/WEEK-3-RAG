@@ -54,13 +54,16 @@ ALLOWED_EXTENSIONS = {"pdf", "txt", "md"}
 # Per-session stores
 VECTOR_STORE: dict[str, "VectorStore"] = {}
 SESSION_ACCESS: dict[str, float] = {}
-HASH_STORE: dict[str, set[str]] = {}
-# Tracks which content-hash belongs to which doc_id, per session, so that
-# removing a single document can also forget its hash (see remove_doc()).
-# Without this, a removed document's hash stays in HASH_STORE forever and
-# re-uploading the exact same file later is incorrectly rejected as a
-# duplicate for the rest of the session.
-HASH_BY_DOC: dict[str, dict[str, str]] = {}
+HASH_STORE: dict[str, set[tuple[str, str]]] = {}
+# Tracks which (content-hash, chunk_mode) key belongs to which doc_id, per
+# session, so that removing a single document can also forget that key (see
+# remove_doc()). Keying on (hash, chunk_mode) instead of hash alone means the
+# exact same file can be indexed under several chunking strategies at once —
+# needed to actually compare retrieval quality across chunk sizes, instead of
+# only ever seeing a hypothetical chunk-count preview for strategies you
+# never actually indexed. Uploading the same file + same chunk_mode twice is
+# still rejected as a duplicate.
+HASH_BY_DOC: dict[str, dict[str, tuple[str, str]]] = {}
 SESSION_FILES: dict[str, dict[str, dict]] = {}
 CHUNK_COUNTS: dict[str, dict[str, int]] = {}
 
@@ -188,6 +191,33 @@ class VectorStore:
         if removed:
             self.save()
         return removed
+
+    def filtered_by_method(self, method: str) -> "VectorStore":
+        """
+        Return an ephemeral, non-persisted view containing only chunks
+        indexed under the given chunking strategy ("structured", "128",
+        "256", "512").
+
+        This is what makes chunk-size comparison real rather than
+        hypothetical: once the same document has been uploaded under two
+        or more strategies (see the (hash, chunk_mode) dedupe key in
+        /upload), /ask can restrict retrieval to just one strategy at a
+        time, so you can directly see whether a given question is found
+        under 128-word chunks but missed under 512-word chunks, etc.
+
+        Never call .save()/.add() on the returned view — it shares no
+        state with the real store and isn't written to disk.
+        """
+        view = VectorStore(f"{self.sid}__view")
+        # In TF-IDF-only mode (no embeddings configured) self.vectors is []
+        # while self.chunks isn't — zip(chunks, vectors) would silently
+        # truncate to the shorter list and drop every chunk. Filter by
+        # index instead so this works whether or not vectors are present.
+        has_vectors = len(self.vectors) == len(self.chunks)
+        matched = [i for i, c in enumerate(self.chunks) if c.get("method") == method]
+        view.chunks = [self.chunks[i] for i in matched]
+        view.vectors = [self.vectors[i] for i in matched] if has_vectors else []
+        return view
 
 
 def _manifest_path(sid: str) -> Path:
@@ -933,12 +963,16 @@ def upload():
             f.save(filepath)
             with open(filepath, "rb") as fh:
                 content_hash = hashlib.sha256(fh.read()).hexdigest()
+            dedupe_key = (content_hash, chunk_mode)
 
-            if content_hash in hashes:
+            if dedupe_key in hashes:
                 filepath.unlink(missing_ok=True)
-                results.append({"filename": original_name, "error": "Duplicate file skipped"})
+                results.append({"filename": original_name,
+                                "error": f"Already indexed under the '{chunk_mode}' strategy — "
+                                         f"pick a different chunking strategy to compare, or remove "
+                                         f"the existing one first."})
                 continue
-            hashes.add(content_hash)
+            hashes.add(dedupe_key)
 
             doc_id = str(uuid.uuid4())[:8]
             doc_info = {"doc_id": doc_id, "filename": original_name}
@@ -948,7 +982,7 @@ def upload():
 
             if not pages:
                 filepath.unlink(missing_ok=True)
-                hashes.discard(content_hash)
+                hashes.discard(dedupe_key)
                 reason = ("No extractable text (password-protected or scanned PDF?)"
                           if ext == "pdf" else "Empty file")
                 results.append({"filename": original_name, "error": reason})
@@ -957,7 +991,7 @@ def upload():
             new_chunks = chunk_text(doc_info, pages, chunk_mode)
             if not new_chunks:
                 filepath.unlink(missing_ok=True)
-                hashes.discard(content_hash)
+                hashes.discard(dedupe_key)
                 results.append({"filename": original_name, "error": "No chunks produced"})
                 continue
 
@@ -971,7 +1005,7 @@ def upload():
                 "filename": original_name,
                 "ext": ext,
                 "chunks": new_chunks,
-                "hash": content_hash,
+                "hash": dedupe_key,
                 "result": {
                     "filename": original_name,
                     "pages": len(pages),
@@ -981,7 +1015,8 @@ def upload():
             })
         except Exception as exc:
             filepath.unlink(missing_ok=True)
-            hashes.discard(content_hash) if "content_hash" in locals() else None
+            if "dedupe_key" in locals():
+                hashes.discard(dedupe_key)
             results.append({"filename": original_name, "error": f"Failed to index: {exc}"})
 
     if not pending:
@@ -1143,6 +1178,11 @@ def ask():
     sid = session["session_id"]
     data = request.get_json()
     query = (data or {}).get("query", "").strip()
+    # Optional: restrict retrieval to one chunking strategy, so you can
+    # directly compare "does hybrid search find the answer under 128-word
+    # chunks?" vs. 512-word, etc. Requires the same document to have been
+    # uploaded under that strategy already (see /upload's dedupe key).
+    method_filter = (data or {}).get("chunk_mode", "").strip() or None
 
     if not query:
         return jsonify({"error": "Empty query"}), 400
@@ -1161,15 +1201,27 @@ def ask():
             "sources": [],
         })
 
+    active_store = store
+    if method_filter:
+        active_store = store.filtered_by_method(method_filter)
+        if not active_store.chunks:
+            return jsonify({
+                "found": False,
+                "answer": (f"No documents are indexed under the '{method_filter}' chunking "
+                          f"strategy yet. Upload one under that strategy first, or ask "
+                          f"without a strategy filter to search everything indexed."),
+                "sources": [],
+            })
+
     # Path 1: embeddings + LLM (if configured and vectors exist)
-    if OPENROUTER_API_KEY and store.vectors and len(store.vectors) == len(store.chunks):
+    if OPENROUTER_API_KEY and active_store.vectors and len(active_store.vectors) == len(active_store.chunks):
         try:
             if RETRIEVAL_MODE == "hybrid":
-                results = hybrid_search(store, query, top_k=5)
+                results = hybrid_search(active_store, query, top_k=5)
                 results = [r for r in results if r["score"] >= EMBED_MIN_SCORE]
             else:
                 q_vec = embed_text(query)
-                results = store.query(q_vec, top_k=5, min_score=EMBED_MIN_SCORE)
+                results = active_store.query(q_vec, top_k=5, min_score=EMBED_MIN_SCORE)
             if not validate_context(results, EMBED_MIN_SCORE):
                 return jsonify({
                     "found": False,
@@ -1186,7 +1238,7 @@ def ask():
             pass  # fall through to TF-IDF
 
     # Path 2: offline TF-IDF fallback
-    chunks = store.chunks
+    chunks = active_store.chunks
     index = build_index(chunks)
     results = search_chunks(query, chunks, index, top_k=4)
     resp = synthesize_answer(query, results)
@@ -1264,6 +1316,7 @@ def status():
     return jsonify({
         "total_chunks": len(chunks),
         "documents": list(docs_seen.values()),
+        "methods": sorted({c["method"] for c in chunks}),
         "mode": "TF-IDF",
     })
 

@@ -1161,7 +1161,15 @@
     </div>
 
     <!-- Input Bar -->
-    <div class="input-bar">
+    <div class="input-bar" style="flex-direction: column; gap: 8px; align-items: stretch;">
+      <div id="methodFilterRow" style="display:none; align-items:center; gap:8px; max-width:760px; width:100%; margin: 0 auto; font-size:.7rem; color: var(--text-muted);">
+        <span>Compare against:</span>
+        <select id="methodFilterSelect"
+                onchange="handleMethodFilterChange()"
+                style="background: var(--bg-raised); border: 1px solid var(--border); border-radius: var(--radius-sm); color: var(--text-primary); font-family: var(--font); font-size: .72rem; padding: 4px 8px;">
+          <option value="">All strategies (mixed)</option>
+        </select>
+      </div>
       <div class="input-wrap">
         <textarea
           id="chatInput"
@@ -1326,6 +1334,7 @@ async function uploadFiles() {
       chunkCount = data.total_chunks;
       updateStatus();
       updateChunkComparison(data.chunk_comparison);
+      refreshMethodFilter();
       if (indexed > 0) {
         showToast(`✅ Indexed ${indexed} doc(s) → ${data.total_chunks} chunks`, 'success');
       }
@@ -1370,6 +1379,7 @@ async function loadUrl() {
     chunkCount = data.total_chunks;
     updateStatus();
     updateChunkComparison(data.chunk_comparison);
+      refreshMethodFilter();
     if ((data.documents || []).length > 0) markSteps(3);
     showToast(`✅ Indexed ${data.documents.length} doc(s) → ${data.total_chunks} chunks`, 'success');
     input.value = '';
@@ -1436,6 +1446,37 @@ function updateStatus() {
   }
 }
 
+// Shows a "Compare against: [strategy]" dropdown, but only once the same
+// document has actually been indexed under more than one chunking strategy
+// — otherwise there's nothing to compare and the control would just be
+// clutter. Reads /status's `methods` list rather than guessing locally.
+async function refreshMethodFilter() {
+  try {
+    const res = await fetch('/status');
+    const data = await res.json();
+    const methods = data.methods || [];
+    const row = document.getElementById('methodFilterRow');
+    const select = document.getElementById('methodFilterSelect');
+    if (!row || !select) return;
+    const prevValue = select.value;
+    if (methods.length > 1) {
+      const label = m => (m === 'structured' ? 'Structured' : `${m}-word`);
+      select.innerHTML = '<option value="">All strategies (mixed)</option>' +
+        methods.map(m => `<option value="${m}">${label(m)}</option>`).join('');
+      select.value = methods.includes(prevValue) ? prevValue : '';
+      row.style.display = 'flex';
+    } else {
+      row.style.display = 'none';
+      select.innerHTML = '<option value="">All strategies (mixed)</option>';
+      select.value = '';
+    }
+  } catch (_) { /* non-critical — leave the row as-is */ }
+}
+
+function handleMethodFilterChange() {
+  // Value is read directly in sendQuestion(); nothing to do here yet.
+}
+
 // ─────────────────────────────────────────────────────────────────────────────
 //  Clear Documents
 // ─────────────────────────────────────────────────────────────────────────────
@@ -1447,6 +1488,7 @@ async function clearDocs() {
   docCount = 0;
   chunkCount = 0;
   updateStatus();
+  refreshMethodFilter();
   showToast('All documents cleared.', 'success');
 }
 
@@ -1487,6 +1529,7 @@ async function removeDoc(encodedDocId) {
     `<div style="font-size:.75rem;color:var(--text-muted);text-align:center;padding:12px 0;" data-empty>No documents loaded</div>`;
     }
     updateStatus();
+    refreshMethodFilter();
     showToast(`Removed document and ${data.removed_chunks} chunk(s).`, 'success');
   } catch (err) {
     showToast('Error: ' + err.message, 'error');
@@ -1566,7 +1609,11 @@ async function sendQuestion() {
   setChatEmpty(false);
 
   // Add user message
-  appendMessage('user', query);
+  const activeFilter = document.getElementById('methodFilterSelect')?.value || '';
+  const filterLabel = activeFilter
+    ? ` [${activeFilter === 'structured' ? 'Structured' : activeFilter + '-word'} only]`
+    : '';
+  appendMessage('user', query + filterLabel);
 
   // Add thinking bubble
   const thinkId = 'think-' + Date.now();
@@ -1579,7 +1626,10 @@ async function sendQuestion() {
     const res = await fetch('/ask', {
       method: 'POST',
       headers: { 'Content-Type': 'application/json' },
-      body: JSON.stringify({ query }),
+      body: JSON.stringify({
+        query,
+        chunk_mode: document.getElementById('methodFilterSelect')?.value || undefined,
+      }),
     });
     const data = await res.json();
 
@@ -1785,6 +1835,18 @@ function showToast(msg, type = '') {
       });
     }
     updateStatus();
+
+    // Reuse this same /status response to populate the strategy filter
+    // instead of firing a second fetch from refreshMethodFilter().
+    const methods = data.methods || [];
+    const row = document.getElementById('methodFilterRow');
+    const select = document.getElementById('methodFilterSelect');
+    if (row && select && methods.length > 1) {
+      const label = m => (m === 'structured' ? 'Structured' : `${m}-word`);
+      select.innerHTML = '<option value="">All strategies (mixed)</option>' +
+        methods.map(m => `<option value="${m}">${label(m)}</option>`).join('');
+      row.style.display = 'flex';
+    }
   } catch (_) {}
 })();
 </script>
