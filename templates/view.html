@@ -292,7 +292,7 @@
     return escapeHtml(text).replace(re, '<mark>$1</mark>');
   }
 
-function renderTextPage() {
+  function renderTextPage() {
     const p = pages[curPage - 1];
     if (!p) return;
     const el = document.createElement('div');
@@ -313,8 +313,6 @@ function renderTextPage() {
         m.scrollIntoView({ block: 'center', behavior: 'smooth' });
         m.animate([{ backgroundColor: 'var(--hl)' }, { backgroundColor: 'transparent' }], { duration: 2500 });
       }
-    }
-  }
     }
   }
 
@@ -386,5 +384,4 @@ function renderTextPage() {
     }
   })();
 </script>
-</body>
 </html>
