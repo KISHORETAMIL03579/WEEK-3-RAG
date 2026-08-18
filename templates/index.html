@@ -1460,7 +1460,12 @@ function openDoc(docId, pageNum, hlQuery) {
   window.open(url, '_blank');
 }
 
-async function removeDoc(docId) {
+async function removeDoc(encodedDocId) {
+  // The onclick handler passes an encodeURIComponent()'d id (safe for the
+  // inline attribute). Decode it here so both the DOM lookup and the
+  // request body use the original, raw doc_id — matching how it was
+  // stored in item.dataset.docId and issued by the server.
+  const docId = decodeURIComponent(encodedDocId);
   const item = document.querySelector(`.doc-item[data-doc-id="${docId}"]`);
   const chunks = item ? parseInt(item.dataset.chunks || '0', 10) : 0;
   try {

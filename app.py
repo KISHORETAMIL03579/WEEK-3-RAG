@@ -55,6 +55,12 @@ ALLOWED_EXTENSIONS = {"pdf", "txt", "md"}
 VECTOR_STORE: dict[str, "VectorStore"] = {}
 SESSION_ACCESS: dict[str, float] = {}
 HASH_STORE: dict[str, set[str]] = {}
+# Tracks which content-hash belongs to which doc_id, per session, so that
+# removing a single document can also forget its hash (see remove_doc()).
+# Without this, a removed document's hash stays in HASH_STORE forever and
+# re-uploading the exact same file later is incorrectly rejected as a
+# duplicate for the rest of the session.
+HASH_BY_DOC: dict[str, dict[str, str]] = {}
 SESSION_FILES: dict[str, dict[str, dict]] = {}
 CHUNK_COUNTS: dict[str, dict[str, int]] = {}
 
@@ -71,6 +77,13 @@ LLM_MODEL = os.environ.get("LLM_MODEL", "deepseek/deepseek-chat")
 EMBED_MODEL = os.environ.get("EMBED_MODEL", "openai/text-embedding-3-small")
 EMBED_MIN_SCORE = float(os.environ.get("EMBED_MIN_SCORE", "0.30"))
 EMBED_BATCH = 32
+
+# Retrieval strategy for the embeddings path. "hybrid" combines cosine
+# similarity with TF-IDF so exact tokens (error codes, IDs, acronyms) aren't
+# lost to semantic blurring. "embed" is the old behavior, kept only so you
+# can flip back to it and measure the before/after with the same code.
+RETRIEVAL_MODE = os.environ.get("RETRIEVAL_MODE", "hybrid")  # "hybrid" | "embed"
+HYBRID_ALPHA = float(os.environ.get("HYBRID_ALPHA", "0.6"))  # weight on embedding score
 
 _simple_tokenizer = re.compile(r"[\w]+")
 
@@ -153,6 +166,12 @@ class VectorStore:
         scored = [(i, s) for i, s in scored if s >= min_score]
         scored.sort(key=lambda x: -x[1])
         return [{**self.chunks[i], "score": s} for i, s in scored[:top_k]]
+
+    def query_scores(self, vector: list[float]) -> list[float]:
+        """Cosine similarity of `vector` against every chunk, unfiltered and
+        in chunk order. Used by hybrid_search() to line embedding scores up
+        against TF-IDF scores index-for-index before combining them."""
+        return [cosine(vector, v) for v in self.vectors]
 
     def clear(self) -> None:
         self.chunks, self.vectors = [], []
@@ -244,6 +263,7 @@ def _get_store(sid: str) -> VectorStore:
             VECTOR_STORE.pop(s, None)
             SESSION_ACCESS.pop(s, None)
             HASH_STORE.pop(s, None)
+            HASH_BY_DOC.pop(s, None)
             (VECTOR_FOLDER / f"{s}.pkl").unlink(missing_ok=True)
             _cleanup_session_files(s)
     if len(SESSION_ACCESS) >= MAX_SESSIONS and sid not in SESSION_ACCESS:
@@ -251,6 +271,7 @@ def _get_store(sid: str) -> VectorStore:
         VECTOR_STORE.pop(oldest, None)
         SESSION_ACCESS.pop(oldest, None)
         HASH_STORE.pop(oldest, None)
+        HASH_BY_DOC.pop(oldest, None)
         (VECTOR_FOLDER / f"{oldest}.pkl").unlink(missing_ok=True)
         _cleanup_session_files(oldest)
     SESSION_ACCESS[sid] = now
@@ -705,6 +726,44 @@ def search_chunks(query: str, chunks: list[dict], index: dict,
     return scored[:top_k]
 
 
+def hybrid_search(store: "VectorStore", query: str, top_k: int = 5,
+                  alpha: float = HYBRID_ALPHA) -> list[dict]:
+    """
+    Rank chunks by a weighted blend of embedding similarity and TF-IDF
+    similarity, instead of embeddings alone.
+
+    Why: pure embedding search is good at "what does the policy say about
+    refunds" (meaning) but can bury an exact token like "ERR-4032" under
+    semantically-similar-but-wrong chunks, because embeddings compress exact
+    strings into fuzzy meaning space. TF-IDF does the opposite: great at
+    exact/rare tokens, poor at paraphrase. Blending catches both. This is
+    THE single change for this week — it only touches ranking inside the
+    embeddings path; the TF-IDF-only fallback path is untouched.
+    """
+    if not store.chunks:
+        return []
+
+    embed_scores = (store.query_scores(embed_text(query))
+                    if store.vectors and len(store.vectors) == len(store.chunks)
+                    else [0.0] * len(store.chunks))
+
+    index = build_index(store.chunks)
+    q_vec = tfidf_vector(compute_tf(tokenize(query)), index["idf"])
+    tfidf_scores = [
+        cosine_sim(q_vec, tfidf_vector(compute_tf(tokens), index["idf"]))
+        for tokens in index["corpus_tokens"]
+    ]
+
+    combined = [alpha * e + (1 - alpha) * t for e, t in zip(embed_scores, tfidf_scores)]
+    ranked = sorted(range(len(combined)), key=lambda i: -combined[i])[:top_k]
+
+    return [
+        {**store.chunks[i], "score": combined[i],
+         "embed_score": embed_scores[i], "tfidf_score": tfidf_scores[i]}
+        for i in ranked
+    ]
+
+
 def synthesize_answer(query: str, results: list[dict]) -> dict:
     """Template-based answer for the offline fallback path."""
     if not results:
@@ -889,6 +948,7 @@ def upload():
 
             if not pages:
                 filepath.unlink(missing_ok=True)
+                hashes.discard(content_hash)
                 reason = ("No extractable text (password-protected or scanned PDF?)"
                           if ext == "pdf" else "Empty file")
                 results.append({"filename": original_name, "error": reason})
@@ -897,6 +957,7 @@ def upload():
             new_chunks = chunk_text(doc_info, pages, chunk_mode)
             if not new_chunks:
                 filepath.unlink(missing_ok=True)
+                hashes.discard(content_hash)
                 results.append({"filename": original_name, "error": "No chunks produced"})
                 continue
 
@@ -910,6 +971,7 @@ def upload():
                 "filename": original_name,
                 "ext": ext,
                 "chunks": new_chunks,
+                "hash": content_hash,
                 "result": {
                     "filename": original_name,
                     "pages": len(pages),
@@ -919,6 +981,7 @@ def upload():
             })
         except Exception as exc:
             filepath.unlink(missing_ok=True)
+            hashes.discard(content_hash) if "content_hash" in locals() else None
             results.append({"filename": original_name, "error": f"Failed to index: {exc}"})
 
     if not pending:
@@ -942,11 +1005,17 @@ def upload():
             }
             _save_session_manifest(sid)
 
+            # Remember which hash belongs to this doc_id so /remove can
+            # release it later (see remove_doc()) — otherwise re-uploading
+            # the same file after removing it is wrongly flagged duplicate.
+            HASH_BY_DOC.setdefault(sid, {})[item["doc_id"]] = item["hash"]
+
             item["result"]["doc_id"] = item["doc_id"]
             item["result"]["openable"] = True
             results.append(item["result"])
         except Exception as exc:
             item["filepath"].unlink(missing_ok=True)
+            hashes.discard(item["hash"])
             results.append({"filename": item["filename"],
                             "error": f"Failed to index: {exc}"})
 
@@ -1093,8 +1162,12 @@ def ask():
     # Path 1: embeddings + LLM (if configured and vectors exist)
     if OPENROUTER_API_KEY and store.vectors and len(store.vectors) == len(store.chunks):
         try:
-            q_vec = embed_text(query)
-            results = store.query(q_vec, top_k=5, min_score=EMBED_MIN_SCORE)
+            if RETRIEVAL_MODE == "hybrid":
+                results = hybrid_search(store, query, top_k=5)
+                results = [r for r in results if r["score"] >= EMBED_MIN_SCORE]
+            else:
+                q_vec = embed_text(query)
+                results = store.query(q_vec, top_k=5, min_score=EMBED_MIN_SCORE)
             if not validate_context(results, EMBED_MIN_SCORE):
                 return jsonify({
                     "found": False,
@@ -1128,13 +1201,17 @@ def clear():
             store.clear()
         SESSION_ACCESS.pop(sid, None)
         HASH_STORE.pop(sid, None)
+        HASH_BY_DOC.pop(sid, None)
+        CHUNK_COUNTS.pop(sid, None)
         _cleanup_session_files(sid)
     return jsonify({"ok": True})
 
 
 @app.route("/remove", methods=["POST"])
 def remove_doc():
-    """Remove a single document: its chunks, its retained file, and its manifest entry."""
+    """Remove a single document: its chunks, its retained file, its manifest
+    entry, and its content hash (so the same file can be re-uploaded later
+    without being wrongly flagged as a duplicate)."""
     sid = session.get("session_id")
     if not sid:
         return jsonify({"error": "No active session"}), 400
@@ -1153,6 +1230,12 @@ def remove_doc():
     if info:
         info["path"].unlink(missing_ok=True)
     _save_session_manifest(sid)
+
+    # Forget this doc's content hash so a future re-upload of the same
+    # file isn't rejected as a stale duplicate.
+    doc_hash = HASH_BY_DOC.get(sid, {}).pop(doc_id, None)
+    if doc_hash is not None:
+        HASH_STORE.get(sid, set()).discard(doc_hash)
 
     return jsonify({"ok": True, "removed_chunks": removed_chunks})
 
