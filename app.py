@@ -1092,7 +1092,9 @@ def serve_file(doc_id: str):
     info = SESSION_FILES.get(sid, {}).get(doc_id)
     if not info or not info["path"].exists():
         return jsonify({"error": "File not found or no longer available"}), 404
-    return render_template("view.html", doc_id=doc_id, filename=info["name"])
+    name = info["name"]
+    ext = (name.rsplit(".", 1)[1] if "." in name else "").lower()
+    return render_template("view.html", doc_id=doc_id, filename=name, ext=ext)
 
 
 @app.route("/file/<doc_id>/raw", methods=["GET"])
