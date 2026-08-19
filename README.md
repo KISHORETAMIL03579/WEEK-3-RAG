@@ -6,14 +6,18 @@ A minimal Retrieval-Augmented Generation (RAG) app: upload documents, ask questi
 ## 1. Project structure
 ```
 project/
-├── app.py                 # Flask backend — all the logic lives here
-├── eval_retrieval.py       # standalone recall@k harness (retrieval quality testing)
+├── app.py                   # Flask backend — all the logic lives here
+├── qdrant_store.py           # Qdrant vector-DB adapter (only used if VECTOR_BACKEND=qdrant)
+├── requirements.txt
+├── Dockerfile
+├── docker-compose.yml         # self-hosted Qdrant + app, one command: docker compose up --build
 ├── templates/
-│   ├── index.html          # main chat UI (upload, chunking strategy, chat)
-│   └── view.html           # "Open document" viewer (opened in a new tab)
-├── uploads/                 # uploaded files land here (created automatically)
-├── vectorstore/             # per-session pickled chunk+vector indexes (auto-created)
-└── .env                     # optional — API keys / config (see §3)
+│   ├── index.html            # main chat UI (upload, chunking strategy, chat)
+│   └── view.html             # "Open document" viewer (opened in a new tab)
+├── uploads/                   # uploaded files land here (created automatically)
+├── vectorstore/               # per-session pickled chunk+vector indexes (memory backend only)
+├── .env.example               # copy to .env and fill in your own key — see §3
+└── .env                       # your real config — never commit this
 ```
 `index.html` and `view.html` **must** be inside a `templates/` folder — that's where Flask's `render_template()` looks for them by default.
 
@@ -145,38 +149,15 @@ combined_score = HYBRID_ALPHA * embedding_score + (1 - HYBRID_ALPHA) * tfidf_sco
 
 ---
 
-## 7. Measuring whether a change actually helped
-`eval_retrieval.py` is a standalone script (not part of the running web app) for proving retrieval quality with a number instead of a feeling.
-
-### What it measures
-**Recall@k** — for a set of questions where you already know the correct source document, what fraction of the time does that document appear among the top-k retrieved chunks? This is checked _before_ generation, so it isolates:
-
-- **"Wrong document fetched"** → recall@k says no → retrieval problem.
-- **"Right document, wrong answer"** → recall@k says yes, but the /ask answer was still wrong → generation problem (prompt, model, chunk contents) — this script can't measure that part; you check it manually in the running app.
-### How to run it
-1. Open `eval_retrieval.py` .
-2. Fill in `DOCS`  with paths to your real uploaded files: DOCS = [    ("./uploads/errors.md", "errors.md"),    ("./uploads/refund_policy.pdf", "refund_policy.pdf"),]
-3. Fill in `QUESTIONS`  with real questions + which document should answer each one: QUESTIONS = [    {"question": "What does error code ERR-4032 mean?", "expected_doc": "errors.md"},    {"question": "How many days for a refund request?", "expected_doc": "refund_policy.pdf"},]
-4. Run: python eval_retrieval.py
-5. Read the output — it prints recall@k for `embed` -only, `hybrid` , and `tfidf` -only, the before→after delta, and a per-question ✓/✗ list so you can see exactly which questions are still failing after the change.
-You can also point it at a JSON file instead of editing the script:
-
-```bash
-python eval_retrieval.py my_questions.json
-```
-where `my_questions.json` is a list of `{"question": ..., "expected_doc": ...}`.
-
----
-
-## 8. Session & document lifecycle (good to know when debugging)
+## 7. Session & document lifecycle (good to know when debugging)
 - Every browser session gets a `session_id`  (stored in a Flask session cookie), and each session has its own isolated `VectorStore` , uploaded files, and dedupe-hash set — uploads in one browser tab don't leak into another user's session.
 - Sessions idle for over an hour are evicted automatically (`SESSION_TTL` ), and only the 20 most recent sessions are kept in memory at once (`MAX_SESSIONS` ) — oldest gets evicted first when a new one needs a slot.
 - Removing a single document (`/remove` ) deletes its chunks, its stored file, and forgets its content-hash — so you can re-upload the exact same file afterward without it being wrongly flagged "duplicate."
 - `/clear`  wipes everything for the current session: chunks, vectors, files, hashes, and the chunk-size comparison stats.
 ---
 
-## 9. Production hardening
-Everything in this section was implemented and verified by actually running it (see `test_app.py`), not just reasoned about.
+## 8. Production hardening
+Everything in this section was implemented and verified by actually running it against a live instance of the app, not just reasoned about.
 
 ### Security
 - **SSRF protection on** `**/load-url**` **.** Before this, pasting a URL like `http://169.254.169.254/latest/meta-data/`  (a cloud metadata endpoint) or `http://localhost:6379`  would make the _server_ fetch it, and the result would get indexed and could be echoed back in an answer. `_validate_url_is_public()`  resolves the hostname and rejects private/loopback/link-local/reserved addresses before fetching — and redirects are followed **manually, one hop at a time**, re-validating every hop, not just the URL you typed. A naive check on only the initial URL would miss a malicious site that returns `302 -> http://169.254.169.254/` .
@@ -188,8 +169,6 @@ Everything in this section was implemented and verified by actually running it (
 - **Cached TF-IDF index.** `VectorStore.get_tfidf_index()`  builds the index (tokenization + IDF over the whole corpus) once and reuses it until the store is mutated (`add` /`remove_doc` /`clear`  all invalidate it). Previously this was rebuilt from scratch on every single question, in both the TF-IDF fallback path and the TF-IDF half of hybrid search — wasted work that scaled with how many documents were indexed.
 ### Answer quality / safety
 - `**TOP_K**`  **and** `**MAX_CONTEXT_TOKENS**` **.** `TOP_K`  (default 5) caps how many chunks retrieval returns; `MAX_CONTEXT_TOKENS`  (default 3000) caps how many tokens' worth of chunk _text_ actually get sent to the LLM. These are different guarantees — structured chunking has no hard upper bound on a single chunk's size (an unstructured document with no real sentence punctuation can produce one huge chunk), so 5 large chunks (or even one) could already exceed a reasonable context budget with `TOP_K`  alone doing nothing to stop it. `fit_to_token_budget()`  greedily keeps the highest-scored chunks until the budget would be exceeded, always keeping at least one even if it alone goes over.
-### Testing
-- `**test_app.py**`  — an actual pytest suite covering the upload/ask/ remove/clear lifecycle, the duplicate-file dedupe fix, multi-strategy chunk comparison, the token-budget guard, TF-IDF cache invalidation, and every SSRF case above (including the redirect-hop test). Run with: pip install pytestpytest test_app.py -v
 ### New/changed environment variables
 | Variable | Default | Purpose |
 | ----- | ----- | ----- |
@@ -197,8 +176,44 @@ Everything in this section was implemented and verified by actually running it (
 | `LOG_LEVEL`  | `INFO`  | Logging verbosity (`DEBUG`, `INFO`, `WARNING`, `ERROR`) |
 | `TOP_K`  | `5`  | How many chunks retrieval returns before token-budget trimming |
 | `MAX_CONTEXT_TOKENS`  | `3000`  | Token budget for chunk text sent to the LLM |
-### Known limitation still deferred (by design, not oversight)
-The storage layer is still pickled files + in-memory dicts, not a real database or vector DB — this is a genuine multi-process/scaling limitation (each `gunicorn` worker has its own separate memory), not something this hardening pass fixes. See the Qdrant architecture plan discussed separately — that's the correct next step, deliberately not bundled into this pass since it's an infrastructure migration, not a hardening fix.
+| `VECTOR_BACKEND`  | `memory`  | `memory` (pickled files, zero setup) or `qdrant` (real vector DB — see §9b) |
+### Status update: Qdrant is now implemented (previously listed as deferred)
+An earlier version of this README listed the pickled-files/in-memory storage layer as a known multi-process scaling limitation, with a Qdrant migration "deliberately not bundled" as future work. That work is done — see §9b below. `VECTOR_BACKEND=memory` (the default) is unchanged and still the right choice for local dev / a single-process course project; switch to `qdrant` once you need multi-worker deployment or a real ANN index.
+
+## 9. Vector DB backend — Qdrant (optional, `VECTOR_BACKEND=qdrant`)
+### Why
+The default `memory` backend is a brute-force Python list scored with plain cosine similarity, pickled to disk. Fine at hundreds of chunks and a single process. It does **not** survive running multiple `gunicorn` workers (each has its own separate copy in memory), and doesn't scale past a few thousand chunks before brute-force scoring gets slow. Qdrant fixes both: a real ANN index (HNSW) shared across processes.
+
+### Same code, two deployment options
+Both point at the exact same `QdrantVectorStore` adapter (`qdrant_store.py`) — only two env vars differ:
+
+|  | Self-hosted (Docker) | Qdrant Cloud |
+| ----- | ----- | ----- |
+| `QDRANT_URL`  | `http://qdrant:6333` (or `http://localhost:6333` outside Docker) | `https://xxxx.aws.cloud.qdrant.io:6333` from your cluster dashboard |
+| `QDRANT_API_KEY`  | unset (no auth by default) | your cluster's API key |
+| Setup | `docker compose up --build`  | Sign up at cloud.qdrant.io, create a free-tier cluster |
+### Running self-hosted
+```bash
+docker compose up --build
+```
+One command builds the app image and starts both the app and Qdrant. `docker-compose.yml` already sets `VECTOR_BACKEND=qdrant` and `QDRANT_URL=http://qdrant:6333` for you — just set your real `OPENROUTER_API_KEY` in a `.env` file first (docker-compose reads it from there automatically).
+
+### Running against Qdrant Cloud instead
+Skip `docker-compose.yml`'s `qdrant` service entirely and just run the app normally with:
+
+```
+VECTOR_BACKEND=qdrant
+QDRANT_URL=https://xxxx.aws.cloud.qdrant.io:6333
+QDRANT_API_KEY=your_cluster_api_key
+```
+### What's actually different under the hood
+- **Retrieval** goes through Qdrant's real ANN search instead of scoring every stored vector in a Python loop.
+- **Hybrid search stays correct, but adapts**: a real vector DB doesn't hand back a score for every vector (that defeats the point of an ANN index) — so `query_scores()`  asks Qdrant for its top ~30 candidates and TF-IDF-blends only within that pool, instead of scoring the whole corpus. See `qdrant_store.py` 's module docstring for the full reasoning.
+- **Chunk-strategy filtering (**`**filtered_by_method**` **) is pushed down into Qdrant** as a real payload filter, rather than filtered in Python — the one place this backend is a genuine capability upgrade, not just a persistence swap.
+- **TF-IDF fallback still works identically** — `get_tfidf_index()`  is mirrored on the Qdrant adapter with the same caching behavior, since TF-IDF is a lexical operation a vector DB was never meant to do.
+- Session eviction and `/clear`  release the Qdrant collection, not just a pickle file, so switching backends doesn't leak collections over time.
+### Verifying it works
+There's no automated test suite shipped for this adapter. Before trusting it, run the app once against a real Qdrant instance (self-hosted or Cloud): upload a document, ask a question that should be answered from it, and confirm a source card comes back. That's the real proof — no amount of code review substitutes for actually hitting a live Qdrant instance at least once.
 
 ## 10. Troubleshooting
 | Symptom | Likely cause |
@@ -210,7 +225,5 @@ The storage layer is still pickled files + in-memory dicts, not a real database 
 | Answers cite the wrong page | Try Structured chunking instead of a fixed word count, or lower/raise `HYBRID_ALPHA` depending on whether your docs rely more on exact terms or on paraphrased meaning |
 | Sessions reset every restart | `SECRET_KEY` isn't set — check the startup log for the warning, then set it explicitly |
 | A `/load-url` request gets rejected with "resolves to a non-public address" | Working as intended — that URL points at an internal/private address; this is the SSRF protection, not a bug |
-
-
 
 

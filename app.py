@@ -105,7 +105,7 @@ MAX_SESSIONS = 20
 
 OPENROUTER_API_KEY = os.environ.get("OPENROUTER_API_KEY", "")
 OPENROUTER_URL = "https://openrouter.ai/api/v1"
-LLM_MODEL = os.environ.get("LLM_MODEL", "openai/gpt-5-mini")
+LLM_MODEL = os.environ.get("LLM_MODEL", "deepseek/deepseek-chat")
 EMBED_MODEL = os.environ.get("EMBED_MODEL", "openai/text-embedding-3-small")
 EMBED_MIN_SCORE = float(os.environ.get("EMBED_MIN_SCORE", "0.30"))
 EMBED_BATCH = 32
@@ -133,6 +133,22 @@ TOP_K = int(os.environ.get("TOP_K", "5"))
 # actual context window. This trims the already-retrieved, already-ranked
 # list down to what actually fits, on top of (not instead of) TOP_K.
 MAX_CONTEXT_TOKENS = int(os.environ.get("MAX_CONTEXT_TOKENS", "3000"))
+
+# Which VectorStore implementation backs retrieval. "memory" (default) is
+# the original brute-force in-process store — zero setup, pickled to disk.
+# "qdrant" swaps in a real vector database with an actual ANN index (HNSW)
+# behind it. The SAME code path handles both self-hosted Qdrant (via
+# docker-compose.yml, QDRANT_API_KEY left unset) and Qdrant Cloud (a
+# cluster URL + API key from cloud.qdrant.io) — only QDRANT_URL and
+# QDRANT_API_KEY differ between the two; see qdrant_store.py.
+VECTOR_BACKEND = os.environ.get("VECTOR_BACKEND", "memory")
+QDRANT_URL = os.environ.get("QDRANT_URL", "http://localhost:6333")
+QDRANT_API_KEY = os.environ.get("QDRANT_API_KEY") or None  # None for self-hosted, unauthenticated
+QDRANT_TIMEOUT = float(os.environ.get("QDRANT_TIMEOUT", "10"))
+# ANN candidates pulled from Qdrant before TF-IDF re-ranks for hybrid
+# search — see qdrant_store.py's module docstring for why this differs
+# from the in-memory backend's "score every chunk" approach.
+QDRANT_CANDIDATE_POOL = int(os.environ.get("QDRANT_CANDIDATE_POOL", "30"))
 
 
 def estimate_tokens(text: str) -> int:
@@ -394,6 +410,35 @@ def _sweep_orphan_uploads() -> None:
 _sweep_orphan_uploads()
 
 
+def _make_store(sid: str):
+    """Construct + load the right VectorStore implementation for `sid`,
+    based on VECTOR_BACKEND. Both implementations expose the same
+    interface, so nothing downstream needs to know or care which one it
+    got. The qdrant_store import is lazy — only needed, and only
+    attempted, when VECTOR_BACKEND=qdrant is actually set."""
+    if VECTOR_BACKEND == "qdrant":
+        from qdrant_store import QdrantVectorStore
+        store = QdrantVectorStore(sid)
+    else:
+        store = VectorStore(sid)
+    store.load()
+    return store
+
+
+def _evict_session_store(sid: str) -> None:
+    """Release backend-specific storage for an evicted/cleared session.
+    Safe to call even if that session never used the currently-active
+    backend — the pickle file simply won't exist, or the Qdrant call
+    will find no matching collection."""
+    (VECTOR_FOLDER / f"{sid}.pkl").unlink(missing_ok=True)
+    if VECTOR_BACKEND == "qdrant":
+        try:
+            from qdrant_store import QdrantVectorStore
+            QdrantVectorStore(sid).clear()
+        except Exception:
+            logger.warning("Failed to release Qdrant collection for evicted session %s", sid, exc_info=True)
+
+
 def _get_store(sid: str) -> VectorStore:
     """Return this session's vector store, evicting stale/overflowing sessions."""
     now = time.time()
@@ -403,7 +448,7 @@ def _get_store(sid: str) -> VectorStore:
             SESSION_ACCESS.pop(s, None)
             HASH_STORE.pop(s, None)
             HASH_BY_DOC.pop(s, None)
-            (VECTOR_FOLDER / f"{s}.pkl").unlink(missing_ok=True)
+            _evict_session_store(s)
             _cleanup_session_files(s)
     if len(SESSION_ACCESS) >= MAX_SESSIONS and sid not in SESSION_ACCESS:
         oldest = min(SESSION_ACCESS, key=SESSION_ACCESS.get)
@@ -411,15 +456,14 @@ def _get_store(sid: str) -> VectorStore:
         SESSION_ACCESS.pop(oldest, None)
         HASH_STORE.pop(oldest, None)
         HASH_BY_DOC.pop(oldest, None)
-        (VECTOR_FOLDER / f"{oldest}.pkl").unlink(missing_ok=True)
+        _evict_session_store(oldest)
         _cleanup_session_files(oldest)
     SESSION_ACCESS[sid] = now
     _load_session_manifest(sid)
 
     store = VECTOR_STORE.get(sid)
     if store is None:
-        store = VectorStore(sid)
-        store.load()
+        store = _make_store(sid)
         VECTOR_STORE[sid] = store
     return store
 
@@ -1514,6 +1558,7 @@ def healthz():
         "status": "ok",
         "embeddings_configured": bool(OPENROUTER_API_KEY),
         "retrieval_mode": RETRIEVAL_MODE if OPENROUTER_API_KEY else "tfidf-only",
+        "vector_backend": VECTOR_BACKEND,
         "active_sessions": len(SESSION_ACCESS),
     })
 

@@ -2,4 +2,8 @@ flask>=3.0
 werkzeug>=3.0
 pymupdf>=1.24
 waitress>=3.0
-pytest>=8.0
+
+# Optional — only needed if VECTOR_BACKEND=qdrant. The app runs fine
+# without this installed as long as VECTOR_BACKEND stays "memory" (the
+# default); qdrant_store.py is only imported when qdrant mode is selected.
+qdrant-client>=1.9
