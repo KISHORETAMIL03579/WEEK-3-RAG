@@ -7,8 +7,13 @@ import time
 import uuid
 import pickle
 import hashlib
+import logging
+import secrets
+import ipaddress
+import socket
 import urllib.request
 import urllib.parse
+import urllib.error
 import html.parser
 from pathlib import Path
 from collections import Counter
@@ -22,6 +27,12 @@ try:
     sys.stderr.reconfigure(encoding="utf-8")
 except Exception:
     pass
+
+logging.basicConfig(
+    level=os.environ.get("LOG_LEVEL", "INFO"),
+    format="%(asctime)s %(levelname)s [%(name)s] %(message)s",
+)
+logger = logging.getLogger("ask_my_docs")
 
 
 def _load_env():
@@ -41,7 +52,25 @@ _load_env()
 # ─────────────────────────────────────────────────────────────────────────────
 
 app = Flask(__name__)
-app.secret_key = os.environ.get("SECRET_KEY", "ask-my-docs-secret-2026")
+_env_secret = os.environ.get("SECRET_KEY")
+if _env_secret:
+    app.secret_key = _env_secret
+else:
+    # No hardcoded fallback — a shared, source-controlled secret key means
+    # every deployment that forgets to set SECRET_KEY signs session
+    # cookies with the same key, letting anyone forge another user's
+    # session. A random per-process key at least means cookies from one
+    # run can't be forged by someone who read this file; the real fix in
+    # any actual production deployment is still to set SECRET_KEY
+    # explicitly so sessions survive a restart.
+    app.secret_key = secrets.token_hex(32)
+    logger.warning(
+        "SECRET_KEY not set — using a random per-process key. Sessions will "
+        "NOT survive a server restart, and running multiple instances "
+        "(e.g. gunicorn --workers N) will break sessions since each "
+        "process gets a different key. Set SECRET_KEY explicitly for any "
+        "real deployment."
+    )
 app.config["MAX_CONTENT_LENGTH"] = 50 * 1024 * 1024  # 50 MB per request
 
 BASE_DIR = Path(__file__).parent
@@ -76,7 +105,7 @@ MAX_SESSIONS = 20
 
 OPENROUTER_API_KEY = os.environ.get("OPENROUTER_API_KEY", "")
 OPENROUTER_URL = "https://openrouter.ai/api/v1"
-LLM_MODEL = os.environ.get("LLM_MODEL", "deepseek/deepseek-chat")
+LLM_MODEL = os.environ.get("LLM_MODEL", "openai/gpt-5-mini")
 EMBED_MODEL = os.environ.get("EMBED_MODEL", "openai/text-embedding-3-small")
 EMBED_MIN_SCORE = float(os.environ.get("EMBED_MIN_SCORE", "0.30"))
 EMBED_BATCH = 32
@@ -87,6 +116,57 @@ EMBED_BATCH = 32
 # can flip back to it and measure the before/after with the same code.
 RETRIEVAL_MODE = os.environ.get("RETRIEVAL_MODE", "hybrid")  # "hybrid" | "embed"
 HYBRID_ALPHA = float(os.environ.get("HYBRID_ALPHA", "0.6"))  # weight on embedding score
+
+# How many chunks retrieval returns, before token-budget trimming below.
+TOP_K = int(os.environ.get("TOP_K", "5"))
+
+# Hard cap on how many tokens' worth of retrieved chunk TEXT get sent to
+# the LLM as context, regardless of how many chunks TOP_K allows through.
+#
+# Why this is needed even though TOP_K already exists: TOP_K caps the
+# COUNT of chunks, not their combined SIZE. Structured chunking has no
+# hard upper bound on a single chunk (see structured_chunk() /
+# split_by_sentences() — an unstructured document with no real sentence
+# punctuation can produce one abnormally large chunk). Even 5 large
+# chunks — or just one — can already blow past a reasonable context
+# budget, drive up latency/cost, and in the worst case exceed the model's
+# actual context window. This trims the already-retrieved, already-ranked
+# list down to what actually fits, on top of (not instead of) TOP_K.
+MAX_CONTEXT_TOKENS = int(os.environ.get("MAX_CONTEXT_TOKENS", "3000"))
+
+
+def estimate_tokens(text: str) -> int:
+    """
+    Rough token-count estimate. There's no real tokenizer available
+    offline for arbitrary models, so this uses the standard ~4-characters-
+    per-token rule of thumb for English text (the same approximation most
+    LLM providers themselves suggest when a real tokenizer isn't handy).
+    Not exact — good enough for a budget guard, not for billing.
+    """
+    return max(1, len(text) // 4)
+
+
+def fit_to_token_budget(results: list[dict], max_tokens: int) -> list[dict]:
+    """
+    Greedily keep results — assumed already sorted best-first by score —
+    until the cumulative estimated token count would exceed max_tokens.
+
+    Always keeps at least the single best-scoring result, even if it
+    alone exceeds the budget: an answer grounded in one long chunk is
+    still better than refusing to answer at all. Everything after that
+    is dropped once the running total would tip over the limit, so a
+    handful of oversized chunks can't silently balloon the prompt sent to
+    the LLM regardless of how large TOP_K is set to.
+    """
+    kept: list[dict] = []
+    used = 0
+    for r in results:
+        t = estimate_tokens(r.get("text", ""))
+        if kept and used + t > max_tokens:
+            break
+        kept.append(r)
+        used += t
+    return kept
 
 _simple_tokenizer = re.compile(r"[\w]+")
 
@@ -145,6 +225,11 @@ class VectorStore:
         self.chunks: list[dict] = []
         self.vectors: list[list[float]] = []
         self.path = VECTOR_FOLDER / f"{sid}.pkl"
+        # Cached TF-IDF index (token frequencies + IDF weights) for this
+        # store's current chunk set. None means "needs rebuilding" — see
+        # get_tfidf_index(). Invalidated by every mutation below so it's
+        # never stale, but never rebuilt more often than necessary either.
+        self._tfidf_index_cache: dict | None = None
 
     def load(self) -> None:
         if self.path.exists():
@@ -152,7 +237,9 @@ class VectorStore:
                 data = pickle.loads(self.path.read_bytes())
                 self.chunks = data["chunks"]
                 self.vectors = data["vectors"]
+                self._tfidf_index_cache = None
             except Exception:
+                logger.warning("Corrupted vector store at %s — starting fresh", self.path, exc_info=True)
                 self.chunks, self.vectors = [], []
 
     def save(self) -> None:
@@ -161,7 +248,25 @@ class VectorStore:
     def add(self, chunks: list[dict], vectors: list[list[float]]) -> None:
         self.chunks.extend(chunks)
         self.vectors.extend(vectors)
+        self._tfidf_index_cache = None
         self.save()
+
+    def get_tfidf_index(self) -> dict:
+        """
+        Return this store's TF-IDF index, building it once and caching it
+        until the next mutation (add/remove_doc/clear/load all invalidate
+        the cache).
+
+        Why: without this, build_index() re-tokenizes and recomputes IDF
+        over the ENTIRE chunk corpus on every single question that uses
+        the TF-IDF path — repeated, wasted work that scales with corpus
+        size and gets worse the more documents are indexed. The index
+        only actually changes when chunks change, so it's safe to reuse
+        between questions.
+        """
+        if self._tfidf_index_cache is None:
+            self._tfidf_index_cache = build_index(self.chunks)
+        return self._tfidf_index_cache
 
     def query(self, vector: list[float], top_k: int = 5,
               min_score: float = 0.0) -> list[dict]:
@@ -178,6 +283,7 @@ class VectorStore:
 
     def clear(self) -> None:
         self.chunks, self.vectors = [], []
+        self._tfidf_index_cache = None
         self.path.unlink(missing_ok=True)
 
     def remove_doc(self, doc_id: str) -> int:
@@ -189,6 +295,7 @@ class VectorStore:
         self.vectors = [v for _, v in kept]
         removed = before - len(self.chunks)
         if removed:
+            self._tfidf_index_cache = None
             self.save()
         return removed
 
@@ -246,6 +353,7 @@ def _load_session_manifest(sid: str) -> None:
     try:
         data = json.loads(manifest.read_text(encoding="utf-8"))
     except Exception:
+        logger.warning("Corrupted session manifest at %s — ignoring", manifest, exc_info=True)
         return
     files: dict[str, dict] = {}
     for doc_id, meta in data.items():
@@ -272,6 +380,7 @@ def _sweep_orphan_uploads() -> None:
         try:
             data = json.loads(manifest.read_text(encoding="utf-8"))
         except Exception:
+            logger.warning("Corrupted manifest during startup sweep: %s — skipping", manifest, exc_info=True)
             continue
         for meta in data.values():
             referenced.add(str(Path(meta.get("path", "")).resolve()))
@@ -329,6 +438,7 @@ def extract_pdf_pages(filepath: str) -> list[dict]:
     try:
         doc = fitz.open(filepath)
     except Exception:
+        logger.info("Could not open PDF %s (corrupt, encrypted, or not a real PDF)", filepath, exc_info=True)
         return []
     for page_num, page in enumerate(doc, start=1):
         text = page.get_text("text").strip()
@@ -394,17 +504,99 @@ class _TextExtractor(html.parser.HTMLParser):
         return text.strip()
 
 
-def fetch_web_page(url: str) -> tuple[str, str]:
-    """Fetch a URL and return (title, cleaned text)."""
-    req = urllib.request.Request(
-        url,
-        headers={"User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 AskMyDocs/1.0"},
+def _is_public_ip(ip_str: str) -> bool:
+    try:
+        ip = ipaddress.ip_address(ip_str)
+    except ValueError:
+        return False
+    return not (
+        ip.is_private or ip.is_loopback or ip.is_link_local
+        or ip.is_multicast or ip.is_reserved or ip.is_unspecified
     )
-    with urllib.request.urlopen(req, timeout=30) as resp:
-        raw = resp.read().decode("utf-8", errors="ignore")
+
+
+def _validate_url_is_public(url: str) -> None:
+    """
+    Raise ValueError if `url` resolves to a private/loopback/link-local/
+    reserved address.
+
+    Why: without this, /load-url is a classic SSRF (server-side request
+    forgery) vector — someone points it at http://169.254.169.254/ (a
+    cloud metadata endpoint), http://localhost:6379 (an internal Redis),
+    or any other service only the SERVER can reach, and the fetched
+    content gets indexed and can be echoed back in answers. Scheme
+    validation alone (http/https only) does nothing to stop this, since
+    the hostname itself is the problem, not the protocol.
+    """
+    parsed = urllib.parse.urlparse(url)
+    if parsed.scheme not in ("http", "https"):
+        raise ValueError("Only http:// and https:// URLs are allowed")
+    hostname = parsed.hostname
+    if not hostname:
+        raise ValueError("URL has no hostname")
+    try:
+        infos = socket.getaddrinfo(hostname, None)
+    except socket.gaierror as exc:
+        raise ValueError(f"Could not resolve hostname '{hostname}': {exc}") from exc
+    for family, _, _, _, sockaddr in infos:
+        ip_str = sockaddr[0]
+        if not _is_public_ip(ip_str):
+            raise ValueError(
+                f"URL '{hostname}' resolves to a non-public address ({ip_str}) — refusing to fetch"
+            )
+
+
+class _NoAutoRedirect(urllib.request.HTTPRedirectHandler):
+    """Disables urllib's automatic redirect-following. Returning None here
+    makes urlopen raise HTTPError with the redirect's status code instead
+    of silently following it — see fetch_web_page() for why that matters."""
+    def redirect_request(self, req, fp, code, msg, headers, newurl):
+        return None
+
+
+def fetch_web_page(url: str, max_redirects: int = 5) -> tuple[str, str]:
+    """
+    Fetch a URL and return (title, cleaned text).
+
+    Redirects are followed manually, one hop at a time, re-running
+    _validate_url_is_public() on every hop — not just the URL the user
+    typed. Trusting urllib's built-in automatic redirect handling would
+    mean the SSRF check only ever covers the first URL; a malicious or
+    compromised site could return `301 -> http://169.254.169.254/` and
+    the server would have already made that internal request before any
+    validation saw it.
+    """
+    opener = urllib.request.build_opener(_NoAutoRedirect)
+    current = url
+    raw = None
+
+    for _ in range(max_redirects + 1):
+        _validate_url_is_public(current)
+        req = urllib.request.Request(
+            current,
+            headers={"User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 AskMyDocs/1.0"},
+        )
+        try:
+            with opener.open(req, timeout=30) as resp:
+                raw = resp.read().decode("utf-8", errors="ignore")
+            break
+        except urllib.error.HTTPError as e:
+            if e.code in (301, 302, 303, 307, 308):
+                location = e.headers.get("Location")
+                if not location:
+                    raise ValueError(f"Redirect ({e.code}) with no Location header") from e
+                current = urllib.parse.urljoin(current, location)
+                continue
+            raise
+    else:
+        raise ValueError(f"Too many redirects (>{max_redirects})")
+
+    if raw is None:
+        raise ValueError("Too many redirects")
+
     parser = _TextExtractor()
     parser.feed(raw)
-    title = parser.title or urllib.parse.urlparse(url).netloc
+    title = parser.title or urllib.parse.urlparse(current).netloc
     text = parser.get_text()
     return title, text
 
@@ -777,7 +969,7 @@ def hybrid_search(store: "VectorStore", query: str, top_k: int = 5,
                     if store.vectors and len(store.vectors) == len(store.chunks)
                     else [0.0] * len(store.chunks))
 
-    index = build_index(store.chunks)
+    index = store.get_tfidf_index()
     q_vec = tfidf_vector(compute_tf(tokenize(query)), index["idf"])
     tfidf_scores = [
         cosine_sim(q_vec, tfidf_vector(compute_tf(tokens), index["idf"]))
@@ -1217,11 +1409,17 @@ def ask():
     if OPENROUTER_API_KEY and active_store.vectors and len(active_store.vectors) == len(active_store.chunks):
         try:
             if RETRIEVAL_MODE == "hybrid":
-                results = hybrid_search(active_store, query, top_k=5)
+                results = hybrid_search(active_store, query, top_k=TOP_K)
                 results = [r for r in results if r["score"] >= EMBED_MIN_SCORE]
             else:
                 q_vec = embed_text(query)
-                results = active_store.query(q_vec, top_k=5, min_score=EMBED_MIN_SCORE)
+                results = active_store.query(q_vec, top_k=TOP_K, min_score=EMBED_MIN_SCORE)
+            # TOP_K caps how many CHUNKS come back, not how many TOKENS
+            # they add up to — trim to the context budget before this
+            # goes anywhere near the LLM. Applied here (not just inside
+            # generate_answer) so the "sources" shown to the user are
+            # exactly what actually grounded the answer, never more.
+            results = fit_to_token_budget(results, MAX_CONTEXT_TOKENS)
             if not validate_context(results, EMBED_MIN_SCORE):
                 return jsonify({
                     "found": False,
@@ -1235,12 +1433,18 @@ def ask():
                 "sources": annotate_openable(results),
             })
         except Exception:
-            pass  # fall through to TF-IDF
+            logger.warning(
+                "Embeddings/LLM path failed for a query — falling back to TF-IDF-only. "
+                "This usually means a bad API key, rate limit, or network issue with OpenRouter.",
+                exc_info=True,
+            )
+            # fall through to TF-IDF
 
     # Path 2: offline TF-IDF fallback
     chunks = active_store.chunks
-    index = build_index(chunks)
-    results = search_chunks(query, chunks, index, top_k=4)
+    index = active_store.get_tfidf_index()
+    results = search_chunks(query, chunks, index, top_k=TOP_K)
+    results = fit_to_token_budget(results, MAX_CONTEXT_TOKENS)
     resp = synthesize_answer(query, results)
     resp["sources"] = annotate_openable(resp.get("sources", []))
     return jsonify(resp)
@@ -1292,6 +1496,26 @@ def remove_doc():
         HASH_STORE.get(sid, set()).discard(doc_hash)
 
     return jsonify({"ok": True, "removed_chunks": removed_chunks})
+
+
+@app.route("/healthz", methods=["GET"])
+def healthz():
+    """
+    Liveness/readiness endpoint for deployment monitoring (load balancers,
+    Docker/Kubernetes healthchecks, uptime pings). Deliberately does NOT
+    touch session state — it should return 200 even for a caller with no
+    cookies at all, which is exactly what a healthcheck request looks
+    like. Reports whether the embeddings/LLM path is configured, not
+    whether it's currently reachable — an actual OpenRouter call on every
+    healthcheck would be slow and cost money for something checked every
+    few seconds.
+    """
+    return jsonify({
+        "status": "ok",
+        "embeddings_configured": bool(OPENROUTER_API_KEY),
+        "retrieval_mode": RETRIEVAL_MODE if OPENROUTER_API_KEY else "tfidf-only",
+        "active_sessions": len(SESSION_ACCESS),
+    })
 
 
 @app.route("/status", methods=["GET"])

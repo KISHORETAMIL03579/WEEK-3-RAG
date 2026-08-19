@@ -70,14 +70,16 @@ Create a `.env` file next to `app.py`:
 
 ```
 OPENROUTER_API_KEY=sk-or-...
-LLM_MODEL=deepseek/deepseek-chat
+LLM_MODEL=openai/gpt-5-mini
 EMBED_MODEL=openai/text-embedding-3-small
 EMBED_MIN_SCORE=0.30
 RETRIEVAL_MODE=hybrid
 HYBRID_ALPHA=0.6
 PORT=5000
 ```
-- `**OPENROUTER_API_KEY**`  — get one at [openrouter.ai](https://openrouter.ai/) . Without it, the app still works but falls back to a fully offline TF-IDF-only mode (no embeddings, no LLM-generated answers — it stitches together the most relevant sentences instead).
+- `**OPENROUTER_API_KEY**`  — get one at [openrouter.ai](https://openrouter.ai/) . Without it, the app still works but falls back to a fully offline TF-IDF-only mode (no embeddings, no LLM-generated answers — it stitches together the most relevant sentences instead). **Never commit a real key or paste one into chat/docs/screenshots** — treat any key that's left your local `.env`  as compromised and rotate it at openrouter.ai immediately.
+- `**LLM_MODEL**`  — any OpenRouter chat model slug. Currently set to `openai/gpt-5-mini`  (400k context). Other confirmed working alternatives: `openai/gpt-4o-mini`  (cheaper, 128k context), `deepseek/deepseek-chat`  (app.py's built-in fallback default if `LLM_MODEL`  is unset entirely).
+- `**EMBED_MODEL**`  — any OpenRouter embedding model slug. Confirmed working alternatives: `baai/bge-base-en-v1.5`  (768-dim, solid general default) and `baai/bge-m3`  (1024-dim, strong multilingual/long-document performance). **Switching this requires re-indexing** — vectors from different embedding models live in different, incompatible vector spaces, so `/clear`  and re-upload after changing it; don't expect old and new vectors to compare meaningfully in the same session.
 - `**RETRIEVAL_MODE**`  — `hybrid`  (default) blends embeddings + TF-IDF; `embed`  uses embeddings alone (useful for an A/B comparison, see §7).
 - `**EMBED_MIN_SCORE**`  — the similarity threshold below which the app says "I don't know" rather than answer from weak matches. Lower this if it's too eager to give up; raise it if it's answering from irrelevant chunks.
 ### Run
@@ -173,7 +175,32 @@ where `my_questions.json` is a list of `{"question": ..., "expected_doc": ...}`.
 - `/clear`  wipes everything for the current session: chunks, vectors, files, hashes, and the chunk-size comparison stats.
 ---
 
-## 9. Troubleshooting
+## 9. Production hardening
+Everything in this section was implemented and verified by actually running it (see `test_app.py`), not just reasoned about.
+
+### Security
+- **SSRF protection on** `**/load-url**` **.** Before this, pasting a URL like `http://169.254.169.254/latest/meta-data/`  (a cloud metadata endpoint) or `http://localhost:6379`  would make the _server_ fetch it, and the result would get indexed and could be echoed back in an answer. `_validate_url_is_public()`  resolves the hostname and rejects private/loopback/link-local/reserved addresses before fetching — and redirects are followed **manually, one hop at a time**, re-validating every hop, not just the URL you typed. A naive check on only the initial URL would miss a malicious site that returns `302 -> http://169.254.169.254/` .
+- **No shared hardcoded** `**SECRET_KEY**` **.** Previously, if `SECRET_KEY`  wasn't set in the environment, every deployment fell back to the same hardcoded string in source control — meaning anyone could forge a session cookie for any deployment that forgot to set it. Now it generates a random per-process key instead, with a loud startup warning that sessions won't survive a restart and won't work correctly across multiple worker processes until you set `SECRET_KEY`  explicitly.
+### Observability
+- **Structured logging** (`logging`  module, configurable via `LOG_LEVEL` ) replaced every silent `except Exception: pass` . The most important one: the embeddings/LLM path in `/ask`  used to fail silently and fall back to TF-IDF with zero signal that anything was wrong — a bad API key, a rate limit, or an OpenRouter outage would look identical to normal offline operation. Now it logs a warning with the full traceback before falling back.
+- `**GET /healthz**`  — a liveness endpoint that doesn't touch session state (so a load balancer or Docker healthcheck with no cookies gets a clean 200), reporting whether embeddings are configured and how many sessions are currently active.
+### Performance
+- **Cached TF-IDF index.** `VectorStore.get_tfidf_index()`  builds the index (tokenization + IDF over the whole corpus) once and reuses it until the store is mutated (`add` /`remove_doc` /`clear`  all invalidate it). Previously this was rebuilt from scratch on every single question, in both the TF-IDF fallback path and the TF-IDF half of hybrid search — wasted work that scaled with how many documents were indexed.
+### Answer quality / safety
+- `**TOP_K**`  **and** `**MAX_CONTEXT_TOKENS**` **.** `TOP_K`  (default 5) caps how many chunks retrieval returns; `MAX_CONTEXT_TOKENS`  (default 3000) caps how many tokens' worth of chunk _text_ actually get sent to the LLM. These are different guarantees — structured chunking has no hard upper bound on a single chunk's size (an unstructured document with no real sentence punctuation can produce one huge chunk), so 5 large chunks (or even one) could already exceed a reasonable context budget with `TOP_K`  alone doing nothing to stop it. `fit_to_token_budget()`  greedily keeps the highest-scored chunks until the budget would be exceeded, always keeping at least one even if it alone goes over.
+### Testing
+- `**test_app.py**`  — an actual pytest suite covering the upload/ask/ remove/clear lifecycle, the duplicate-file dedupe fix, multi-strategy chunk comparison, the token-budget guard, TF-IDF cache invalidation, and every SSRF case above (including the redirect-hop test). Run with: pip install pytestpytest test_app.py -v
+### New/changed environment variables
+| Variable | Default | Purpose |
+| ----- | ----- | ----- |
+| `SECRET_KEY`  | _(random per-process if unset)_ | <p>Session cookie signing — </p><p>**set this explicitly for any real deployment**</p> |
+| `LOG_LEVEL`  | `INFO`  | Logging verbosity (`DEBUG`, `INFO`, `WARNING`, `ERROR`) |
+| `TOP_K`  | `5`  | How many chunks retrieval returns before token-budget trimming |
+| `MAX_CONTEXT_TOKENS`  | `3000`  | Token budget for chunk text sent to the LLM |
+### Known limitation still deferred (by design, not oversight)
+The storage layer is still pickled files + in-memory dicts, not a real database or vector DB — this is a genuine multi-process/scaling limitation (each `gunicorn` worker has its own separate memory), not something this hardening pass fixes. See the Qdrant architecture plan discussed separately — that's the correct next step, deliberately not bundled into this pass since it's an infrastructure migration, not a hardening fix.
+
+## 10. Troubleshooting
 | Symptom | Likely cause |
 | ----- | ----- |
 | "TF-IDF (offline fallback)" mode always, even after setting the key | `.env` not being picked up — confirm it's named exactly `.env` and sits next to `app.py`, or export the var in your shell instead |
@@ -181,5 +208,9 @@ where `my_questions.json` is a list of `{"question": ..., "expected_doc": ...}`.
 | Clicking "Open ↗" shows a blank page | Old bug in `view.html` (a stray syntax error broke the whole script) — fixed; make sure you're running the current `view.html`  |
 | Every answer says "I don't know" | `EMBED_MIN_SCORE` too high for your document's content, or the embedding API key/model is misconfigured — check the terminal for errors |
 | Answers cite the wrong page | Try Structured chunking instead of a fixed word count, or lower/raise `HYBRID_ALPHA` depending on whether your docs rely more on exact terms or on paraphrased meaning |
+| Sessions reset every restart | `SECRET_KEY` isn't set — check the startup log for the warning, then set it explicitly |
+| A `/load-url` request gets rejected with "resolves to a non-public address" | Working as intended — that URL points at an internal/private address; this is the SSRF protection, not a bug |
+
+
 
 
