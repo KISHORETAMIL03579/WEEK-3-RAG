@@ -75,6 +75,12 @@ class QdrantVectorStore:
         self.chunks: list[dict] = []
         self.vectors: list[list[float]] = []
         self._tfidf_index_cache: dict | None = None
+        # Set whenever a backend delete call fails — the local mirror still
+        # gets updated so the UI doesn't get stuck, but this makes the
+        # failure visible to whoever called remove_doc()/clear(), instead
+        # of only ever showing up as a warning buried in server logs while
+        # the API response reports plain success.
+        self.last_backend_error: str | None = None
 
     def _collection_exists(self) -> bool:
         names = [c.name for c in _client().get_collections().collections]
@@ -151,6 +157,7 @@ class QdrantVectorStore:
 
     def remove_doc(self, doc_id: str) -> int:
         before = len(self.chunks)
+        self.last_backend_error = None
         try:
             if self._collection_exists():
                 _client().delete(
@@ -159,7 +166,8 @@ class QdrantVectorStore:
                         qmodels.FieldCondition(key="doc_id", match=qmodels.MatchValue(value=doc_id))
                     ])),
                 )
-        except Exception:
+        except Exception as exc:
+            self.last_backend_error = f"Qdrant delete failed: {exc}"
             _app.logger.warning("Qdrant delete-by-doc_id failed for %s — local mirror still "
                                "updated, but the collection may retain stale points.",
                                doc_id, exc_info=True)
@@ -172,10 +180,12 @@ class QdrantVectorStore:
         return removed
 
     def clear(self) -> None:
+        self.last_backend_error = None
         try:
             if self._collection_exists():
                 _client().delete_collection(self.collection)
-        except Exception:
+        except Exception as exc:
+            self.last_backend_error = f"Qdrant delete_collection failed: {exc}"
             _app.logger.warning("Qdrant delete_collection failed for %s during clear().",
                                self.collection, exc_info=True)
         self.chunks, self.vectors = [], []

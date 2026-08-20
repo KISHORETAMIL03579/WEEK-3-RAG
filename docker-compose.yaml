@@ -1,15 +1,20 @@
 version: "3.9"
 
-# Self-hosted Qdrant setup. One command builds the app image and starts
-# everything:
+# Self-hosted Qdrant by default — one command builds the app image and
+# starts everything:
 #
 #   docker compose up --build
 #
-# For Qdrant Cloud instead of self-hosting, skip the qdrant service below
-# entirely and just point the app at your cluster:
+# To point at Qdrant Cloud INSTEAD of self-hosting, set these in your
+# .env (same file docker-compose already reads for OPENROUTER_API_KEY,
+# etc. — no need to edit this file):
 #   QDRANT_URL=https://xxxx.aws.cloud.qdrant.io:6333
 #   QDRANT_API_KEY=<your cluster's key>
-# (same app image, same code — only these two env vars change)
+# The local `qdrant` service below will still start (harmless, just
+# unused) unless you also comment it out and remove the app service's
+# `depends_on` — or skip docker-compose entirely and run
+# `docker build && docker run --env-file .env ...` instead, which never
+# starts a local Qdrant container at all.
 
 services:
   qdrant:
@@ -30,8 +35,12 @@ services:
       - "5000:5000"
     environment:
       VECTOR_BACKEND: qdrant
-      QDRANT_URL: http://qdrant:6333
-      # QDRANT_API_KEY left unset — self-hosted Qdrant has no auth by default
+      # These two now actually respect .env, like every other var here —
+      # previously QDRANT_URL was hardcoded to the local service and
+      # QDRANT_API_KEY wasn't passed through at all, so setting your real
+      # Qdrant Cloud credentials in .env was silently ignored.
+      QDRANT_URL: ${QDRANT_URL:-http://qdrant:6333}
+      QDRANT_API_KEY: ${QDRANT_API_KEY:-}
       OPENROUTER_API_KEY: ${OPENROUTER_API_KEY:-}
       LLM_MODEL: ${LLM_MODEL:-openai/gpt-5-mini}
       EMBED_MODEL: ${EMBED_MODEL:-openai/text-embedding-3-small}

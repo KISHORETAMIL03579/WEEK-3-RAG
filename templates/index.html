@@ -1038,6 +1038,7 @@
       <div class="status-dot" id="statusDot"></div>
       <span id="statLabel">Documents: 0</span>
       <span class="topbar-mode" id="modeLabel">Retrieval: TF-IDF</span>
+      <span class="topbar-mode" id="backendLabel" style="display:none;">Backend: memory</span>
     </div>
   </header>
 
@@ -1267,7 +1268,7 @@ function renderStagedFiles() {
     dropzone.querySelector('.dropzone-title').textContent = 'Drop files here';
     dropzone.querySelector('.dropzone-sub').textContent = 'PDF, TXT, or Markdown';
     uploadBtn.disabled = true;
-    cancelBtn.disabled = true;
+    cancelBtn.style.display = 'none';
     return;
   }
 
@@ -1288,6 +1289,7 @@ function renderStagedFiles() {
 
   uploadBtn.disabled = false;
   cancelBtn.disabled = false;
+  cancelBtn.style.display = 'flex';
 }
 
 // Opens a staged (not-yet-uploaded) file in a new tab so it can be
@@ -1372,23 +1374,42 @@ document.addEventListener('click', (e) => {
 //  Upload & Index
 // ─────────────────────────────────────────────────────────────────────────────
 
+let currentUploadController = null;
+let currentUploadId = null;
+
 async function uploadFiles() {
   if (!selectedFiles.length) return;
 
   const btn = document.getElementById('uploadBtn');
+  const cancelBtn = document.getElementById('cancelStagedBtn');
   const progress = document.getElementById('uploadProgress');
   btn.disabled = true;
   progress.style.display = 'block';
 
+  // Cancel button now stays enabled DURING the upload too — clicking it
+  // calls cancelActiveUpload() below, not cancelStagedFiles().
+  cancelBtn.disabled = false;
+  cancelBtn.textContent = 'Cancel upload';
+  cancelBtn.onclick = cancelActiveUpload;
+
+  currentUploadId = (crypto.randomUUID && crypto.randomUUID()) ||
+    (Date.now() + '-' + Math.random().toString(36).slice(2));
+  currentUploadController = new AbortController();
+
   const formData = new FormData();
   selectedFiles.forEach(f => formData.append('files', f));
   formData.append('chunk_mode', currentMode);
+  formData.append('upload_id', currentUploadId);
 
   try {
-    const res = await fetch('/upload', { method: 'POST', body: formData });
+    const res = await fetch('/upload', {
+      method: 'POST', body: formData, signal: currentUploadController.signal,
+    });
     const data = await res.json();
 
-    if (!res.ok || !data.ok) {
+    if (data.cancelled) {
+      showToast('Upload cancelled — nothing was indexed.', 'success');
+    } else if (!res.ok || !data.ok) {
       showToast(data.error || 'Upload failed', 'error');
       (data.documents || []).forEach(d => {
         if (d.error) showToast(`${d.filename}: ${d.error}`, 'error');
@@ -1411,16 +1432,43 @@ async function uploadFiles() {
         showToast(`✅ Indexed ${indexed} doc(s) → ${data.total_chunks} chunks`, 'success');
       }
       if (indexed > 0) markSteps(3);
-      // Reset dropzone + staged-file list + Cancel button state
-      selectedFiles = [];
-      renderStagedFiles();
     }
+    // Reset dropzone + staged-file list + Cancel button state regardless
+    // of outcome — success, failure, and cancellation all end the same way.
+    selectedFiles = [];
+    renderStagedFiles();
   } catch (err) {
-    showToast('Server error: ' + err.message, 'error');
+    if (err.name === 'AbortError') {
+      // Client-side abort already handled by cancelActiveUpload()'s own
+      // toast + /upload-cancel call — nothing further to show here.
+    } else {
+      showToast('Server error: ' + err.message, 'error');
+    }
   } finally {
     btn.disabled = false;
     progress.style.display = 'none';
+    cancelBtn.textContent = 'Cancel';
+    cancelBtn.onclick = cancelStagedFiles;
+    currentUploadController = null;
+    currentUploadId = null;
   }
+}
+
+// Cancels an upload that's currently in flight. Stops the client from
+// waiting on the response (AbortController) AND tells the server via
+// /upload-cancel so it can roll back anything already committed to the
+// store during this call — see app.py's /upload for why a guaranteed
+// rollback, not always an instant interrupt, is the honest contract here.
+function cancelActiveUpload() {
+  if (currentUploadController) currentUploadController.abort();
+  if (currentUploadId) {
+    fetch('/upload-cancel', {
+      method: 'POST',
+      headers: { 'Content-Type': 'application/json' },
+      body: JSON.stringify({ upload_id: currentUploadId }),
+    }).catch(() => {});
+  }
+  showToast('Cancelling upload…', 'success');
 }
 
 async function loadUrl() {
@@ -1553,7 +1601,8 @@ function handleMethodFilterChange() {
 // ─────────────────────────────────────────────────────────────────────────────
 
 async function clearDocs() {
-  await fetch('/clear', { method: 'POST' });
+  const res = await fetch('/clear', { method: 'POST' });
+  const data = await res.json().catch(() => ({}));
   document.getElementById('docList').innerHTML =
     `<div style="font-size:.75rem;color:var(--text-muted);text-align:center;padding:12px 0;" data-empty>No documents loaded</div>`;
   docCount = 0;
@@ -1561,6 +1610,7 @@ async function clearDocs() {
   updateStatus();
   refreshMethodFilter();
   showToast('All documents cleared.', 'success');
+  if (data.warning) showToast(data.warning, 'error');
 }
 
 function openDoc(docId, pageNum, hlQuery) {
@@ -1602,6 +1652,7 @@ async function removeDoc(encodedDocId) {
     updateStatus();
     refreshMethodFilter();
     showToast(`Removed document and ${data.removed_chunks} chunk(s).`, 'success');
+    if (data.warning) showToast(data.warning, 'error');
   } catch (err) {
     showToast('Error: ' + err.message, 'error');
   }
@@ -1900,6 +1951,11 @@ function showToast(msg, type = '') {
     const data = await res.json();
     const modeEl = document.getElementById('modeLabel');
     if (modeEl && data.mode) modeEl.textContent = 'Retrieval: ' + data.mode;
+    const backendEl = document.getElementById('backendLabel');
+    if (backendEl && data.vector_backend) {
+      backendEl.textContent = 'Backend: ' + data.vector_backend;
+      backendEl.style.display = 'inline-flex';
+    }
     if (data.total_chunks > 0) {
       chunkCount = data.total_chunks;
       data.documents.forEach(doc => {

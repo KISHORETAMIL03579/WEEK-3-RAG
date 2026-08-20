@@ -18,7 +18,10 @@ import html.parser
 from pathlib import Path
 from collections import Counter
 
-import fitz  # PyMuPDF
+import pymupdf as fitz  # PyMuPDF — imports the real module directly, avoiding
+                        # the deprecated `import fitz` legacy-alias shim that
+                        # prints the runtime warning. Every fitz.* call below
+                        # is unaffected since this is just a local alias.
 from flask import Flask, request, jsonify, render_template, session, send_file
 from werkzeug.utils import secure_filename
 
@@ -95,6 +98,22 @@ HASH_STORE: dict[str, set[tuple[str, str]]] = {}
 HASH_BY_DOC: dict[str, dict[str, tuple[str, str]]] = {}
 SESSION_FILES: dict[str, dict[str, dict]] = {}
 CHUNK_COUNTS: dict[str, dict[str, int]] = {}
+
+# Maps a client-generated upload_id -> the time it was cancelled. /upload
+# checks this (see below) so a mid-flight cancel can (a) stop processing
+# any remaining files in a multi-file batch, and (b) roll back whatever
+# was already added to the store during THIS call before the response
+# goes out — since a single embedding call can take real wall-clock time,
+# this is the honest, achievable version of "cancel": not always an
+# instant interrupt, but a guaranteed "nothing stays indexed" outcome.
+CANCELLED_UPLOADS: dict[str, float] = {}
+CANCELLED_UPLOAD_TTL = 10 * 60  # forget stale cancel signals after 10 minutes
+
+
+def _sweep_cancelled_uploads() -> None:
+    now = time.time()
+    for uid in [u for u, t in CANCELLED_UPLOADS.items() if now - t > CANCELLED_UPLOAD_TTL]:
+        CANCELLED_UPLOADS.pop(uid, None)
 
 SESSION_TTL = 60 * 60  # 1 hour
 MAX_SESSIONS = 20
@@ -246,6 +265,7 @@ class VectorStore:
         # get_tfidf_index(). Invalidated by every mutation below so it's
         # never stale, but never rebuilt more often than necessary either.
         self._tfidf_index_cache: dict | None = None
+        self.last_backend_error: str | None = None  # always None for this backend; see QdrantVectorStore
 
     def load(self) -> None:
         if self.path.exists():
@@ -1232,6 +1252,25 @@ def _index_into_store(sid: str, doc_info: dict, pages: list[dict],
     store.add(new_chunks, vectors)
 
 
+@app.route("/upload-cancel", methods=["POST"])
+def upload_cancel():
+    """
+    Signals that an in-flight /upload call (identified by the same
+    upload_id the client sent with its FormData) should be cancelled.
+    This just records the signal — /upload itself is what actually acts
+    on it, checking between files and rolling back anything already
+    added before it returns. If /upload has already finished and
+    returned by the time this arrives, the signal is simply ignored
+    (nothing left to cancel) and cleaned up by the TTL sweep.
+    """
+    _sweep_cancelled_uploads()
+    data = request.get_json(silent=True) or {}
+    upload_id = (data.get("upload_id") or "").strip()
+    if upload_id:
+        CANCELLED_UPLOADS[upload_id] = time.time()
+    return jsonify({"ok": True})
+
+
 @app.route("/upload", methods=["POST"])
 def upload():
     if "session_id" not in session:
@@ -1239,6 +1278,8 @@ def upload():
 
     sid = session["session_id"]
     chunk_mode = request.form.get("chunk_mode", "structured")
+    upload_id = (request.form.get("upload_id") or "").strip()
+    _sweep_cancelled_uploads()
 
     files = request.files.getlist("files")
     if not files:
@@ -1328,7 +1369,19 @@ def upload():
                         "documents": results}), 400
 
     store = _get_store(sid)
+    committed_doc_ids: list[str] = []  # tracks what THIS call actually added, for rollback below
+    was_cancelled = False
+
     for item in pending:
+        if upload_id and upload_id in CANCELLED_UPLOADS:
+            # Stop processing any remaining files in this batch — no
+            # point embedding/indexing more once cancellation was
+            # requested. Whatever's already committed gets rolled back
+            # below, after the loop.
+            was_cancelled = True
+            item["filepath"].unlink(missing_ok=True)
+            hashes.discard(item["hash"])
+            continue
         try:
             if embedding_ok:
                 vectors = embed_texts([c["text"] for c in item["chunks"]])
@@ -1352,11 +1405,34 @@ def upload():
             item["result"]["doc_id"] = item["doc_id"]
             item["result"]["openable"] = True
             results.append(item["result"])
+            committed_doc_ids.append(item["doc_id"])
         except Exception as exc:
             item["filepath"].unlink(missing_ok=True)
             hashes.discard(item["hash"])
             results.append({"filename": item["filename"],
                             "error": f"Failed to index: {exc}"})
+
+    # Final check: even if cancellation only arrived after every file had
+    # already finished committing, honor it anyway — roll back everything
+    # this call just added rather than leave it silently indexed. This is
+    # the guaranteed part of "cancel": maybe not always an instant stop,
+    # but always a clean "nothing stays indexed" outcome.
+    if upload_id and upload_id in CANCELLED_UPLOADS:
+        was_cancelled = True
+    if was_cancelled:
+        for doc_id in committed_doc_ids:
+            store.remove_doc(doc_id)
+            info = SESSION_FILES.get(sid, {}).pop(doc_id, None)
+            if info:
+                info["path"].unlink(missing_ok=True)
+            doc_hash = HASH_BY_DOC.get(sid, {}).pop(doc_id, None)
+            if doc_hash is not None:
+                hashes.discard(doc_hash)
+        _save_session_manifest(sid)
+        CANCELLED_UPLOADS.pop(upload_id, None)
+        return jsonify({"ok": False, "cancelled": True,
+                        "error": "Upload cancelled — nothing was indexed.",
+                        "documents": []})
 
     return jsonify({"ok": True, "documents": results, "total_chunks": len(store.chunks),
                     "chunk_comparison": CHUNK_COUNTS.get(sid, {})})
@@ -1592,6 +1668,7 @@ def ask():
 @app.route("/clear", methods=["POST"])
 def clear():
     sid = session.get("session_id")
+    backend_error = None
     if sid:
         # _get_store() reconnects to the real backend (Qdrant collection
         # or pickle file) if it isn't already cached in this process's
@@ -1600,13 +1677,19 @@ def clear():
         # to pop and never actually call .clear() on the real backend.
         store = _get_store(sid)
         store.clear()
+        backend_error = getattr(store, "last_backend_error", None)
         VECTOR_STORE.pop(sid, None)
         SESSION_ACCESS.pop(sid, None)
         HASH_STORE.pop(sid, None)
         HASH_BY_DOC.pop(sid, None)
         CHUNK_COUNTS.pop(sid, None)
         _cleanup_session_files(sid)
-    return jsonify({"ok": True})
+    resp = {"ok": True}
+    if backend_error:
+        resp["warning"] = (f"Cleared locally, but the vector database delete "
+                          f"failed: {backend_error}. The data may still exist "
+                          f"in the backend.")
+    return jsonify(resp)
 
 
 @app.route("/remove", methods=["POST"])
@@ -1639,7 +1722,17 @@ def remove_doc():
     if doc_hash is not None:
         HASH_STORE.get(sid, set()).discard(doc_hash)
 
-    return jsonify({"ok": True, "removed_chunks": removed_chunks})
+    resp = {"ok": True, "removed_chunks": removed_chunks}
+    backend_error = getattr(store, "last_backend_error", None)
+    if backend_error:
+        # Removed from the local view either way, but the real backend
+        # (Qdrant) delete failed — surface this so it's not just a
+        # server-log warning nobody sees. The document may reappear if
+        # the session reloads from the backend later.
+        resp["warning"] = (f"Removed locally, but the vector database delete "
+                          f"failed: {backend_error}. The data may still exist "
+                          f"in the backend.")
+    return jsonify(resp)
 
 
 @app.route("/healthz", methods=["GET"])
@@ -1686,7 +1779,8 @@ def status():
         "total_chunks": len(chunks),
         "documents": list(docs_seen.values()),
         "methods": sorted({c["method"] for c in chunks}),
-        "mode": "TF-IDF",
+        "mode": (RETRIEVAL_MODE if OPENROUTER_API_KEY else "tfidf-only"),
+        "vector_backend": VECTOR_BACKEND,
     })
 
 
