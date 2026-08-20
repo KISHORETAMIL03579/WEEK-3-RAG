@@ -87,12 +87,31 @@ class QdrantVectorStore:
         return self.collection in names
 
     def _ensure_collection(self, dim: int) -> None:
-        if self._collection_exists():
-            return
-        _client().create_collection(
-            collection_name=self.collection,
-            vectors_config=qmodels.VectorParams(size=dim, distance=qmodels.Distance.COSINE),
-        )
+        client = _client()
+        if not self._collection_exists():
+            client.create_collection(
+                collection_name=self.collection,
+                vectors_config=qmodels.VectorParams(size=dim, distance=qmodels.Distance.COSINE),
+            )
+        # Ensure payload indexes exist regardless of whether the collection
+        # was just created or already existed — Qdrant requires an explicit
+        # index on any field you filter by (remove_doc()'s doc_id filter,
+        # filtered_by_method()'s method filter), otherwise those calls fail
+        # with a 400 ("Index required but not found ... Create an index for
+        # this key or use a different filter"). Running this on every add()
+        # call, not just fresh collections, retroactively patches any
+        # collection created before this fix — no manual clear needed.
+        # Safe to call repeatedly: re-indexing an already-indexed field is
+        # a no-op, not an error.
+        for field_name in ("doc_id", "method"):
+            try:
+                client.create_payload_index(
+                    collection_name=self.collection,
+                    field_name=field_name,
+                    field_schema="keyword",
+                )
+            except Exception:
+                pass  # already indexed, or the real filter call below will surface any genuine problem
 
     def _qdrant_filter(self):
         if not self.method_filter:

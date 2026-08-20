@@ -126,7 +126,10 @@ OPENROUTER_API_KEY = os.environ.get("OPENROUTER_API_KEY", "")
 OPENROUTER_URL = "https://openrouter.ai/api/v1"
 LLM_MODEL = os.environ.get("LLM_MODEL", "deepseek/deepseek-chat")
 EMBED_MODEL = os.environ.get("EMBED_MODEL", "openai/text-embedding-3-small")
-EMBED_MIN_SCORE = float(os.environ.get("EMBED_MIN_SCORE", "0.30"))
+EMBED_MIN_SCORE = float(os.environ.get("EMBED_MIN_SCORE", "0.15"))  # was 0.30 — real
+# hybrid-search matches on genuine section-title queries observed scoring
+# ~0.19 against real documents, which the old 0.30 default incorrectly
+# rejected. Lowered to match TFIDF_MIN_SCORE's already-proven value.
 EMBED_BATCH = 32
 
 # Retrieval strategy for the embeddings path. "hybrid" combines cosine
@@ -137,7 +140,11 @@ RETRIEVAL_MODE = os.environ.get("RETRIEVAL_MODE", "hybrid")  # "hybrid" | "embed
 HYBRID_ALPHA = float(os.environ.get("HYBRID_ALPHA", "0.6"))  # weight on embedding score
 
 # How many chunks retrieval returns, before token-budget trimming below.
-TOP_K = int(os.environ.get("TOP_K", "5"))
+TOP_K = int(os.environ.get("TOP_K", "8"))  # was 5 — a genuinely relevant
+# section that's split across chunks (see STRUCT_MAX_WORDS) can get
+# crowded out of a small top-k window entirely by other, unrelated but
+# similarly-scored sections. A wider window gives the LLM more raw
+# material to synthesize a complete answer from.
 
 # Hard cap on how many tokens' worth of retrieved chunk TEXT get sent to
 # the LLM as context, regardless of how many chunks TOP_K allows through.
@@ -151,7 +158,10 @@ TOP_K = int(os.environ.get("TOP_K", "5"))
 # budget, drive up latency/cost, and in the worst case exceed the model's
 # actual context window. This trims the already-retrieved, already-ranked
 # list down to what actually fits, on top of (not instead of) TOP_K.
-MAX_CONTEXT_TOKENS = int(os.environ.get("MAX_CONTEXT_TOKENS", "3000"))
+MAX_CONTEXT_TOKENS = int(os.environ.get("MAX_CONTEXT_TOKENS", "6000"))  # was
+# 3000 — raised alongside TOP_K (5->8); otherwise the wider candidate
+# pool just gets trimmed straight back down by this budget, defeating
+# the point of considering more candidates in the first place.
 
 # Which VectorStore implementation backs retrieval. "memory" (default) is
 # the original brute-force in-process store — zero setup, pickled to disk.
@@ -706,7 +716,15 @@ def fixed_chunk(doc_info: dict, pages: list[dict], chunk_size: int,
 # ─────────────────────────────────────────────────────────────────────────────
 
 STRUCT_MIN_WORDS = 40
-STRUCT_MAX_WORDS = 300
+STRUCT_MAX_WORDS = 500  # was 300 — real sections with a multi-point lettered
+# list (e.g. a 7-item duties list plus a closing sentence) were getting
+# split mid-section at the old limit, and only ONE fragment would end up
+# among the top retrieval results — stranding the rest of that same
+# section's content in a separate chunk that never got shown at all.
+# Confirmed directly: a real section's source-card preview showed only
+# its closing sentence, with the actual substantive list content missing
+# entirely from the answer. 500 gives real-world sections like this
+# enough room to survive as one coherent, fully-retrievable chunk.
 
 
 _NUMBERED_HEADING_RE = re.compile(r"^\d+(\.\d+)*\.?\s+[A-Z][A-Za-z].*$")
@@ -884,15 +902,30 @@ def split_by_sentences(block: dict, max_words: int) -> list[dict]:
 
 def _make_chunk(doc_info: dict, block: dict, index: int) -> dict:
     pages = block.get("pages") or [block.get("page", 1)]
+    section = block.get("section")
+    body_text = block["text"]
+    # Prepend the section heading to the chunk's SEARCHABLE text — without
+    # this, a query that closely matches a section's own title wording
+    # (e.g. "Rights and Obligations of Staff" matching a section literally
+    # titled "Duties, Rights and Obligations of Staff") scores badly,
+    # because the heading's words were previously stripped into metadata
+    # only and never appeared anywhere TF-IDF or embeddings actually look.
+    # "Overview" is the fallback default when no real heading was ever
+    # detected, so it's excluded here — it isn't a real title worth
+    # matching against.
+    if section and section != "Overview":
+        searchable_text = f"{section}. {body_text}"
+    else:
+        searchable_text = body_text
     return {
         "id": f"{doc_info['doc_id']}::c{index}",
         "doc_id": doc_info["doc_id"],
         "filename": doc_info["filename"],
         "page": pages[0],
         "page_end": pages[-1] if len(pages) > 1 else None,
-        "section": block.get("section"),
+        "section": section,
         "block_type": block.get("type", "paragraph"),
-        "text": block["text"],
+        "text": searchable_text,
         "chunk_index": index,
         "method": "structured",
     }
@@ -931,6 +964,15 @@ def structured_chunk(doc_info: dict, pages: list[dict]) -> list[dict]:
                     if merge_buffer["pages"][-1] != page_num:
                         merge_buffer["pages"].append(page_num)
                     merge_buffer["text"] += " " + block["text"]
+                    # Track the section of whichever block was merged in
+                    # MOST RECENTLY, not just whichever started the merge —
+                    # otherwise a chunk combining "10 SEPARATION FROM
+                    # SERVICE" (short intro) + "10.1 Resignation" (short
+                    # detail) keeps citing the intro's heading even though
+                    # the more specific 10.1 content is what actually
+                    # answers a question about resignation notice periods.
+                    if block.get("section"):
+                        merge_buffer["section"] = block["section"]
                     if len(merge_buffer["text"].split()) >= STRUCT_MIN_WORDS:
                         flush_merge()
                 continue
@@ -1113,7 +1155,13 @@ def synthesize_answer(query: str, results: list[dict]) -> dict:
     all_text = " ".join(r["text"] for r in results)
 
     for r in results:
-        key = f"{r['doc_id']}::p{r['page']}"
+        # Dedupe by chunk ID, not page number — two genuinely distinct,
+        # relevant sections often share the same page in a real document
+        # (e.g. two subsections on one dense page), and page-based
+        # dedup was silently dropping legitimate additional sources
+        # whenever that happened, even though the answer text below
+        # draws from all of them.
+        key = r["id"]
         if key not in seen:
             seen.add(key)
             sources.append(r)
@@ -1134,11 +1182,21 @@ def synthesize_answer(query: str, results: list[dict]) -> dict:
 
     seen_sents: set[str] = set()
     top_sents = []
-    for _, s in scored_sents:
+    for overlap, s in scored_sents:
+        # Stop once we run out of GENUINELY relevant sentences — sentences
+        # are sorted by overlap descending, so once overlap hits 0 every
+        # remaining sentence is equally irrelevant. Previously this loop
+        # kept going regardless, padding a simple question's answer with
+        # up to 4 completely unrelated sentences just to force the count
+        # to exactly 5, even when only 1 sentence actually answered it.
+        if overlap <= 0:
+            break
         if s not in seen_sents:
             seen_sents.add(s)
             top_sents.append(s)
-        if len(top_sents) >= 5:
+        # Still cap the upper end — a genuinely complex question where
+        # many sentences share query terms shouldn't run away unbounded.
+        if len(top_sents) >= 8:
             break
 
     answer = " ".join(top_sents) if top_sents else results[0]["text"][:500] + "…"
@@ -1157,11 +1215,56 @@ _DONT_KNOW_MARKERS = (
 )
 
 
-def validate_context(results: list[dict], min_score: float) -> bool:
-    """Reject retrieval when nothing clears the similarity bar."""
+def _stem_lite(token: str) -> str:
+    """Crude suffix-stripping so simple variations (discover/discovers,
+    obligation/obligations) count as the same word for the shared-token
+    safeguard below — without pulling in a real stemmer or changing the
+    main tokenize()/TF-IDF pipeline used everywhere else in scoring."""
+    for suffix in ("ing", "es", "ed", "s"):
+        if len(token) > len(suffix) + 3 and token.endswith(suffix):
+            return token[: -len(suffix)]
+    return token
+
+
+def validate_context(results: list[dict], min_score: float, query: str = None) -> bool:
+    """
+    Reject retrieval when nothing clears the similarity bar, OR when the
+    only real signal is a single coincidentally-shared word.
+
+    Why the score threshold alone isn't enough: it's corpus-size
+    dependent. A common domain word (e.g. "policy" in an HR manual) can
+    push a completely unrelated query's score just over a fixed threshold
+    purely because that one word is rare enough in a SMALL corpus to
+    carry outsized IDF weight — the same query might score well under the
+    threshold in a larger corpus where that word is more common. Verified
+    directly: "What is the stock buyback policy?" scored 0.153 against a
+    real 25-chunk HR document — above a 0.15 threshold — via the single
+    shared word "policy", despite zero other relevant overlap.
+
+    Requiring at least 2 shared meaningful tokens (or all of them, for a
+    1-2 word query) is corpus-size independent: a genuine match almost
+    always shares multiple real content words with the query, while a
+    coincidental false-positive typically shares only one. Matching is
+    done via _stem_lite() rather than exact string equality, so
+    "discover" (query) still counts as shared with "discovers" (chunk
+    text) — plain exact-match comparison was rejecting genuine matches
+    over simple suffix differences like this.
+    """
     if not results:
         return False
-    return results[0]["score"] >= min_score
+    if results[0]["score"] < min_score:
+        return False
+    if query is not None:
+        query_tokens = set(tokenize(query))
+        if query_tokens:
+            chunk_tokens = set(tokenize(results[0]["text"]))
+            query_stems = {_stem_lite(t) for t in query_tokens}
+            chunk_stems = {_stem_lite(t) for t in chunk_tokens}
+            shared = query_stems & chunk_stems
+            required = min(2, len(query_stems))
+            if len(shared) < required:
+                return False
+    return True
 
 
 def _is_dont_know(answer: str) -> bool:
@@ -1205,7 +1308,13 @@ def generate_answer(query: str, results: list[dict]) -> str:
         "document excerpts provided. Cite every fact with its source number like "
         "[1] or [2]. If the excerpts do not contain enough information to answer "
         "the question, reply exactly with: \"I don't know.\" Do not use outside "
-        "knowledge. Be concise and direct."
+        "knowledge. Match your answer's length to what the question actually "
+        "needs — a short, direct sentence or two for a simple factual question, "
+        "but a longer, complete answer (including every item, if the source "
+        "material itself lists several, such as a numbered or lettered list) "
+        "for a question that calls for it. Never omit relevant details from the "
+        "excerpts just to keep the answer short; completeness for the specific "
+        "question asked matters more than brevity."
     )
     user = (
         "DOCUMENTS:\n\n" + "\n\n".join(context_blocks) +
@@ -1614,7 +1723,7 @@ def ask():
             # generate_answer) so the "sources" shown to the user are
             # exactly what actually grounded the answer, never more.
             results = fit_to_token_budget(results, MAX_CONTEXT_TOKENS)
-            if not validate_context(results, EMBED_MIN_SCORE):
+            if not validate_context(results, EMBED_MIN_SCORE, query):
                 return jsonify({
                     "found": False,
                     "answer": "I don't know — no document content matched your question closely enough.",
@@ -1646,7 +1755,7 @@ def ask():
     index = active_store.get_tfidf_index()
     results = search_chunks(query, chunks, index, top_k=TOP_K)
     results = fit_to_token_budget(results, MAX_CONTEXT_TOKENS)
-    if not validate_context(results, TFIDF_MIN_SCORE):
+    if not validate_context(results, TFIDF_MIN_SCORE, query):
         near_miss = results[0] if results else None
         return jsonify({
             "found": False,

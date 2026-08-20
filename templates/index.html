@@ -534,26 +534,12 @@
       padding: 16px 20px;
     }
 
-    .main.chat-empty .input-bar {
-      flex: 0 0 auto;
-      border-top: none;
-      display: flex !important;
-      visibility: visible !important;
-      opacity: 1 !important;
-    }
-
-    /* When chat is not empty, ensure input bar always shows */
-    .main:not(.chat-empty) .input-bar {
-      flex: 0 0 auto !important;
-      display: flex !important;
-      border-top: 1px solid var(--border);
-      visibility: visible !important;
-      opacity: 1 !important;
-    }
+    .main.chat-empty .input-bar { border-top: none; }
+    .main:not(.chat-empty) .input-bar { border-top: 1px solid var(--border); }
 
     .main:not(.chat-empty) .chat-area {
-      flex: 1 !important;
-      overflow-y: auto !important;
+      flex: 1;
+      overflow-y: auto;
     }
 
     /* ── Chat Area ────────────────────────────────────────── */
@@ -901,8 +887,7 @@
       visibility: visible !important;
       opacity: 1 !important;
       height: auto;
-      min-height: auto;
-      max-height: 180px;
+      max-height: 240px;
       overflow: visible;
     }
 
@@ -931,7 +916,7 @@
       padding: 8px 10px; resize: none;
       font-size: .9rem; font-family: var(--font);
       color: var(--text-primary); caret-color: var(--accent);
-      min-height: 40px; max-height: 140px;
+      min-height: 24px; max-height: 200px;
       line-height: 1.5;
     }
 
@@ -1003,12 +988,23 @@
 
     /* ── Responsive ───────────────────────────────────────── */
     @media (max-width: 700px) {
-      .layout { grid-template-columns: 1fr; }
+      .layout {
+        grid-template-columns: 1fr;
+        /* Row 3 (the sidebar, moved below main content on mobile) needs
+           an actual declared track, not an implicit one — .sidebar
+           below sets grid-row: 3 but the desktop grid-template-rows
+           only ever declares 2 rows, leaving row 3 to the browser's
+           default implicit sizing, which could squeeze or misplace
+           the row above it (main content, including the input bar). */
+        grid-template-rows: auto 1fr auto;
+      }
       .sidebar {
         grid-row: 3;
         border-right: none;
         border-top: 1px solid var(--border);
         height: auto;
+        max-height: 40vh;
+        overflow-y: auto;
       }
       .chat-area { padding: 16px; }
       .input-bar { padding: 12px 16px; }
@@ -1171,7 +1167,7 @@
     </div>
 
     <!-- Input Bar -->
-    <div class="input-bar" style="flex-direction: column; gap: 8px; align-items: stretch;">
+    <div class="input-bar" style="flex-direction: column; gap: 8px; align-items: stretch; justify-content: flex-start;">
       <div id="methodFilterRow" style="display:none; align-items:center; gap:8px; max-width:760px; width:100%; margin: 0 auto; font-size:.7rem; color: var(--text-muted);">
         <span>Compare against:</span>
         <select id="methodFilterSelect"
@@ -1672,7 +1668,7 @@ function handleKey(e) {
 
 function autoResize(el) {
   el.style.height = 'auto';
-  el.style.height = Math.min(el.scrollHeight, 140) + 'px';
+  el.style.height = Math.min(el.scrollHeight, 200) + 'px';
 }
 
 function hideEmptyState() {
