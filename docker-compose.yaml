@@ -43,6 +43,11 @@ services:
       SECRET_KEY: ${SECRET_KEY:-}
       LOG_LEVEL: ${LOG_LEVEL:-INFO}
       PORT: 5000
+      # Required inside a container: binding to 127.0.0.1 (the code's
+      # own default, safe for bare-metal runs) would make the port
+      # mapping below silently unreachable — see app.py's comment on
+      # this exact variable.
+      HOST: 0.0.0.0
     depends_on:
       qdrant:
         condition: service_healthy

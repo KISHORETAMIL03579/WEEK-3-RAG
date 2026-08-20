@@ -703,7 +703,6 @@ def parse_blocks(text: str, base_section: str = "Overview") -> list[dict]:
     in_code = False
 
     def flush():
-        nonlocal block_type
         joined = " ".join(buffer).replace("  ", " ").strip()
         if not joined:
             buffer.clear()
@@ -1595,30 +1594,23 @@ def too_large(_e):
     return jsonify({"error": "File too large (max 50 MB)"}), 413
 
 
-# if __name__ == "__main__":
-#     port = int(os.environ.get("PORT", 5000))
-#     debug = os.environ.get("APP_DEBUG", "").lower() in ("1", "true", "yes")
-#     print(f"\n🚀 Ask My Docs is running → http://localhost:{port}")
-#     print(f"   Mode: {'embeddings + LLM' if OPENROUTER_API_KEY else 'TF-IDF (offline fallback)'}\n")
-#     try:
-#         from waitress import serve
-#         serve(app, host="127.0.0.1", port=port)
-#     except ImportError:
-#         app.run(debug=debug, port=port)
-
 if __name__ == "__main__":
     port = int(os.environ.get("PORT", 5000))
+    # Defaults to loopback-only — safe for `python app.py` on your own
+    # machine (not reachable from your LAN). MUST be "0.0.0.0" when run
+    # inside Docker: a container's own loopback interface is invisible to
+    # `docker run -p`/docker-compose's port mapping, so binding to
+    # 127.0.0.1 in a container means the port mapping silently does
+    # nothing — the container starts fine, but nothing outside it can
+    # ever reach the server. docker-compose.yml sets HOST=0.0.0.0 for
+    # exactly this reason; don't set it that way for a bare local run
+    # unless you actually want this reachable from your whole network.
+    host = os.environ.get("HOST", "127.0.0.1")
     debug = os.environ.get("APP_DEBUG", "").lower() in ("1", "true", "yes")
-
     print(f"\n🚀 Ask My Docs is running → http://localhost:{port}")
     print(f"   Mode: {'embeddings + LLM' if OPENROUTER_API_KEY else 'TF-IDF (offline fallback)'}\n")
-
     try:
         from waitress import serve
-        serve(app, host="0.0.0.0", port=port)
+        serve(app, host=host, port=port)
     except ImportError:
-        app.run(
-            host="0.0.0.0",
-            debug=debug,
-            port=port
-        )
+        app.run(host=host, debug=debug, port=port)
