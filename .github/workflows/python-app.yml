@@ -1,39 +1,59 @@
-name: Ask My Docs CI
-
+﻿name: Ask My Docs CI
 on:
   push:
     branches: ["main"]
   pull_request:
     branches: ["main"]
-
 permissions:
   contents: read
-
+  packages: write   # required to push images to GHCR — this is ALL that's needed,
+                    # no personal access token or extra scopes required
+env:
+  # GHCR requires the image name to be all-lowercase; github.repository can
+  # contain uppercase letters (e.g. "Org/Repo"), so it's normalized below.
+  IMAGE_NAME: ${{ github.repository }}
 jobs:
   build:
     runs-on: ubuntu-latest
-
     steps:
       - name: Checkout repository
         uses: actions/checkout@v4
-
       - name: Set up Python 3.11
         uses: actions/setup-python@v5
         with:
           python-version: "3.11"
           cache: "pip"
-
       - name: Install dependencies
         run: |
           python -m pip install --upgrade pip
           pip install -r requirements.txt
           pip install flake8 pytest
-
       - name: Lint with flake8
         run: |
           flake8 . --count --select=E9,F63,F7,F82 --show-source --statistics
           flake8 . --count --exit-zero --max-complexity=10 --max-line-length=127 --statistics
-
+      - name: Compute lowercase image name
+        id: image
+        run: |
+          echo "name=ghcr.io/$(echo '${{ env.IMAGE_NAME }}' | tr '[:upper:]' '[:lower:]')" >> "$GITHUB_OUTPUT"
       - name: Build Docker image
         run: |
-          docker build -t ask-my-docs-python:latest .
+          docker build \
+            -t ${{ steps.image.outputs.name }}:latest \
+            -t ${{ steps.image.outputs.name }}:${{ github.sha }} \
+            .
+      # Only log in / push on an actual push to main — never on a pull_request.
+      # PRs (especially from forks) don't get write access to secrets by
+      # design, and shouldn't be able to publish images even if they did.
+      - name: Log in to GHCR
+        if: github.event_name == 'push'
+        uses: docker/login-action@v3
+        with:
+          registry: ghcr.io
+          username: ${{ github.actor }}
+          password: ${{ secrets.GITHUB_TOKEN }}
+      - name: Push image to GHCR
+        if: github.event_name == 'push'
+        run: |
+          docker push ${{ steps.image.outputs.name }}:latest
+          docker push ${{ steps.image.outputs.name }}:${{ github.sha }} 
