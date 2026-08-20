@@ -1595,13 +1595,30 @@ def too_large(_e):
     return jsonify({"error": "File too large (max 50 MB)"}), 413
 
 
+# if __name__ == "__main__":
+#     port = int(os.environ.get("PORT", 5000))
+#     debug = os.environ.get("APP_DEBUG", "").lower() in ("1", "true", "yes")
+#     print(f"\n🚀 Ask My Docs is running → http://localhost:{port}")
+#     print(f"   Mode: {'embeddings + LLM' if OPENROUTER_API_KEY else 'TF-IDF (offline fallback)'}\n")
+#     try:
+#         from waitress import serve
+#         serve(app, host="127.0.0.1", port=port)
+#     except ImportError:
+#         app.run(debug=debug, port=port)
+
 if __name__ == "__main__":
     port = int(os.environ.get("PORT", 5000))
     debug = os.environ.get("APP_DEBUG", "").lower() in ("1", "true", "yes")
+
     print(f"\n🚀 Ask My Docs is running → http://localhost:{port}")
     print(f"   Mode: {'embeddings + LLM' if OPENROUTER_API_KEY else 'TF-IDF (offline fallback)'}\n")
+
     try:
         from waitress import serve
-        serve(app, host="127.0.0.1", port=port)
+        serve(app, host="0.0.0.0", port=port)
     except ImportError:
-        app.run(debug=debug, port=port)
+        app.run(
+            host="0.0.0.0",
+            debug=debug,
+            port=port
+        )
