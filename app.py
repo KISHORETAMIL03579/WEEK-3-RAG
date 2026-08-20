@@ -1521,11 +1521,17 @@ def ask():
     if OPENROUTER_API_KEY and active_store.vectors and len(active_store.vectors) == len(active_store.chunks):
         try:
             if RETRIEVAL_MODE == "hybrid":
-                results = hybrid_search(active_store, query, top_k=TOP_K)
-                results = [r for r in results if r["score"] >= EMBED_MIN_SCORE]
+                raw_results = hybrid_search(active_store, query, top_k=TOP_K)
             else:
                 q_vec = embed_text(query)
-                results = active_store.query(q_vec, top_k=TOP_K, min_score=EMBED_MIN_SCORE)
+                # min_score=0.0 here deliberately — capture the true top
+                # candidate before any threshold filtering, so a below-
+                # threshold rejection below can still report what it was
+                # closest to, instead of an empty list with no diagnostic
+                # information at all (see closest_match below).
+                raw_results = active_store.query(q_vec, top_k=TOP_K, min_score=0.0)
+            near_miss = raw_results[0] if raw_results else None
+            results = [r for r in raw_results if r["score"] >= EMBED_MIN_SCORE]
             # TOP_K caps how many CHUNKS come back, not how many TOKENS
             # they add up to — trim to the context budget before this
             # goes anywhere near the LLM. Applied here (not just inside
@@ -1537,6 +1543,13 @@ def ask():
                     "found": False,
                     "answer": "I don't know — no document content matched your question closely enough.",
                     "sources": [],
+                    "closest_match": ({
+                        "filename": near_miss["filename"],
+                        "section": near_miss.get("section"),
+                        "page": near_miss.get("page"),
+                        "score": round(near_miss["score"], 4),
+                        "threshold": EMBED_MIN_SCORE,
+                    } if near_miss else None),
                 })
             answer = generate_answer(query, results)
             return jsonify({
@@ -1558,10 +1571,18 @@ def ask():
     results = search_chunks(query, chunks, index, top_k=TOP_K)
     results = fit_to_token_budget(results, MAX_CONTEXT_TOKENS)
     if not validate_context(results, TFIDF_MIN_SCORE):
+        near_miss = results[0] if results else None
         return jsonify({
             "found": False,
             "answer": "I don't know — no document content matched your question closely enough.",
             "sources": [],
+            "closest_match": ({
+                "filename": near_miss["filename"],
+                "section": near_miss.get("section"),
+                "page": near_miss.get("page"),
+                "score": round(near_miss["score"], 4),
+                "threshold": TFIDF_MIN_SCORE,
+            } if near_miss else None),
         })
     resp = synthesize_answer(query, results)
     resp["sources"] = annotate_openable(resp.get("sources", []))
@@ -1572,9 +1593,14 @@ def ask():
 def clear():
     sid = session.get("session_id")
     if sid:
-        store = VECTOR_STORE.pop(sid, None)
-        if store:
-            store.clear()
+        # _get_store() reconnects to the real backend (Qdrant collection
+        # or pickle file) if it isn't already cached in this process's
+        # memory — using VECTOR_STORE.pop() directly here would silently
+        # no-op after any restart/worker respawn, since it'd find nothing
+        # to pop and never actually call .clear() on the real backend.
+        store = _get_store(sid)
+        store.clear()
+        VECTOR_STORE.pop(sid, None)
         SESSION_ACCESS.pop(sid, None)
         HASH_STORE.pop(sid, None)
         HASH_BY_DOC.pop(sid, None)

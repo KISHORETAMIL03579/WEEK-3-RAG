@@ -1054,6 +1054,9 @@
         <div class="dropzone-sub">PDF, TXT, or Markdown</div>
       </div>
 
+      <!-- Staged files (selected but not yet uploaded/indexed) -->
+      <div id="stagedFilesList" style="display:none; flex-direction:column; gap:6px; margin-top:8px;"></div>
+
       <!-- Chunk Mode -->
       <div style="margin-top: 14px;">
         <div class="sidebar-label">Chunking Strategy</div>
@@ -1091,9 +1094,15 @@
         </div>
       </div>
 
-      <button class="upload-btn" id="uploadBtn" onclick="uploadFiles()" disabled>
-        <span>⬆</span> Upload & Index document
-      </button>
+      <div style="display:flex; gap:8px; margin-top:12px;">
+        <button class="upload-btn" id="uploadBtn" onclick="uploadFiles()" disabled style="margin-top:0;">
+          <span>⬆</span> Upload & Index document
+        </button>
+        <button class="upload-btn" id="cancelStagedBtn" onclick="cancelStagedFiles()" disabled
+                style="margin-top:0; background:transparent; border:1px solid var(--border); color:var(--text-muted); flex:0 0 auto; width:auto; padding:10px 14px;">
+          Cancel
+        </button>
+      </div>
       <div class="upload-progress" id="uploadProgress">
         Indexing document…
         <div class="progress-bar"><div class="progress-fill"></div></div>
@@ -1240,11 +1249,74 @@ function handleFiles(files) {
     return;
   }
   selectedFiles = selectedFiles.concat(fresh);
+  renderStagedFiles();
+}
+
+// Renders the staged-file list with a per-file ✕ so a wrong/accidental
+// selection can be removed BEFORE it's ever uploaded, embedded, or
+// written to the vector store — nothing about a staged file touches the
+// backend at all until "Upload & Index document" is actually clicked.
+function renderStagedFiles() {
+  const list = document.getElementById('stagedFilesList');
+  const uploadBtn = document.getElementById('uploadBtn');
+  const cancelBtn = document.getElementById('cancelStagedBtn');
+
+  if (!selectedFiles.length) {
+    list.style.display = 'none';
+    list.innerHTML = '';
+    dropzone.querySelector('.dropzone-title').textContent = 'Drop files here';
+    dropzone.querySelector('.dropzone-sub').textContent = 'PDF, TXT, or Markdown';
+    uploadBtn.disabled = true;
+    cancelBtn.disabled = true;
+    return;
+  }
+
   dropzone.querySelector('.dropzone-title').textContent =
     `${selectedFiles.length} file${selectedFiles.length > 1 ? 's' : ''} ready`;
-  dropzone.querySelector('.dropzone-sub').textContent =
-    selectedFiles.map(f => f.name).join(', ');
-  document.getElementById('uploadBtn').disabled = false;
+  dropzone.querySelector('.dropzone-sub').textContent = 'Review below, then Upload & Index';
+
+  list.style.display = 'flex';
+  list.innerHTML = selectedFiles.map((f, i) => `
+    <div style="display:flex; align-items:center; gap:8px; background:var(--bg-raised); border:1px solid var(--border); border-radius:var(--radius-sm); padding:6px 10px;">
+      <span style="flex:1; font-size:.78rem; color:var(--text-primary); overflow:hidden; text-overflow:ellipsis; white-space:nowrap;" title="${f.name}">${f.name}</span>
+      <button onclick="openStagedFile(${i})" title="Preview ${f.name} before uploading"
+              class="doc-open" style="height:22px; padding:0 8px; font-size:.68rem;">Open ↗</button>
+      <button onclick="removeStagedFile(${i})" title="Remove ${f.name} — it will not be uploaded"
+              style="background:transparent; border:1px solid var(--border); color:var(--text-muted); border-radius:var(--radius-sm); width:22px; height:22px; cursor:pointer; font-size:.72rem; flex-shrink:0;">✕</button>
+    </div>
+  `).join('');
+
+  uploadBtn.disabled = false;
+  cancelBtn.disabled = false;
+}
+
+// Opens a staged (not-yet-uploaded) file in a new tab so it can be
+// verified before committing to upload — entirely client-side via a
+// blob URL, since the file only exists in the browser at this point and
+// hasn't been sent to the server at all.
+function openStagedFile(index) {
+  const file = selectedFiles[index];
+  if (!file) return;
+  const url = URL.createObjectURL(file);
+  window.open(url, '_blank');
+  // Revoke once the new tab has had time to load the content, so the
+  // blob doesn't linger in memory indefinitely.
+  setTimeout(() => URL.revokeObjectURL(url), 60000);
+}
+
+// Removes one file from the staged selection — it was never uploaded,
+// embedded, or written anywhere, so this is a pure client-side undo.
+function removeStagedFile(index) {
+  selectedFiles.splice(index, 1);
+  renderStagedFiles();
+}
+
+// Discards the entire staged selection without uploading any of it —
+// for when the whole selection was a mistake, not just one file in it.
+function cancelStagedFiles() {
+  selectedFiles = [];
+  renderStagedFiles();
+  showToast('Selection cancelled — nothing was uploaded.', 'success');
 }
 
 // ─────────────────────────────────────────────────────────────────────────────
@@ -1339,10 +1411,9 @@ async function uploadFiles() {
         showToast(`✅ Indexed ${indexed} doc(s) → ${data.total_chunks} chunks`, 'success');
       }
       if (indexed > 0) markSteps(3);
-      // Reset dropzone
-      dropzone.querySelector('.dropzone-title').textContent = 'Drop files here';
-      dropzone.querySelector('.dropzone-sub').textContent = 'PDF, TXT, or Markdown';
+      // Reset dropzone + staged-file list + Cancel button state
       selectedFiles = [];
+      renderStagedFiles();
     }
   } catch (err) {
     showToast('Server error: ' + err.message, 'error');
@@ -1703,10 +1774,18 @@ function appendAnswer(data) {
   const msg = document.createElement('div');
   msg.className = 'msg bot';
 
+  const closest = data.closest_match;
+  const closestHtml = closest ? `
+       <div class="not-found-hint" style="margin-top:8px; font-family:var(--mono); font-size:.7rem; opacity:.8;">
+         Closest match: ${escapeHtml(closest.filename)}${closest.section ? ' — §' + escapeHtml(closest.section) : ''}
+         (score ${closest.score}, needed ${closest.threshold})
+       </div>` : '';
+
   const answerHtml = data.found
     ? `<div class="msg-bubble">${formatAnswer(data.answer)}</div>`
     : `<div class="msg-status not-found">🤷 Not in the documents.</div>
-       <div class="not-found-hint">I couldn't find this information in the indexed documents.<br>Try asking a question related to the uploaded content.</div>`;
+       <div class="not-found-hint">I couldn't find this information in the indexed documents.<br>Try asking a question related to the uploaded content.</div>
+       ${closestHtml}`;
 
   const sourcesHtml = (data.sources || []).length > 0 ? `
     <div class="sources-label">Sources</div>
