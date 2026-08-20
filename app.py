@@ -689,6 +689,36 @@ STRUCT_MIN_WORDS = 40
 STRUCT_MAX_WORDS = 300
 
 
+_NUMBERED_HEADING_RE = re.compile(r"^\d+(\.\d+)*\.?\s+[A-Z][A-Za-z].*$")
+_ALLCAPS_HEADING_RE = re.compile(r"^[A-Z][A-Z0-9 ,&'/\-]{2,70}$")
+
+
+def _looks_like_plain_heading(stripped: str) -> bool:
+    """
+    Detects section headings in real-world documents that were never
+    written in Markdown — numbered ("2.1 Duties, Rights and Obligations
+    of GESCI") or ALL-CAPS ("INTRODUCTION", "OFFENCES") titles, the
+    overwhelmingly common style in Word/PDF-extracted policy manuals,
+    contracts, and handbooks.
+
+    Constrained to short, title-like lines specifically so it does NOT
+    misfire on numbered body sentences like "6.6. These records will be
+    updated as required by law..." — a real heading is a few words with
+    no trailing sentence punctuation; a numbered clause is a full
+    sentence and will fail the word-count/punctuation checks below.
+    """
+    if not stripped or len(stripped) > 90:
+        return False
+    words = stripped.split()
+    if not (1 <= len(words) <= 12):
+        return False
+    if _NUMBERED_HEADING_RE.match(stripped) and not stripped.endswith((".", ";", ",")):
+        return True
+    if _ALLCAPS_HEADING_RE.match(stripped) and any(c.isalpha() for c in stripped):
+        return True
+    return False
+
+
 def parse_blocks(text: str, base_section: str = "Overview") -> list[dict]:
     """
     Parse plain text (or Markdown) into semantic blocks.
@@ -736,13 +766,20 @@ def parse_blocks(text: str, base_section: str = "Overview") -> list[dict]:
                 buffer.append(stripped)
             continue
 
-        # Heading detection
+        # Heading detection — Markdown style, or plain numbered/ALL-CAPS
+        # (see _looks_like_plain_heading for why the latter is needed)
         heading_match = re.match(r"^#{1,4}\s+(.*)", stripped)
         if heading_match:
             flush()
             current_section = heading_match.group(1).strip()
             current_section = re.sub(r"\*\*(.+?)\*\*", r"\1", current_section)
             current_section = re.sub(r"`(.+?)`", r"\1", current_section)
+            block_type = "paragraph"
+            continue
+
+        if _looks_like_plain_heading(stripped):
+            flush()
+            current_section = stripped
             block_type = "paragraph"
             continue
 
@@ -921,6 +958,16 @@ STOPWORDS = {
 }
 
 CONFIDENCE_THRESHOLD = 0.05
+# CONFIDENCE_THRESHOLD above only filters which chunks are even considered
+# candidates — it's deliberately low so search_chunks() doesn't miss
+# anything. It is NOT a "should we actually answer" gate: a single
+# incidentally-shared word (e.g. both the query and an unrelated document
+# containing the word "policy") can clear 0.05 easily, producing a
+# confident-looking answer with source citations for a question that has
+# nothing to do with the document. TFIDF_MIN_SCORE below is the real gate
+# — checked via validate_context() in /ask, the same way EMBED_MIN_SCORE
+# already gates the embeddings path.
+TFIDF_MIN_SCORE = float(os.environ.get("TFIDF_MIN_SCORE", "0.15"))
 
 
 def tokenize(text: str) -> list[str]:
@@ -1098,8 +1145,30 @@ def validate_context(results: list[dict], min_score: float) -> bool:
 
 
 def _is_dont_know(answer: str) -> bool:
+    """
+    Detects a genuine refusal, not just the incidental presence of a
+    refusal-like phrase somewhere in a real answer.
+
+    Why this can't be a plain substring search: the system prompt asks
+    the model to reply with EXACTLY "I don't know." when it can't
+    answer — but a real, substantive, correctly-cited answer to a broad
+    question (e.g. one spanning two sections of a document) can easily
+    include a hedging clause like "the manual does not contain a single
+    consolidated list, but section 2.2 states..." A naive `marker in
+    answer` check flags that whole answer as "not found" and the
+    frontend discards it entirely, even though the model did answer.
+
+    So: check for an exact (or near-exact, allowing trivial punctuation)
+    match to the instructed refusal first. As a fallback, catch short
+    responses that are still basically just a refusal in slightly
+    different words — but require the response to actually BE short, so
+    a hedge embedded in a longer, real answer is never caught by this.
+    """
     a = answer.lower().strip()
-    return any(m in a for m in _DONT_KNOW_MARKERS)
+    if a.rstrip(".") in ("i don't know", "i do not know"):
+        return True
+    word_count = len(a.split())
+    return word_count <= 12 and any(m in a for m in _DONT_KNOW_MARKERS)
 
 
 def generate_answer(query: str, results: list[dict]) -> str:
@@ -1488,6 +1557,12 @@ def ask():
     index = active_store.get_tfidf_index()
     results = search_chunks(query, chunks, index, top_k=TOP_K)
     results = fit_to_token_budget(results, MAX_CONTEXT_TOKENS)
+    if not validate_context(results, TFIDF_MIN_SCORE):
+        return jsonify({
+            "found": False,
+            "answer": "I don't know — no document content matched your question closely enough.",
+            "sources": [],
+        })
     resp = synthesize_answer(query, results)
     resp["sources"] = annotate_openable(resp.get("sources", []))
     return jsonify(resp)
