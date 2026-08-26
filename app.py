@@ -126,10 +126,12 @@ OPENROUTER_API_KEY = os.environ.get("OPENROUTER_API_KEY", "")
 OPENROUTER_URL = "https://openrouter.ai/api/v1"
 LLM_MODEL = os.environ.get("LLM_MODEL", "deepseek/deepseek-chat")
 EMBED_MODEL = os.environ.get("EMBED_MODEL", "openai/text-embedding-3-small")
-EMBED_MIN_SCORE = float(os.environ.get("EMBED_MIN_SCORE", "0.15"))  # was 0.30 — real
-# hybrid-search matches on genuine section-title queries observed scoring
-# ~0.19 against real documents, which the old 0.30 default incorrectly
-# rejected. Lowered to match TFIDF_MIN_SCORE's already-proven value.
+EMBED_MIN_SCORE = float(os.environ.get("EMBED_MIN_SCORE", "0.55"))  # recalibrated
+# for reciprocal_rank_fusion()'s normalized scale (see RRF_K comment) —
+# NOT comparable to the old weighted-average blend's raw-cosine scale.
+# Tested directly: a genuine top-ranked match scores ~0.9-1.0 here; a
+# plausible false positive (moderate, non-top rank in both methods)
+# scores ~0.39-0.42 — 0.55 sits cleanly between them.
 EMBED_BATCH = 32
 
 # Retrieval strategy for the embeddings path. "hybrid" combines cosine
@@ -1100,19 +1102,91 @@ def search_chunks(query: str, chunks: list[dict], index: dict,
     return scored[:top_k]
 
 
+RRF_K = int(os.environ.get("RRF_K", "10"))  # NOT the textbook default (60) —
+# that's calibrated for web-scale search with thousands of candidates.
+# Tested directly for a document-sized corpus (a few hundred chunks):
+# k=60 gives a perfect rank-0-in-both match ~1.0 but a plausible FALSE
+# POSITIVE (moderate rank ~15-20 in both methods) ~0.78 — nearly as high,
+# destroying the threshold's ability to tell them apart. k=10 spreads
+# these to ~1.0 vs ~0.39-0.42, leaving real room for EMBED_MIN_SCORE to
+# discriminate.
+
+
+def reciprocal_rank_fusion(store: "VectorStore", query: str, top_k: int = 5) -> list[dict]:
+    """
+    Combines embedding-based ranking and TF-IDF-based ranking via
+    Reciprocal Rank Fusion, replacing the old weighted-average blend
+    (alpha*embed + (1-alpha)*tfidf) that hybrid_search() used to do.
+
+    Why weighted averaging kept failing: it's scale-sensitive. A chunk
+    that's genuinely the #1 best match by embedding similarity can still
+    have a modest-looking raw cosine score (e.g. 0.3 instead of 0.7) for
+    reasons having nothing to do with correctness — different embedding
+    models, different document styles, short/generic-sounding queries
+    all shift the RAW SCORE distribution without changing which chunk is
+    actually most relevant. Averaging that modest raw score against
+    TF-IDF's raw score can pull an obviously-correct match below a fixed
+    threshold — repeatedly observed in production: multiple different
+    exact-section-title queries scored 0.12-0.19 against a 0.15-0.30
+    threshold despite correctly ranking #1 in their own method.
+
+    RRF sidesteps this entirely: it only asks "what RANK did this chunk
+    get in each method's own ordering," never "how big was the raw
+    score." A chunk ranked #1 by embeddings AND #1 by TF-IDF scores near
+    the maximum regardless of what the underlying raw numbers happened
+    to be. This is the standard, named technique for combining ranked
+    lists from different retrieval methods (Cormack et al., 2009).
+
+    The final score is normalized to roughly a real number in [0, 1]
+    (1.0 = ranked #1 in both methods) purely so it remains compatible
+    with the existing validate_context()/EMBED_MIN_SCORE threshold logic
+    downstream — the actual fusion math above the normalization step is
+    unmodified textbook RRF.
+    """
+    if not store.chunks:
+        return []
+    n = len(store.chunks)
+
+    embed_scores = (store.query_scores(embed_text(query))
+                    if store.vectors and len(store.vectors) == len(store.chunks)
+                    else [0.0] * n)
+    embed_order = sorted(range(n), key=lambda i: -embed_scores[i])
+    embed_rank = {chunk_i: rank for rank, chunk_i in enumerate(embed_order)}
+
+    index = store.get_tfidf_index()
+    q_vec = tfidf_vector(compute_tf(tokenize(query)), index["idf"])
+    tfidf_scores = [
+        cosine_sim(q_vec, tfidf_vector(compute_tf(tokens), index["idf"]))
+        for tokens in index["corpus_tokens"]
+    ]
+    tfidf_order = sorted(range(n), key=lambda i: -tfidf_scores[i])
+    tfidf_rank = {chunk_i: rank for rank, chunk_i in enumerate(tfidf_order)}
+
+    max_possible = 2.0 / (RRF_K + 1)  # rank 0 (best) in both methods
+    rrf_scores = [
+        (1.0 / (RRF_K + embed_rank[i] + 1) + 1.0 / (RRF_K + tfidf_rank[i] + 1)) / max_possible
+        for i in range(n)
+    ]
+
+    ranked = sorted(range(n), key=lambda i: -rrf_scores[i])[:top_k]
+    return [
+        {**store.chunks[i], "score": rrf_scores[i],
+         "embed_score": embed_scores[i], "tfidf_score": tfidf_scores[i]}
+        for i in ranked
+    ]
+
+
 def hybrid_search(store: "VectorStore", query: str, top_k: int = 5,
                   alpha: float = HYBRID_ALPHA) -> list[dict]:
     """
     Rank chunks by a weighted blend of embedding similarity and TF-IDF
     similarity, instead of embeddings alone.
 
-    Why: pure embedding search is good at "what does the policy say about
-    refunds" (meaning) but can bury an exact token like "ERR-4032" under
-    semantically-similar-but-wrong chunks, because embeddings compress exact
-    strings into fuzzy meaning space. TF-IDF does the opposite: great at
-    exact/rare tokens, poor at paraphrase. Blending catches both. This is
-    THE single change for this week — it only touches ranking inside the
-    embeddings path; the TF-IDF-only fallback path is untouched.
+    Kept for RETRIEVAL_MODE=hybrid-legacy / A-B comparison against
+    reciprocal_rank_fusion() above, which is now the default (see
+    RETRIEVAL_MODE handling in /ask). Superseded as the default because
+    it's scale-sensitive in a way RRF isn't — see that function's
+    docstring for the specific, repeatedly-observed failure mode.
     """
     if not store.chunks:
         return []
@@ -1705,9 +1779,9 @@ def ask():
     # Path 1: embeddings + LLM (if configured and vectors exist)
     if OPENROUTER_API_KEY and active_store.vectors and len(active_store.vectors) == len(active_store.chunks):
         try:
-            if RETRIEVAL_MODE == "hybrid":
+            if RETRIEVAL_MODE == "hybrid-legacy":
                 raw_results = hybrid_search(active_store, query, top_k=TOP_K)
-            else:
+            elif RETRIEVAL_MODE == "embed":
                 q_vec = embed_text(query)
                 # min_score=0.0 here deliberately — capture the true top
                 # candidate before any threshold filtering, so a below-
@@ -1715,6 +1789,8 @@ def ask():
                 # closest to, instead of an empty list with no diagnostic
                 # information at all (see closest_match below).
                 raw_results = active_store.query(q_vec, top_k=TOP_K, min_score=0.0)
+            else:  # "hybrid" (default) — Reciprocal Rank Fusion
+                raw_results = reciprocal_rank_fusion(active_store, query, top_k=TOP_K)
             near_miss = raw_results[0] if raw_results else None
             results = [r for r in raw_results if r["score"] >= EMBED_MIN_SCORE]
             # TOP_K caps how many CHUNKS come back, not how many TOKENS

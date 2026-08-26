@@ -225,11 +225,18 @@ class QdrantVectorStore:
         try:
             if not self._collection_exists():
                 return []
-            hits = _client().search(
-                collection_name=self.collection, query_vector=vector,
+            # query_points() replaces the removed search() method (qdrant-
+            # client >=1.10ish deprecated it, and it's gone entirely as of
+            # 1.19 — confirmed directly via AttributeError in production).
+            # Note the two API differences: the vector parameter is named
+            # `query`, not `query_vector`, and the actual hit list is on
+            # the response's `.points` attribute, not returned directly.
+            response = _client().query_points(
+                collection_name=self.collection, query=vector,
                 query_filter=self._qdrant_filter(),
                 limit=top_k, score_threshold=min_score,
             )
+            hits = response.points
         except Exception:
             _app.logger.warning("Qdrant search failed — returning no results for this query.",
                                exc_info=True)
@@ -243,11 +250,12 @@ class QdrantVectorStore:
         try:
             if not self._collection_exists():
                 return [0.0] * len(self.chunks)
-            hits = _client().search(
-                collection_name=self.collection, query_vector=vector,
+            response = _client().query_points(
+                collection_name=self.collection, query=vector,
                 query_filter=self._qdrant_filter(),
                 limit=_app.QDRANT_CANDIDATE_POOL,
             )
+            hits = response.points
         except Exception:
             _app.logger.warning("Qdrant search failed during hybrid scoring — "
                                "treating all candidates as score 0.0 for this query.",
