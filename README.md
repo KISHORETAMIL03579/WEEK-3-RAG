@@ -21,7 +21,8 @@ project/
 │       └── ci.yml             # lint + build + push to GHCR on every push to main
 ├── templates/
 │   ├── index.html            # main chat UI (upload, chunking strategy, chat)
-│   └── view.html             # "Open document" viewer (opened in a new tab)
+│   ├── view.html             # "Open document" viewer (opened in a new tab)
+│   └── eval.html              # /eval page — hit-rate@k measurement, see §9.5
 ├── uploads/                   # uploaded files land here (created automatically)
 ├── vectorstore/               # per-session pickled chunk+vector indexes (memory backend only)
 ├── .env.example               # copy to .env and fill in your own key — see §3
@@ -128,20 +129,27 @@ Every environment variable the app actually reads:
 
 | Variable | Default | What it controls |
 |---|---|---|
-| `OPENROUTER_API_KEY` | *(empty)* | Without it, the app runs in fully offline TF-IDF-only mode — no embeddings, no LLM, no network calls |
+| `OPENROUTER_API_KEY` | *(empty)* | Without it, the app runs in fully offline BM25-only mode — no embeddings, no LLM, no network calls |
 | `LLM_MODEL` | `deepseek/deepseek-chat` | Any OpenRouter chat model slug. Confirmed alternatives: `openai/gpt-5-mini` (400k context), `openai/gpt-4o-mini` (cheaper, 128k) |
 | `EMBED_MODEL` | `openai/text-embedding-3-small` | Any OpenRouter embedding model slug. Confirmed alternatives: `baai/bge-base-en-v1.5`, `baai/bge-m3`. **Switching requires re-indexing** — old and new vectors are incompatible; `/clear` and re-upload |
-| `EMBED_MIN_SCORE` | `0.30` | Similarity threshold below which the embeddings path says "I don't know" rather than answer from a weak match |
-| `TFIDF_MIN_SCORE` | `0.15` | Same idea, for the offline TF-IDF path — without this gate, a single incidentally-shared word could produce a confident-looking answer to a completely unrelated question |
-| `RETRIEVAL_MODE` | `hybrid` | `hybrid` blends embeddings + TF-IDF; `embed` uses embeddings alone (for A/B comparison) |
-| `HYBRID_ALPHA` | `0.6` | Weight on the embedding score in the hybrid blend (0–1). Higher favors meaning-based matching; lower favors exact keyword/code matching |
-| `TOP_K` | `5` | How many chunks retrieval returns, before token-budget trimming |
-| `MAX_CONTEXT_TOKENS` | `3000` | Hard cap on chunk-text tokens sent to the LLM, regardless of how many chunks `TOP_K` allows through |
+| `EMBED_MIN_SCORE` | `0.55` | Minimum score on **Reciprocal Rank Fusion's normalized scale** (not a raw cosine similarity — see §6) before the app will answer at all |
+| `TFIDF_MIN_SCORE` | `0.15` | Same idea, for the offline BM25 fallback path — without this gate, a single incidentally-shared word could produce a confident-looking answer to a completely unrelated question |
+| `RETRIEVAL_MODE` | `hybrid` | `hybrid` (default) = BM25 + embeddings combined via Reciprocal Rank Fusion. `hybrid-legacy` = the older weighted-average blend, kept only for A/B comparison. `embed` = embeddings alone |
+| `HYBRID_ALPHA` | `0.6` | Only used by `RETRIEVAL_MODE=hybrid-legacy`. Weight on the embedding score in that weighted blend (0–1). Not used by the RRF default |
+| `RRF_K` | `10` | Reciprocal Rank Fusion's smoothing constant. **Not** the textbook default (60, calibrated for web-scale search) — tested directly for a document-sized corpus: 60 made a genuine match and a plausible false positive score nearly the same; 10 spreads them apart enough for `EMBED_MIN_SCORE` to discriminate |
+| `BM25_K1` | `1.5` | Real BM25's term-frequency saturation constant — standard default |
+| `BM25_B` | `0.75` | Real BM25's document-length normalization constant — standard default |
+| `TOP_K` | `8` | How many chunks retrieval returns, before token-budget trimming. Widened from an earlier `5` — a narrower window let a relevant section (especially one split across chunks) get crowded out entirely by competing sections |
+| `MAX_CONTEXT_TOKENS` | `6000` | Hard cap on chunk-text tokens sent to the LLM, regardless of how many chunks `TOP_K` allows through. Raised alongside `TOP_K` |
+| `RERANK_ENABLED` | `false` | When `true`, sends the top `RERANK_TOP_N` RRF candidates to the LLM for a real 0–10 relevance score each, reordering by that score — the practical substitute for a cross-encoder (Cohere Rerank/BGE-Reranker) this project uses instead of a new paid API or heavy local ML dependency |
+| `RERANK_TOP_N` | `8` | How many RRF candidates get sent to the reranker |
+| `RERANK_MIN_RELEVANCE` | `5` | 0–10 scale — the reranker's own relevance judgment must clear this to answer at all. Only used when `RERANK_ENABLED=true` |
+| `QUERY_REWRITE_ENABLED` | `false` | When `true`, an LLM call rewrites the question into a cleaner search query before retrieval. Only affects what's searched *for* — the original question is still shown to the user and used for the final answer |
 | `VECTOR_BACKEND` | `memory` | `memory` (pickled files, zero setup) or `qdrant` (real vector DB — see §9) |
 | `QDRANT_URL` | `http://localhost:6333` | Only used if `VECTOR_BACKEND=qdrant` — self-hosted or Cloud cluster URL |
 | `QDRANT_API_KEY` | *(empty)* | Only used if `VECTOR_BACKEND=qdrant` — leave empty for self-hosted, required for Qdrant Cloud |
 | `QDRANT_TIMEOUT` | `10` | Seconds before a Qdrant request times out — raise on a distant/cold cluster |
-| `QDRANT_CANDIDATE_POOL` | `30` | How many ANN candidates Qdrant returns before hybrid search TF-IDF-reranks within that pool (see §9) |
+| `QDRANT_CANDIDATE_POOL` | `30` | How many ANN candidates Qdrant returns before hybrid search re-ranks within that pool (see §9) |
 | `SECRET_KEY` | *(random per-process)* | Signs session cookies. Set explicitly for any real deployment — otherwise sessions won't survive a restart or work across multiple worker processes |
 | `LOG_LEVEL` | `INFO` | `DEBUG`, `INFO`, `WARNING`, or `ERROR` |
 | `HOST` | `127.0.0.1` | Leave as-is for a normal local run. **Must** be `0.0.0.0` inside Docker (`docker-compose.yml` already sets this) — otherwise the container's port mapping silently doesn't work |
@@ -232,24 +240,69 @@ this trade-off directly instead of guessing.
 
 ---
 
-## 6. Why hybrid retrieval (embeddings + TF-IDF)
+## 6. Retrieval architecture — BM25 + embeddings via Reciprocal Rank Fusion, optional reranking and query rewriting
+
+**The core idea**, same as before: two different search methods catch different things.
 
 - **Embeddings** are great at *meaning*: "How do I get my money back?"
   matches a chunk about "refunds" even with zero shared words.
-- **TF-IDF** is great at *exact tokens*: an error code like `ERR-4032`, a
-  product SKU, or a rare acronym can get semantically "blurred" by an
-  embedding model into a fuzzy neighborhood of similar-sounding text,
-  causing the exact chunk to rank lower than it should. TF-IDF scores
-  exact/rare-word overlap directly, so it nails these cases.
+- **BM25** is great at *exact tokens*: an error code like `ERR-4032`, a
+  product SKU, a section title, or a rare acronym can get semantically
+  "blurred" by an embedding model into a fuzzy neighborhood of
+  similar-sounding text, causing the exact chunk to rank lower than it
+  should. BM25 scores exact/rare-word overlap directly, so it nails
+  these cases — and unlike plain TF-IDF (what this project used
+  originally), real BM25 adds two things that matter: **term-frequency
+  saturation** (a word appearing 20 times in a chunk doesn't score 20×
+  higher than appearing once — it plateaus) and **document-length
+  normalization** (the same single mention isn't penalized just because
+  it sits in a longer chunk).
 
-`hybrid_search()` computes both scores per chunk and blends them:
-
+**How the two get combined — Reciprocal Rank Fusion, not a weighted average.**
+An earlier version of this app blended raw scores directly:
 ```
-combined_score = HYBRID_ALPHA * embedding_score + (1 - HYBRID_ALPHA) * tfidf_score
+combined_score = HYBRID_ALPHA * embedding_score + (1 - HYBRID_ALPHA) * bm25_score
 ```
+This turned out to be fragile in production: a chunk that's genuinely
+the #1 best match by embeddings can still have a modest-looking raw
+cosine score for reasons that have nothing to do with correctness
+(different embedding models, short/generic-sounding queries, etc.).
+Averaging that modest score against BM25's score could pull an
+obviously-correct match below any fixed threshold — repeatedly observed
+in production against a real document.
 
-`HYBRID_ALPHA` (default `0.6`) controls the blend — higher favors meaning
-matching, lower favors exact keyword matching.
+**Reciprocal Rank Fusion (RRF)** fixes this by only looking at *rank
+position* within each method, never raw magnitude:
+```
+rrf_score(chunk) = 1/(RRF_K + rank_in_bm25 + 1) + 1/(RRF_K + rank_in_embeddings + 1)
+```
+A chunk that's ranked #1 by BM25 *and* #1 by embeddings scores near the
+maximum regardless of what the underlying raw numbers happened to be.
+This is the default (`RETRIEVAL_MODE=hybrid`); the old weighted blend is
+still available as `RETRIEVAL_MODE=hybrid-legacy` for direct comparison
+on the `/eval` page (see §9.5).
+
+**Optional: reranking** (`RERANK_ENABLED=true`). A second pass over the
+RRF results — sends the top candidates to the LLM with a prompt asking
+for a genuine 0–10 relevance judgment per candidate, then reorders by
+that score. This is the practical substitute for a cross-encoder
+(Cohere Rerank / BGE-Reranker) — a real one needs either a paid API or a
+heavy local ML dependency (`sentence-transformers` + `torch`) this
+project's stack doesn't otherwise need; using the LLM call
+infrastructure already in place achieves the same goal — a smarter,
+more expensive second look at a small candidate set — without adding a
+new dependency. When enabled, the reranker's own relevance judgment also
+replaces a cruder keyword-overlap safety check for whether to answer at
+all, since the LLM correctly recognizes semantically-correct-but-
+lexically-different answers that a pure word-overlap check would wrongly
+reject (e.g. "who issued this?" matching "...issued by the Financial
+Conduct Authority" — almost no shared words, but clearly relevant).
+
+**Optional: query rewriting** (`QUERY_REWRITE_ENABLED=true`). Before
+retrieval, an LLM call turns a messy/conversational question into a
+cleaner search query. Only affects what's searched *for* — the original
+question is still what's shown in the UI and what the final answer is
+generated from.
 
 ---
 
@@ -423,7 +476,38 @@ it, and confirm a source card comes back. That's the real proof — no
 amount of code review substitutes for actually hitting a live Qdrant
 instance at least once.
 
-## 10. Troubleshooting
+## 9.5. Evaluation page — `/eval`
+
+A separate page (linked from the main chat UI's header) for real,
+measured retrieval quality — not eyeballing individual answers one at a
+time.
+
+**What it does:** enter a set of test questions, each paired with a
+substring that should appear in the section/filename it *should*
+retrieve. Pick which ablation stages to compare, hit run, and get a real
+hit-rate@k number per stage — plus, for every candidate, the individual
+BM25 score, embedding score, RRF fusion score, and reranker judgment
+(when reranking is enabled), so you can see *why* a chunk ranked where
+it did, not just whether the final answer was right.
+
+**The named ablation presets** (`/eval/run`'s `presets` field):
+
+| Preset | What it actually runs |
+|---|---|
+| `tfidf` | BM25-only, no embeddings at all — the baseline |
+| `bm25-qdrant-blend` | `RETRIEVAL_MODE=hybrid-legacy` — the old weighted-average blend |
+| `bm25-qdrant-rrf` | `RETRIEVAL_MODE=hybrid` — the current default, RRF fusion |
+| `rrf-rerank` | RRF fusion + LLM reranking |
+| `rrf-rerank-rewrite` | RRF fusion + reranking + query rewriting |
+
+Each preset routes through the exact same functions `/ask` uses
+(`reciprocal_rank_fusion()`, `rerank_with_llm()`, `rewrite_query()`) —
+there's no separate reimplementation that could silently drift from
+what users actually experience. Comparing presets side by side answers
+"did adding X actually help *my* document" with a number, instead of
+assuming a technique helps just because it's implemented.
+
+
 
 | Symptom | Likely cause |
 |---|---|

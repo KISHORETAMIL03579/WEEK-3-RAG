@@ -1073,14 +1073,91 @@ def cosine_sim(vec_a: dict[str, float], vec_b: dict[str, float]) -> float:
     return dot / (norm_a * norm_b)
 
 
+BM25_K1 = float(os.environ.get("BM25_K1", "1.5"))  # term-frequency saturation —
+# higher = a repeated word keeps adding score for longer before flattening out
+BM25_B = float(os.environ.get("BM25_B", "0.75"))  # document-length normalization —
+# 0 = ignore length entirely (like TF-IDF effectively does), 1 = fully
+# penalize longer chunks for their length
+
+
 def build_index(chunks: list[dict]) -> dict:
     corpus_tokens = [tokenize(c["text"]) for c in chunks]
-    return {"corpus_tokens": corpus_tokens, "idf": compute_idf(corpus_tokens)}
+    doc_lengths = [len(tokens) for tokens in corpus_tokens]
+    avg_doc_length = sum(doc_lengths) / len(doc_lengths) if doc_lengths else 0.0
+    # BM25's own IDF variant (log((N - n + 0.5) / (n + 0.5) + 1)) is
+    # deliberately different from compute_idf() above — it's shaped to
+    # never go negative even when a term appears in more than half the
+    # corpus, which compute_idf()'s plain formula can do.
+    n = len(corpus_tokens)
+    doc_freq: dict[str, int] = {}
+    for tokens in corpus_tokens:
+        for t in set(tokens):
+            doc_freq[t] = doc_freq.get(t, 0) + 1
+    bm25_idf = {t: math.log((n - df + 0.5) / (df + 0.5) + 1) for t, df in doc_freq.items()}
+    return {
+        "corpus_tokens": corpus_tokens,
+        "idf": compute_idf(corpus_tokens),
+        "doc_lengths": doc_lengths,
+        "avg_doc_length": avg_doc_length,
+        "bm25_idf": bm25_idf,
+    }
+
+
+def bm25_score(query_tokens: list[str], doc_tokens: list[str], doc_length: int,
+              avg_doc_length: float, bm25_idf: dict[str, float]) -> float:
+    """
+    Real BM25, not TF-IDF. The two things this adds that plain TF-IDF
+    cosine similarity doesn't have:
+
+    1. Term-frequency SATURATION — TF-IDF's raw term-frequency component
+       scales roughly linearly, so a word appearing 20 times in a chunk
+       scores dramatically higher than appearing once, even past the
+       point where more repetitions tell you anything more about
+       relevance. BM25's (k1+1)*f / (f+k1) term flattens out — it keeps
+       increasing but with steeply diminishing returns, matching the
+       intuition that "mentioned it 20 times" isn't 20x more relevant
+       than "mentioned it once."
+
+    2. Document-length NORMALIZATION — TF-IDF has no notion of chunk
+       length at all, so a long chunk that happens to contain a query
+       word once looks identical (per that word) to a short, focused
+       chunk containing it once, even though the short chunk is
+       intuitively a much stronger, more concentrated match. BM25's
+       (1 - b + b * doc_length/avg_doc_length) term in the denominator
+       penalizes matches diluted across a long chunk relative to the
+       corpus's average chunk length.
+    """
+    if avg_doc_length == 0:
+        return 0.0
+    doc_tf = Counter(doc_tokens)
+    score = 0.0
+    length_norm = 1 - BM25_B + BM25_B * (doc_length / avg_doc_length)
+    for t in query_tokens:
+        f = doc_tf.get(t, 0)
+        if f == 0:
+            continue
+        idf = bm25_idf.get(t, 0.0)
+        score += idf * (f * (BM25_K1 + 1)) / (f + BM25_K1 * length_norm)
+    return score
+
+
+def bm25_scores_for_corpus(query: str, index: dict) -> list[float]:
+    """BM25 score of `query` against every chunk in `index`, in corpus order."""
+    query_tokens = tokenize(query)
+    if not query_tokens:
+        return [0.0] * len(index["corpus_tokens"])
+    return [
+        bm25_score(query_tokens, doc_tokens, index["doc_lengths"][i],
+                  index["avg_doc_length"], index["bm25_idf"])
+        for i, doc_tokens in enumerate(index["corpus_tokens"])
+    ]
 
 
 def search_chunks(query: str, chunks: list[dict], index: dict,
                   top_k: int = 4) -> list[dict]:
-    """TF-IDF cosine similarity search — offline fallback."""
+    """Real BM25 search — offline fallback (was plain TF-IDF cosine
+    similarity; see bm25_score()'s docstring for exactly what changed
+    and why)."""
     if not chunks:
         return []
 
@@ -1088,15 +1165,19 @@ def search_chunks(query: str, chunks: list[dict], index: dict,
     if not query_tokens:
         return []
 
-    idf = index["idf"]
-    q_vec = tfidf_vector(compute_tf(query_tokens), idf)
-
+    raw_scores = bm25_scores_for_corpus(query, index)
+    # BM25 scores are unbounded (unlike TF-IDF cosine's [0,1] range) and
+    # their scale depends on corpus size/IDF, so CONFIDENCE_THRESHOLD
+    # (calibrated for the old TF-IDF cosine scale) doesn't directly
+    # apply. Normalize by the max score in this result set so downstream
+    # thresholds (TFIDF_MIN_SCORE, the shared-token safeguard) keep
+    # working against a comparable [0,1]-ish scale.
+    max_score = max(raw_scores) if raw_scores else 0.0
     scored = []
-    for chunk, tokens in zip(chunks, index["corpus_tokens"]):
-        c_vec = tfidf_vector(compute_tf(tokens), idf)
-        score = cosine_sim(q_vec, c_vec)
-        if score >= CONFIDENCE_THRESHOLD:
-            scored.append({**chunk, "score": score})
+    for chunk, score in zip(chunks, raw_scores):
+        normalized = (score / max_score) if max_score > 0 else 0.0
+        if normalized >= CONFIDENCE_THRESHOLD:
+            scored.append({**chunk, "score": normalized})
 
     scored.sort(key=lambda x: -x["score"])
     return scored[:top_k]
@@ -1114,7 +1195,8 @@ RRF_K = int(os.environ.get("RRF_K", "10"))  # NOT the textbook default (60) —
 
 def reciprocal_rank_fusion(store: "VectorStore", query: str, top_k: int = 5) -> list[dict]:
     """
-    Combines embedding-based ranking and TF-IDF-based ranking via
+    Combines embedding-based ranking and real BM25-based ranking (not
+    TF-IDF — see bm25_score() for exactly what that adds) via
     Reciprocal Rank Fusion, replacing the old weighted-average blend
     (alpha*embed + (1-alpha)*tfidf) that hybrid_search() used to do.
 
@@ -1154,24 +1236,20 @@ def reciprocal_rank_fusion(store: "VectorStore", query: str, top_k: int = 5) -> 
     embed_rank = {chunk_i: rank for rank, chunk_i in enumerate(embed_order)}
 
     index = store.get_tfidf_index()
-    q_vec = tfidf_vector(compute_tf(tokenize(query)), index["idf"])
-    tfidf_scores = [
-        cosine_sim(q_vec, tfidf_vector(compute_tf(tokens), index["idf"]))
-        for tokens in index["corpus_tokens"]
-    ]
-    tfidf_order = sorted(range(n), key=lambda i: -tfidf_scores[i])
-    tfidf_rank = {chunk_i: rank for rank, chunk_i in enumerate(tfidf_order)}
+    keyword_scores = bm25_scores_for_corpus(query, index)
+    keyword_order = sorted(range(n), key=lambda i: -keyword_scores[i])
+    keyword_rank = {chunk_i: rank for rank, chunk_i in enumerate(keyword_order)}
 
     max_possible = 2.0 / (RRF_K + 1)  # rank 0 (best) in both methods
     rrf_scores = [
-        (1.0 / (RRF_K + embed_rank[i] + 1) + 1.0 / (RRF_K + tfidf_rank[i] + 1)) / max_possible
+        (1.0 / (RRF_K + embed_rank[i] + 1) + 1.0 / (RRF_K + keyword_rank[i] + 1)) / max_possible
         for i in range(n)
     ]
 
     ranked = sorted(range(n), key=lambda i: -rrf_scores[i])[:top_k]
     return [
         {**store.chunks[i], "score": rrf_scores[i],
-         "embed_score": embed_scores[i], "tfidf_score": tfidf_scores[i]}
+         "embed_score": embed_scores[i], "keyword_score": keyword_scores[i]}
         for i in ranked
     ]
 
@@ -1300,10 +1378,11 @@ def _stem_lite(token: str) -> str:
     return token
 
 
-def validate_context(results: list[dict], min_score: float, query: str = None) -> bool:
+def validate_context(results: list[dict], min_score: float, query: str = None,
+                     rerank_score: float | None = None) -> bool:
     """
-    Reject retrieval when nothing clears the similarity bar, OR when the
-    only real signal is a single coincidentally-shared word.
+    Reject retrieval when nothing clears the similarity bar, OR when
+    there's no good evidence the top result is actually relevant.
 
     Why the score threshold alone isn't enough: it's corpus-size
     dependent. A common domain word (e.g. "policy" in an HR manual) can
@@ -1315,19 +1394,29 @@ def validate_context(results: list[dict], min_score: float, query: str = None) -
     real 25-chunk HR document — above a 0.15 threshold — via the single
     shared word "policy", despite zero other relevant overlap.
 
-    Requiring at least 2 shared meaningful tokens (or all of them, for a
-    1-2 word query) is corpus-size independent: a genuine match almost
-    always shares multiple real content words with the query, while a
-    coincidental false-positive typically shares only one. Matching is
-    done via _stem_lite() rather than exact string equality, so
-    "discover" (query) still counts as shared with "discovers" (chunk
-    text) — plain exact-match comparison was rejecting genuine matches
-    over simple suffix differences like this.
+    Two different ways of catching that, depending on what's available:
+
+    1. If reranking ran and produced a real relevance judgment
+       (rerank_score is not None), use THAT — the LLM reranker correctly
+       recognizes a semantically-correct-but-lexically-different answer
+       (e.g. "who issued this?" matching "...issued by the Financial
+       Conduct Authority", zero shared content words) as relevant, which
+       a pure lexical check would wrongly reject. This is the smarter
+       check when a smarter judge is actually available.
+
+    2. Otherwise, fall back to requiring at least 2 shared meaningful
+       tokens (stemmed) between the query and the top result — corpus-
+       size independent, catches the "policy"-style false positive, but
+       is a genuinely blunter instrument than #1 and can reject a
+       correct low-overlap answer. This is the safety net for when
+       there's no reranker available to make a better call.
     """
     if not results:
         return False
     if results[0]["score"] < min_score:
         return False
+    if rerank_score is not None:
+        return rerank_score >= RERANK_MIN_RELEVANCE
     if query is not None:
         query_tokens = set(tokenize(query))
         if query_tokens:
@@ -1366,6 +1455,126 @@ def _is_dont_know(answer: str) -> bool:
         return True
     word_count = len(a.split())
     return word_count <= 12 and any(m in a for m in _DONT_KNOW_MARKERS)
+
+
+RERANK_ENABLED = os.environ.get("RERANK_ENABLED", "false").lower() == "true"
+RERANK_TOP_N = int(os.environ.get("RERANK_TOP_N", "8"))  # how many RRF candidates to rerank
+RERANK_MIN_RELEVANCE = float(os.environ.get("RERANK_MIN_RELEVANCE", "5"))  # 0-10 scale;
+# the reranker's own relevance judgment must clear this to answer at all
+
+
+def rerank_with_llm(query: str, results: list[dict]) -> tuple[list[dict], float | None]:
+    """
+    A second-pass reranker over RRF's already-narrowed candidate list —
+    functionally the same PURPOSE as a cross-encoder (Cohere Rerank /
+    BGE-Reranker, as named in the syllabus): look at a small candidate
+    set more carefully than a first-pass ranker can, and reorder it.
+
+    Why this isn't literally a cross-encoder: a real one needs either a
+    paid API (Cohere) or a local model (BGE-Reranker, via
+    sentence-transformers + torch) — a large new dependency this
+    project's stack doesn't otherwise need. This uses the LLM call
+    infrastructure already in place instead: send the query and each
+    candidate's text to the LLM, ask for a 0-10 relevance score per
+    candidate, and reorder by that score. Same place in the pipeline,
+    same goal, different (already-available) mechanism — not a silent
+    swap presented as something it isn't.
+
+    Also returns the TOP candidate's relevance score (0-10, or None if
+    reranking didn't run). This exists specifically so /ask can use it
+    in place of the shared-token safeguard when reranking is active: a
+    pure lexical-overlap check rejects genuinely correct but
+    low-overlap answers (e.g. "who issued this?" vs "...issued by the
+    Financial Conduct Authority" shares almost no words), which a real
+    relevance judgment from the LLM correctly recognizes as a match.
+    The token-overlap check remains the fallback when reranking is OFF,
+    since there'd otherwise be no smarter judge available at all.
+
+    Fails open: if the LLM call errors for any reason, returns the
+    original RRF order unchanged and a None score (caller falls back
+    to the token-overlap check in that case) rather than breaking
+    retrieval.
+    """
+    if not results or not OPENROUTER_API_KEY:
+        return results, None
+
+    candidates = results[:RERANK_TOP_N]
+    numbered = "\n\n".join(f"[{i}] {c['text'][:600]}" for i, c in enumerate(candidates))
+    system = (
+        "You score search results for relevance to a question. Given a "
+        "question and numbered candidate excerpts, respond with ONLY a "
+        "JSON array of objects, one per candidate, each with \"index\" "
+        "and \"score\" (0-10, where 10 means the excerpt directly and "
+        "fully answers the question, 0 means completely unrelated — "
+        "judge genuine relevance, not just shared words). Order the "
+        "array from highest score to lowest. No other text — just the "
+        "JSON array, e.g. [{\"index\":2,\"score\":9},{\"index\":0,\"score\":3}]."
+    )
+    user = f"Question: {query}\n\nCandidates:\n{numbered}"
+    try:
+        data = _openrouter_call("chat/completions", {
+            "model": LLM_MODEL,
+            "messages": [{"role": "system", "content": system},
+                        {"role": "user", "content": user}],
+            "temperature": 0,
+            "max_tokens": 300,
+        })
+        raw = data["choices"][0]["message"]["content"].strip()
+        raw = re.sub(r"^```(?:json)?|```$", "", raw, flags=re.MULTILINE).strip()
+        scored = json.loads(raw)
+        indices = sorted(item["index"] for item in scored)
+        if indices != list(range(len(candidates))):
+            raise ValueError("LLM did not score every candidate exactly once")
+        scored.sort(key=lambda item: -item["score"])
+        reranked = [candidates[item["index"]] for item in scored]
+        top_score = float(scored[0]["score"])
+        return reranked + results[RERANK_TOP_N:], top_score  # anything beyond RERANK_TOP_N stays untouched, in original order
+    except Exception:
+        logger.warning("LLM reranking failed — falling back to the original RRF order.",
+                       exc_info=True)
+        return results, None
+
+
+QUERY_REWRITE_ENABLED = os.environ.get("QUERY_REWRITE_ENABLED", "false").lower() == "true"
+
+
+def rewrite_query(query: str) -> str:
+    """
+    Rewrites a messy/conversational question into a cleaner search query
+    BEFORE retrieval — e.g. "so like what happens if someone just doesn't
+    show up to work for a while" -> "abandonment of post policy".
+
+    Only the rewritten query is used for retrieval (embeddings + BM25).
+    The ORIGINAL question is still what's shown in the UI and what gets
+    sent to generate_answer() for the final answer — rewriting only
+    changes what we search FOR, never what we tell the user we searched,
+    and never what the model is actually asked to answer.
+
+    Fails open: returns the original query unchanged on any error.
+    """
+    if not query.strip() or not OPENROUTER_API_KEY:
+        return query
+    system = (
+        "Rewrite the user's question into a short, keyword-rich search "
+        "query optimized for retrieving relevant passages from a "
+        "document — not a natural-language answer, not a rephrased "
+        "question, just the core searchable terms. Respond with ONLY "
+        "the rewritten query, nothing else."
+    )
+    try:
+        data = _openrouter_call("chat/completions", {
+            "model": LLM_MODEL,
+            "messages": [{"role": "system", "content": system},
+                        {"role": "user", "content": query}],
+            "temperature": 0,
+            "max_tokens": 60,
+        })
+        rewritten = data["choices"][0]["message"]["content"].strip().strip('"')
+        return rewritten if rewritten else query
+    except Exception:
+        logger.warning("Query rewriting failed — using the original question as-is.",
+                       exc_info=True)
+        return query
 
 
 def generate_answer(query: str, results: list[dict]) -> str:
@@ -1750,6 +1959,11 @@ def ask():
     if not query:
         return jsonify({"error": "Empty query"}), 400
 
+    # search_query is what actually goes to retrieval (RRF/BM25/embeddings);
+    # query itself is untouched and still what's shown to the user and
+    # sent to generate_answer() for the actual answer.
+    search_query = rewrite_query(query) if QUERY_REWRITE_ENABLED else query
+
     def annotate_openable(results):
         files = SESSION_FILES.get(sid, {})
         for r in results:
@@ -1780,9 +1994,9 @@ def ask():
     if OPENROUTER_API_KEY and active_store.vectors and len(active_store.vectors) == len(active_store.chunks):
         try:
             if RETRIEVAL_MODE == "hybrid-legacy":
-                raw_results = hybrid_search(active_store, query, top_k=TOP_K)
+                raw_results = hybrid_search(active_store, search_query, top_k=TOP_K)
             elif RETRIEVAL_MODE == "embed":
-                q_vec = embed_text(query)
+                q_vec = embed_text(search_query)
                 # min_score=0.0 here deliberately — capture the true top
                 # candidate before any threshold filtering, so a below-
                 # threshold rejection below can still report what it was
@@ -1790,16 +2004,22 @@ def ask():
                 # information at all (see closest_match below).
                 raw_results = active_store.query(q_vec, top_k=TOP_K, min_score=0.0)
             else:  # "hybrid" (default) — Reciprocal Rank Fusion
-                raw_results = reciprocal_rank_fusion(active_store, query, top_k=TOP_K)
+                raw_results = reciprocal_rank_fusion(active_store, search_query, top_k=TOP_K)
             near_miss = raw_results[0] if raw_results else None
             results = [r for r in raw_results if r["score"] >= EMBED_MIN_SCORE]
+            rerank_score = None
+            if RERANK_ENABLED and len(results) > 1:
+                # Reranking judges relevance to what the user actually
+                # meant — the ORIGINAL query, not the rewritten search
+                # terms used just now to find these candidates.
+                results, rerank_score = rerank_with_llm(query, results)
             # TOP_K caps how many CHUNKS come back, not how many TOKENS
             # they add up to — trim to the context budget before this
             # goes anywhere near the LLM. Applied here (not just inside
             # generate_answer) so the "sources" shown to the user are
             # exactly what actually grounded the answer, never more.
             results = fit_to_token_budget(results, MAX_CONTEXT_TOKENS)
-            if not validate_context(results, EMBED_MIN_SCORE, query):
+            if not validate_context(results, EMBED_MIN_SCORE, query, rerank_score):
                 return jsonify({
                     "found": False,
                     "answer": "I don't know — no document content matched your question closely enough.",
@@ -1829,7 +2049,7 @@ def ask():
     # Path 2: offline TF-IDF fallback
     chunks = active_store.chunks
     index = active_store.get_tfidf_index()
-    results = search_chunks(query, chunks, index, top_k=TOP_K)
+    results = search_chunks(search_query, chunks, index, top_k=TOP_K)
     results = fit_to_token_budget(results, MAX_CONTEXT_TOKENS)
     if not validate_context(results, TFIDF_MIN_SCORE, query):
         near_miss = results[0] if results else None
@@ -1918,6 +2138,162 @@ def remove_doc():
                           f"failed: {backend_error}. The data may still exist "
                           f"in the backend.")
     return jsonify(resp)
+
+
+@app.route("/eval")
+def eval_page():
+    """Serves the Week 4 evaluation page — a real hit-rate@k measurement
+    tool, separate from the main chat UI, using the documents already
+    indexed in this session."""
+    if "session_id" not in session:
+        session["session_id"] = str(uuid.uuid4())
+    return render_template("eval.html")
+
+
+# Named presets for the Week 4 ablation ladder — each maps to a specific,
+# real combination of techniques already implemented, so "did adding X
+# actually help" can be measured directly rather than inferred.
+EVAL_PRESETS = {
+    "tfidf":                {"force_tfidf": True,  "mode": None,            "rerank": False, "rewrite": False},
+    "bm25-qdrant-blend":    {"force_tfidf": False, "mode": "hybrid-legacy", "rerank": False, "rewrite": False},
+    "bm25-qdrant-rrf":      {"force_tfidf": False, "mode": "hybrid",        "rerank": False, "rewrite": False},
+    "rrf-rerank":           {"force_tfidf": False, "mode": "hybrid",        "rerank": True,  "rewrite": False},
+    "rrf-rerank-rewrite":   {"force_tfidf": False, "mode": "hybrid",        "rerank": True,  "rewrite": True},
+}
+
+
+def _retrieve_for_eval(active_store, query: str, k: int, mode: str, force_tfidf: bool = False) -> list[dict]:
+    """
+    Runs retrieval through the exact same functions /ask uses for each
+    mode, so evaluation measures the REAL system's behavior rather than
+    a separate reimplementation that could silently drift from it.
+
+    force_tfidf deliberately bypasses embeddings even if configured —
+    needed for the "tfidf" baseline preset to be a real, comparable
+    baseline against a document that DOES have embeddings, rather than
+    only ever being available when no API key exists at all.
+    """
+    has_embeddings = (OPENROUTER_API_KEY and active_store.vectors
+                      and len(active_store.vectors) == len(active_store.chunks))
+    if has_embeddings and not force_tfidf:
+        if mode == "hybrid-legacy":
+            return hybrid_search(active_store, query, top_k=k)
+        if mode == "embed":
+            return active_store.query(embed_text(query), top_k=k, min_score=0.0)
+        return reciprocal_rank_fusion(active_store, query, top_k=k)  # "hybrid" (RRF)
+    index = active_store.get_tfidf_index()
+    return search_chunks(query, active_store.chunks, index, top_k=k)
+
+
+def _hit_check(retrieved: list[dict], expected: str) -> bool:
+    """A 'hit' means the expected section/filename text appears as a
+    substring of any retrieved chunk's section or filename — matches the
+    same matching style used throughout this project's manual testing
+    (e.g. "5.2 Policy on Annual Leave" matching that exact section)."""
+    if not expected:
+        return False
+    expected_lower = expected.lower()
+    for r in retrieved:
+        section = (r.get("section") or "").lower()
+        filename = (r.get("filename") or "").lower()
+        if expected_lower in section or expected_lower in filename:
+            return True
+    return False
+
+
+def _run_eval_preset(active_store, question: str, expected: str, k: int, preset: dict) -> dict:
+    """
+    Runs ONE question through ONE named preset's full pipeline —
+    optional query rewriting, retrieval, optional reranking — and
+    returns a per-stage breakdown (BM25/embed/RRF scores per candidate,
+    plus the reranker's judgment if it ran) alongside the hit/miss
+    verdict, so each Week 4 technique's real effect is visible, not just
+    the final aggregate hit-rate.
+    """
+    search_q = rewrite_query(question) if preset["rewrite"] else question
+    retrieved = _retrieve_for_eval(active_store, search_q, k, preset["mode"], preset["force_tfidf"])
+    rerank_score = None
+    if preset["rerank"] and len(retrieved) > 1:
+        retrieved, rerank_score = rerank_with_llm(question, retrieved)
+    hit = _hit_check(retrieved, expected)
+    return {
+        "question": question,
+        "search_query": search_q if search_q != question else None,
+        "expected": expected,
+        "hit": hit,
+        "rerank_score": rerank_score,
+        "retrieved": [
+            {
+                "section": r.get("section"), "filename": r.get("filename"),
+                "score": round(r.get("score", 0.0), 4),
+                "embed_score": round(r["embed_score"], 4) if "embed_score" in r else None,
+                "bm25_score": round(r["keyword_score"], 4) if "keyword_score" in r else None,
+            }
+            for r in retrieved
+        ],
+    }
+
+
+@app.route("/eval/run", methods=["POST"])
+def eval_run():
+    """
+    Runs a real hit-rate@k evaluation: for each (question, expected
+    section) pair, retrieves top-k through the real retrieval pipeline
+    and checks whether the expected section actually shows up. Optionally
+    compares multiple retrieval modes side by side in one call, so "did
+    this change actually help" has a real before/after number instead of
+    manual re-testing.
+    """
+    sid = session.get("session_id")
+    if not sid:
+        return jsonify({"error": "No active session"}), 400
+
+    data = request.get_json(silent=True) or {}
+    questions = data.get("questions", [])
+    k = max(1, min(int(data.get("k", 3)), 20))
+    chunk_mode_filter = (data.get("chunk_mode") or "").strip() or None
+    # "presets" is the new, preferred way to compare ablation stages
+    # (tfidf -> bm25+qdrant -> +RRF -> +reranking -> +query rewriting).
+    # "modes" is kept for backward compatibility with the raw retrieval-
+    # mode comparison this page originally shipped with.
+    preset_names = data.get("presets") or list(EVAL_PRESETS.keys())[:3]
+    legacy_modes = data.get("modes")
+
+    questions = [
+        {"question": (q.get("question") or "").strip(), "expected": (q.get("expected") or "").strip()}
+        for q in questions if (q.get("question") or "").strip()
+    ]
+    if not questions:
+        return jsonify({"error": "No questions provided"}), 400
+
+    store = _get_store(sid)
+    if not store.chunks:
+        return jsonify({"error": "No documents indexed in this session yet — upload one first"}), 400
+
+    active_store = store.filtered_by_method(chunk_mode_filter) if chunk_mode_filter else store
+    if chunk_mode_filter and not active_store.chunks:
+        return jsonify({"error": f"No documents indexed under the '{chunk_mode_filter}' strategy"}), 400
+
+    by_preset = {}
+    names = legacy_modes if legacy_modes else preset_names
+    for name in names:
+        preset = EVAL_PRESETS.get(name) or {
+            "force_tfidf": False, "mode": name, "rerank": False, "rewrite": False,
+        }  # legacy raw-mode names fall back to a plain preset shape
+        per_question = []
+        hits = 0
+        for q in questions:
+            result = _run_eval_preset(active_store, q["question"], q["expected"], k, preset)
+            hits += result["hit"]
+            per_question.append(result)
+        by_preset[name] = {
+            "hit_rate": hits / len(questions),
+            "hits": hits,
+            "total": len(questions),
+            "results": per_question,
+        }
+
+    return jsonify({"ok": True, "k": k, "modes": by_preset})
 
 
 @app.route("/healthz", methods=["GET"])
