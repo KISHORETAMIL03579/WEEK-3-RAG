@@ -2039,10 +2039,22 @@ def ask():
                 "answer": answer or "I don't know.",
                 "sources": annotate_openable(results),
             })
+        except urllib.error.HTTPError as exc:
+            reason = {
+                401: "Invalid or expired OpenRouter API key — check OPENROUTER_API_KEY.",
+                402: "OpenRouter account has insufficient credits (Payment Required) — "
+                    "add credits or check your balance at openrouter.ai.",
+                429: "Rate limited by OpenRouter — too many requests too quickly.",
+            }.get(exc.code, f"Unexpected HTTP {exc.code} from OpenRouter.")
+            logger.warning(
+                "Embeddings/LLM path failed for a query — falling back to TF-IDF-only. %s",
+                reason, exc_info=True,
+            )
+            # fall through to TF-IDF
         except Exception:
             logger.warning(
                 "Embeddings/LLM path failed for a query — falling back to TF-IDF-only. "
-                "This usually means a bad API key, rate limit, or network issue with OpenRouter.",
+                "This usually means a network issue reaching OpenRouter.",
                 exc_info=True,
             )
             # fall through to TF-IDF

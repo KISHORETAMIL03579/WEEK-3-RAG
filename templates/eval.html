@@ -43,8 +43,8 @@
       padding: 9px 12px; color: var(--text-primary); font-family: var(--font); font-size: .85rem;
     }
     .row { display: flex; gap: 10px; margin-bottom: 8px; align-items: center; }
-    .row input[type="text"]:first-child { flex: 2; }
-    .row input[type="text"]:last-child { flex: 1; }
+    .row .row-question { flex: 2; min-width: 0; }
+    .row .row-expected { flex: 1; min-width: 0; }
     .row button {
       background: transparent; border: 1px solid var(--border); color: var(--text-muted);
       border-radius: var(--radius); width: 34px; height: 34px; cursor: pointer; flex-shrink: 0;
@@ -76,6 +76,15 @@
     .mode-section h3 { font-size: .9rem; margin: 0 0 10px; display: flex; align-items: center; gap: 10px; }
     .empty-hint { color: var(--text-muted); font-size: .82rem; text-align: center; padding: 30px; }
     .status-line { font-size: .78rem; color: var(--text-muted); margin-top: 10px; }
+    input[type="file"] {
+      color: var(--text-secondary); font-size: .8rem;
+    }
+    input[type="file"]::file-selector-button {
+      background: var(--bg-raised); border: 1px solid var(--border); border-radius: var(--radius);
+      padding: 7px 14px; color: var(--text-primary); font-family: var(--font); font-size: .78rem;
+      font-weight: 600; cursor: pointer; margin-right: 10px;
+    }
+    input[type="file"]::file-selector-button:hover { background: var(--accent-dim); border-color: var(--accent); }
   </style>
 </head>
 <body>
@@ -170,8 +179,8 @@ function addRow(question = '', expected = '') {
   div.className = 'row';
   div.id = `row-${rowCount}`;
   div.innerHTML = `
-    <input type="text" placeholder="Question" value="${escapeAttr(question)}">
-    <input type="text" placeholder="Expected section/filename substring" value="${escapeAttr(expected)}">
+    <input type="text" class="row-question" placeholder="Question" value="${escapeAttr(question)}">
+    <input type="text" class="row-expected" placeholder="Expected section/filename substring" value="${escapeAttr(expected)}">
     <button onclick="document.getElementById('row-${rowCount}').remove()" title="Remove">✕</button>
   `;
   document.getElementById('questionRows').appendChild(div);

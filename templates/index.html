@@ -897,6 +897,7 @@
       gap: 10px;
       width: 100%;
       max-width: 760px;
+      margin: 0 auto;
       position: relative;
       background: var(--bg-raised);
       border: 1px solid var(--border);
@@ -920,7 +921,7 @@
       line-height: 1.5;
     }
 
-    .chat-input::placeholder { color: var(--text-muted); }
+    .chat-input::placeholder { color: var(--text-muted); white-space: nowrap; overflow: hidden; text-overflow: ellipsis; }
 
     .send-btn {
       background: var(--accent);
@@ -1009,6 +1010,16 @@
       .chat-area { padding: 16px; }
       .input-bar { padding: 12px 16px; }
       .topbar-mode { display: none; }
+      /* The header was built assuming desktop width — logo + version tag +
+         Evaluate link + document count + mode badges all fit fine at
+         1400px, but overflow badly on a ~375px phone screen (the logo
+         text itself was wrapping "Ask My Docs" onto 3 separate lines,
+         and the Evaluate link + stats got clipped off-screen entirely).
+         Trim to just the essentials on mobile: logo + a compact status dot. */
+      .logo-name { white-space: nowrap; }
+      .logo-version { display: none; }
+      header a[href="/eval"] { display: none; }
+      #topbarStat #statLabel { display: none; }
     }
   </style>
 </head>
@@ -1181,7 +1192,7 @@
         <textarea
           id="chatInput"
           class="chat-input"
-          placeholder="Ask a question about your documents…"
+          placeholder="Ask a question…"
           rows="1"
           onkeydown="handleKey(event)"
           oninput="autoResize(this)"
