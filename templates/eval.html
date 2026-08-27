@@ -90,6 +90,14 @@
   <main>
     <div class="card">
       <h2>1. Test questions</h2>
+      <div style="margin-bottom:14px; padding:12px; background:var(--bg-raised); border:1px dashed var(--border); border-radius:var(--radius);">
+        <label style="margin-bottom:8px;">Import from a PDF or text file (optional)</label>
+        <div style="display:flex; gap:10px; align-items:center;">
+          <input type="file" id="qaPdfInput" accept=".pdf,.txt,.md" style="flex:1; font-size:.8rem;"/>
+          <button class="btn secondary" onclick="importQaPdf()">Import</button>
+        </div>
+        <div class="status-line" id="qaImportStatus">Format: one line "Q: your question", next line "A: expected section/filename", blank line between pairs.</div>
+      </div>
       <div id="questionRows"></div>
       <button class="btn secondary" onclick="addRow()" style="margin-top:8px;">+ Add question</button>
       <div class="status-line">Each row: a question, and a substring that should appear in the correct section/filename it retrieves (e.g. "5.2 Policy on Annual Leave" or just "Annual Leave").</div>
@@ -125,6 +133,36 @@
 
 <script>
 let rowCount = 0;
+
+async function importQaPdf() {
+  const input = document.getElementById('qaPdfInput');
+  const status = document.getElementById('qaImportStatus');
+  const file = input.files[0];
+  if (!file) {
+    status.textContent = 'Choose a PDF file first.';
+    return;
+  }
+  status.textContent = 'Importing…';
+  const formData = new FormData();
+  formData.append('file', file);
+  try {
+    const res = await fetch('/eval/parse-qa-pdf', { method: 'POST', body: formData });
+    const data = await res.json();
+    if (!res.ok || !data.ok) {
+      status.textContent = data.error || 'Import failed.';
+      return;
+    }
+    // Clear the starter empty rows the first time something real is imported
+    document.getElementById('questionRows').innerHTML = '';
+    for (const pair of data.pairs) {
+      addRow(pair.question, pair.expected);
+    }
+    status.textContent = `Imported ${data.pairs.length} question(s) from "${file.name}".`;
+    input.value = '';
+  } catch (err) {
+    status.textContent = 'Error: ' + err.message;
+  }
+}
 
 function addRow(question = '', expected = '') {
   rowCount++;

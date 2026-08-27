@@ -6,6 +6,7 @@ import json
 import time
 import uuid
 import pickle
+import tempfile
 import hashlib
 import logging
 import secrets
@@ -2138,6 +2139,86 @@ def remove_doc():
                           f"failed: {backend_error}. The data may still exist "
                           f"in the backend.")
     return jsonify(resp)
+
+
+def parse_qa_pairs(text: str) -> list[dict]:
+    """
+    Parses "Q: ...\\nA: ..." blocks out of raw text (from a PDF, or typed
+    directly) into {question, expected} pairs for the eval page.
+
+    Handles a question or answer spanning multiple lines by accumulating
+    lines until the next "Q:"/"A:" marker or end of text — so a longer,
+    wrapped question in the source PDF doesn't get cut short.
+    """
+    pairs = []
+    current_q, current_a = None, None
+
+    def flush():
+        if current_q and current_a:
+            pairs.append({"question": current_q.strip(), "expected": current_a.strip()})
+
+    mode = None  # "q" or "a" — which buffer subsequent non-marker lines append to
+    for raw_line in text.splitlines():
+        line = raw_line.strip()
+        if not line:
+            continue
+        q_match = re.match(r"^q\s*[:\-.]\s*(.*)", line, re.IGNORECASE)
+        a_match = re.match(r"^a\s*[:\-.]\s*(.*)", line, re.IGNORECASE)
+        if q_match:
+            flush()
+            current_q, current_a = q_match.group(1), None
+            mode = "q"
+        elif a_match:
+            current_a = a_match.group(1)
+            mode = "a"
+        elif mode == "q" and current_q is not None:
+            current_q += " " + line
+        elif mode == "a" and current_a is not None:
+            current_a += " " + line
+    flush()
+    return pairs
+
+
+@app.route("/eval/parse-qa-pdf", methods=["POST"])
+def eval_parse_qa_pdf():
+    """
+    Accepts an uploaded PDF, TXT, or MD file containing Q:/A: formatted
+    pairs, extracts its text (via PyMuPDF for PDF, direct decode for
+    plain text), and returns the parsed pairs as JSON for the eval page
+    to populate its question rows from — so a pre-written test set
+    doesn't need to be retyped by hand into the UI.
+    """
+    file = request.files.get("file")
+    if not file or not file.filename:
+        return jsonify({"error": "No file uploaded"}), 400
+
+    filename_lower = file.filename.lower()
+    if filename_lower.endswith(".pdf"):
+        tmp_path = Path(tempfile.gettempdir()) / f"qa_upload_{uuid.uuid4().hex}.pdf"
+        try:
+            file.save(tmp_path)
+            pages = extract_pdf_pages(str(tmp_path))
+            if not pages:
+                return jsonify({"error": "Could not extract any text from that PDF — "
+                                        "it may be corrupt, encrypted, or a scanned "
+                                        "image without a text layer"}), 400
+            full_text = "\n".join(p["text"] for p in pages)
+        finally:
+            tmp_path.unlink(missing_ok=True)
+    elif filename_lower.endswith((".txt", ".md")):
+        try:
+            full_text = file.read().decode("utf-8", errors="replace")
+        except Exception:
+            return jsonify({"error": "Could not read that file as text"}), 400
+    else:
+        return jsonify({"error": "Only PDF, TXT, or MD files are supported here"}), 400
+
+    pairs = parse_qa_pairs(full_text)
+    if not pairs:
+        return jsonify({"error": 'No "Q:"/"A:" pairs found. Expected format: '
+                                '"Q: your question" on one line, "A: expected '
+                                'answer" on the next, blank line between pairs.'}), 400
+    return jsonify({"ok": True, "pairs": pairs})
 
 
 @app.route("/eval")
