@@ -46,7 +46,10 @@ from qdrant_client.http import models as qmodels
 
 # Imported lazily by app.py, so these reference app's module-level config
 # rather than redefining it — avoids two sources of truth for the same URL.
+import os
 import app as _app
+
+QDRANT_SCROLL_LIMIT = int(os.environ.get("QDRANT_SCROLL_LIMIT", "256"))
 
 
 def _client() -> QdrantClient:
@@ -149,7 +152,7 @@ class QdrantVectorStore:
         while True:
             points, offset = _client().scroll(
                 collection_name=self.collection, with_payload=True, with_vectors=True,
-                limit=256, offset=offset,
+                limit=QDRANT_SCROLL_LIMIT, offset=offset,
             )
             for p in points:
                 chunks.append(p.payload)

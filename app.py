@@ -6,6 +6,7 @@ import json
 import time
 import uuid
 import pickle
+import base64
 import tempfile
 import hashlib
 import logging
@@ -18,6 +19,11 @@ import urllib.error
 import html.parser
 from pathlib import Path
 from collections import Counter
+
+try:
+    import docx  # type: ignore
+except ImportError:
+    docx = None
 
 import pymupdf as fitz  # PyMuPDF — imports the real module directly, avoiding
                         # the deprecated `import fitz` legacy-alias shim that
@@ -292,7 +298,13 @@ def _gemini_chat_call(system: str, user: str,
             with urllib.request.urlopen(req, timeout=90) as resp:
                 data = json.loads(resp.read().decode("utf-8"))
             elapsed = time.time() - t0
-            result_text = data["candidates"][0]["content"]["parts"][0]["text"].strip()
+            candidate = data.get("candidates", [{}])[0]
+            content_obj = candidate.get("content", {})
+            parts = content_obj.get("parts", [])
+            if not parts:
+                logger.warning("⚠️ Gemini response candidate has no parts (finish_reason: %s)", candidate.get("finishReason"))
+                return ""
+            result_text = parts[0].get("text", "").strip()
             logger.info("🤖 Gemini LLM call succeeded in %.2fs (model: %s)", elapsed, LLM_MODEL)
             return result_text
         except urllib.error.HTTPError as exc:
@@ -303,6 +315,15 @@ def _gemini_chat_call(system: str, user: str,
                 time.sleep(delay)
             else:
                 logger.error("❌ Gemini LLM call failed with HTTP %d: %s", exc.code, exc)
+                raise
+        except (urllib.error.URLError, socket.timeout, TimeoutError, OSError) as exc:
+            if attempt < max_retries:
+                delay = base_delay * (2 ** (attempt - 1))
+                logger.warning("⏳ Gemini LLM network timeout (%s). Retrying in %.1fs (attempt %d/%d)...",
+                               exc, delay, attempt, max_retries)
+                time.sleep(delay)
+            else:
+                logger.error("❌ Gemini LLM network call timed out after %d attempts: %s", max_retries, exc)
                 raise
         except Exception as exc:
             logger.error("❌ Gemini LLM call exception: %s", exc, exc_info=True)
@@ -658,6 +679,138 @@ def extract_txt_pages(filepath: str) -> list[dict]:
     if not sections:
         sections = [text]
     return [{"page": i + 1, "text": s} for i, s in enumerate(sections)]
+
+
+def extract_image_pages(filepath: str) -> list[dict]:
+    """Extract text and visual content from images using Gemini Vision API OCR."""
+    ext = filepath.rsplit(".", 1)[-1].lower()
+    mime_type = {
+        "png": "image/png",
+        "jpg": "image/jpeg",
+        "jpeg": "image/jpeg",
+        "webp": "image/webp",
+        "bmp": "image/bmp",
+        "tiff": "image/tiff",
+        "gif": "image/gif",
+    }.get(ext, "image/jpeg")
+
+    filename = Path(filepath).name
+    if not GEMINI_API_KEY:
+        logger.warning("⚠️ Gemini API Key missing for Image Vision OCR: %s", filename)
+        return [{"page": 1, "text": f"Document Image: {filename}\nNote: Configure GEMINI_API_KEY to enable full Vision OCR extraction."}]
+
+    try:
+        with open(filepath, "rb") as img_file:
+            img_b64 = base64.b64encode(img_file.read()).decode("utf-8")
+
+        url = f"{GEMINI_URL}/models/{LLM_MODEL}:generateContent?key={GEMINI_API_KEY}"
+        payload = {
+            "contents": [
+                {
+                    "role": "user",
+                    "parts": [
+                        {
+                            "inline_data": {
+                                "mime_type": mime_type,
+                                "data": img_b64
+                            }
+                        },
+                        {
+                            "text": (
+                                "Extract all text, table content, diagram descriptions, titles, bullet points, "
+                                "and key information from this image into clean, structured Markdown text."
+                            )
+                        }
+                    ]
+                }
+            ],
+            "generationConfig": {"temperature": 0}
+        }
+
+        req = urllib.request.Request(
+            url,
+            data=json.dumps(payload).encode("utf-8"),
+            headers={"Content-Type": "application/json"},
+            method="POST"
+        )
+        with urllib.request.urlopen(req, timeout=90) as resp:
+            data = json.loads(resp.read().decode("utf-8"))
+        
+        extracted_text = data["candidates"][0]["content"]["parts"][0]["text"].strip()
+        logger.info("🖼️ Gemini Vision OCR extracted %d characters from image %s", len(extracted_text), filename)
+        return [{"page": 1, "text": f"# Image OCR Content: {filename}\n\n{extracted_text}"}]
+    except Exception as exc:
+        logger.error("❌ Gemini Vision OCR failed for %s: %s", filename, exc, exc_info=True)
+        return [{"page": 1, "text": f"Image Document: {filename}\n(Error during image text extraction)"}]
+
+
+def extract_docx_pages(filepath: str) -> list[dict]:
+    """Extract text and tables from Word (.docx / .doc) documents."""
+    try:
+        if docx is None:
+            raise ImportError("python-docx package not installed")
+        doc = docx.Document(filepath)
+        full_text = []
+        for p in doc.paragraphs:
+            if p.text.strip():
+                full_text.append(p.text.strip())
+        for t in doc.tables:
+            for row in t.rows:
+                row_text = " | ".join(cell.text.strip() for cell in row.cells if cell.text.strip())
+                if row_text:
+                    full_text.append(f"| {row_text} |")
+        text = "\n\n".join(full_text)
+        sections = [s.strip() for s in re.split(r"\n{3,}", text) if s.strip()] or [text]
+        return [{"page": i + 1, "text": s} for i, s in enumerate(sections)]
+    except Exception as exc:
+        logger.info("Falling back to plain text read for Word document %s: %s", filepath, exc)
+        return extract_txt_pages(filepath)
+
+
+def extract_data_pages(filepath: str, ext: str) -> list[dict]:
+    """Extract CSV, TSV, JSON, XML, YAML data files as structured Markdown."""
+    with open(filepath, "r", encoding="utf-8", errors="ignore") as f:
+        content = f.read().strip()
+
+    if ext in ("csv", "tsv"):
+        lines = content.splitlines()
+        delimiter = "\t" if ext == "tsv" else ","
+        formatted = []
+        for line in lines:
+            parts = line.split(delimiter)
+            formatted.append(" | ".join(p.strip() for p in parts))
+        text = f"```table\n" + "\n".join(formatted) + "\n```"
+    elif ext in ("json", "yaml", "yml", "xml"):
+        text = f"```{ext}\n{content}\n```"
+    else:
+        text = content
+
+    return [{"page": 1, "text": text}]
+
+
+def extract_code_pages(filepath: str, ext: str) -> list[dict]:
+    """Extract source code files wrapped in code blocks."""
+    with open(filepath, "r", encoding="utf-8", errors="ignore") as f:
+        code = f.read().strip()
+    wrapped = f"```{ext}\n{code}\n```"
+    return [{"page": 1, "text": wrapped}]
+
+
+def extract_document_pages(filepath: str, ext: str) -> list[dict]:
+    """Universal text extractor supporting PDF, TXT, MD, DOCX, CSV/JSON, Code, and Images (Vision OCR)."""
+    ext = ext.lower()
+    if ext == "pdf":
+        return extract_pdf_pages(filepath)
+    elif ext in ("png", "jpg", "jpeg", "webp", "bmp", "tiff", "gif"):
+        return extract_image_pages(filepath)
+    elif ext in ("docx", "doc"):
+        return extract_docx_pages(filepath)
+    elif ext in ("csv", "tsv", "json", "yaml", "yml", "xml"):
+        return extract_data_pages(filepath, ext)
+    elif ext in ("py", "js", "ts", "jsx", "tsx", "html", "css", "c", "cpp", "h", "hpp", "java", "go", "rs", "php", "sql", "sh", "bat", "ps1"):
+        return extract_code_pages(filepath, ext)
+    else:
+        return extract_txt_pages(filepath)
 
 
 # ─────────────────────────────────────────────────────────────────────────────
@@ -2034,11 +2187,21 @@ def serve_file(doc_id: str):
     sid = session.get("session_id")
     if not sid:
         return jsonify({"error": "No active session"}), 400
+
     info = SESSION_FILES.get(sid, {}).get(doc_id)
-    if not info or not info["path"].exists():
+    store = _get_store(sid)
+    doc_chunks = [c for c in store.chunks if c["doc_id"] == doc_id]
+
+    if not info and not doc_chunks:
         return jsonify({"error": "File not found or no longer available"}), 404
-    name = info["name"]
-    ext = (name.rsplit(".", 1)[1] if "." in name else "").lower()
+
+    if info and info["path"].exists():
+        name = info["name"]
+        ext = (name.rsplit(".", 1)[1] if "." in name else "").lower()
+    else:
+        name = doc_chunks[0]["filename"] if doc_chunks else "Document"
+        ext = "txt"
+
     return render_template("view.html", doc_id=doc_id, filename=name, ext=ext)
 
 
@@ -2060,17 +2223,27 @@ def serve_file_pages(doc_id: str):
     sid = session.get("session_id")
     if not sid:
         return jsonify({"error": "No active session"}), 400
+
     info = SESSION_FILES.get(sid, {}).get(doc_id)
-    if not info or not info["path"].exists():
+    store = _get_store(sid)
+    doc_chunks = [c for c in store.chunks if c["doc_id"] == doc_id]
+
+    if not info and not doc_chunks:
         return jsonify({"error": "File not found or no longer available"}), 404
 
-    name = info["name"]
-    ext = (name.rsplit(".", 1)[1] if "." in name else "").lower()
-    try:
-        pages = (extract_pdf_pages(str(info["path"])) if ext == "pdf"
-                 else extract_txt_pages(str(info["path"])))
-    except Exception as exc:
-        return jsonify({"error": f"Could not read document: {exc}"}), 500
+    if info and info["path"].exists():
+        name = info["name"]
+        ext = (name.rsplit(".", 1)[1] if "." in name else "").lower()
+        try:
+            pages = extract_document_pages(str(info["path"]), ext)
+        except Exception as exc:
+            return jsonify({"error": f"Could not read document: {exc}"}), 500
+    else:
+        # Reconstruct text pages from vector store chunks!
+        name = doc_chunks[0]["filename"] if doc_chunks else "Document"
+        ext = "txt"
+        combined_text = "\n\n".join(c["text"] for c in doc_chunks)
+        pages = [{"page": 1, "text": combined_text}]
 
     return jsonify({
         "filename": name,
@@ -2449,6 +2622,18 @@ def _hit_check(retrieved: list[dict], expected: str) -> bool:
     return False
 
 
+def _rr_rank(retrieved: list[dict], expected: str) -> tuple[bool, float, int]:
+    if not expected:
+        return False, 0.0, 0
+    expected_lower = expected.lower()
+    for idx, r in enumerate(retrieved, start=1):
+        section = (r.get("section") or "").lower()
+        filename = (r.get("filename") or "").lower()
+        if expected_lower in section or expected_lower in filename:
+            return True, 1.0 / idx, idx
+    return False, 0.0, 0
+
+
 def _run_eval_preset(active_store, question: str, expected: str, k: int, preset: dict) -> dict:
     """
     Runs ONE question through ONE named preset's full pipeline —
@@ -2463,12 +2648,16 @@ def _run_eval_preset(active_store, question: str, expected: str, k: int, preset:
     rerank_score = None
     if preset["rerank"] and len(retrieved) > 1:
         retrieved, rerank_score = rerank_with_llm(question, retrieved)
-    hit = _hit_check(retrieved, expected)
+    hit, rr, rank = _rr_rank(retrieved, expected)
+    failure_type = "Success" if hit else "Retrieval Failure"
     return {
         "question": question,
         "search_query": search_q if search_q != question else None,
         "expected": expected,
         "hit": hit,
+        "reciprocal_rank": round(rr, 4),
+        "rank": rank,
+        "failure_type": failure_type,
         "rerank_score": rerank_score,
         "retrieved": [
             {
@@ -2534,8 +2723,10 @@ def eval_run():
             result = _run_eval_preset(active_store, q["question"], q["expected"], k, preset)
             hits += result["hit"]
             per_question.append(result)
+        rr_sum = sum(r.get("reciprocal_rank", 0.0) for r in per_question)
         by_preset[name] = {
             "hit_rate": hits / len(questions),
+            "mrr": round(rr_sum / len(questions), 4),
             "hits": hits,
             "total": len(questions),
             "results": per_question,

@@ -48,9 +48,11 @@ from app import (  # noqa: E402
     extract_pdf_pages, extract_txt_pages, GEMINI_API_KEY,
 )
 
-TOP_K = 5
-HYBRID_ALPHA = 0.6  # weight on embedding score; must match app.py's HYBRID_ALPHA
-                    # to evaluate the exact same config that's live in /ask
+import os
+
+TOP_K = int(os.environ.get("TOP_K", "5"))
+HYBRID_ALPHA = float(os.environ.get("HYBRID_ALPHA", "0.6"))
+EVAL_CHUNK_MODE = os.environ.get("EVAL_CHUNK_MODE", "structured")
 
 # ── 1. Point this at your own documents ─────────────────────────────────
 # [(filepath_on_disk, display_name), ...]
@@ -87,7 +89,7 @@ def build_eval_store() -> VectorStore:
             print(f"⚠ no extractable text in {name}, skipping")
             continue
         doc_info = {"doc_id": name, "filename": name}
-        chunks = chunk_text(doc_info, pages, "structured")
+        chunks = chunk_text(doc_info, pages, EVAL_CHUNK_MODE)
         store.chunks.extend(chunks)
         all_texts.extend(c["text"] for c in chunks)
 
@@ -123,10 +125,11 @@ def _top_k_filenames(scores: list[float], chunks: list[dict], k: int) -> set:
 
 def recall_at_k(store: VectorStore, questions: list[dict], k: int, mode: str):
     if not store.chunks:
-        return 0.0, []
+        return 0.0, 0.0, []
 
     index = build_index(store.chunks)
     hits = 0
+    rr_total = 0.0
     per_question = []
 
     for q in questions:
@@ -141,12 +144,26 @@ def recall_at_k(store: VectorStore, questions: list[dict], k: int, mode: str):
             scores = [HYBRID_ALPHA * e + (1 - HYBRID_ALPHA) * t
                       for e, t in zip(embed_s, tfidf_s)]
 
-        top_docs = _top_k_filenames(scores, store.chunks, k)
-        hit = any(q["expected_doc"] in d for d in top_docs)
-        hits += hit
-        per_question.append((q["question"], hit))
+        ranked_indices = sorted(range(len(scores)), key=lambda i: -scores[i])[:k]
+        top_docs = [store.chunks[i]["filename"] for i in ranked_indices]
+        
+        hit = False
+        rr = 0.0
+        for rank_idx, doc_name in enumerate(top_docs, start=1):
+            if q["expected_doc"].lower() in doc_name.lower():
+                hit = True
+                rr = 1.0 / rank_idx
+                break
 
-    return hits / len(questions), per_question
+        hits += int(hit)
+        rr_total += rr
+        
+        failure_type = "Success" if hit else "Retrieval Failure"
+        per_question.append((q["question"], hit, rr, failure_type))
+
+    hit_rate = hits / len(questions)
+    mrr = rr_total / len(questions)
+    return hit_rate, mrr, per_question
 
 
 def main():
@@ -166,17 +183,17 @@ def main():
 
     results_by_mode = {}
     for mode in ("embed", "hybrid", "tfidf"):
-        score, per_question = recall_at_k(store, questions, TOP_K, mode)
-        results_by_mode[mode] = (score, per_question)
+        hit_rate, mrr, per_question = recall_at_k(store, questions, TOP_K, mode)
+        results_by_mode[mode] = (hit_rate, mrr, per_question)
 
-    print(f"\n{'MODE':8s} {'RECALL@' + str(TOP_K):12s}")
-    print("-" * 24)
+    print(f"\n{'MODE':10s} {'HIT-RATE@' + str(TOP_K):14s} {'MRR':10s}")
+    print("-" * 38)
     for mode in ("embed", "hybrid", "tfidf"):
-        score, _ = results_by_mode[mode]
-        print(f"{mode:8s} {score:6.0%}   ({int(round(score*len(questions)))}/{len(questions)})")
+        hr, mrr, _ = results_by_mode[mode]
+        print(f"{mode:10s} {hr:6.0%} ({int(round(hr*len(questions)))}/{len(questions)})    {mrr:.4f}")
 
-    before, _ = results_by_mode["embed"]
-    after, _ = results_by_mode["hybrid"]
+    before, _, _ = results_by_mode["embed"]
+    after, _, _ = results_by_mode["hybrid"]
     delta = after - before
     print(f"\nBefore (embed-only) -> After (hybrid): {before:.0%} -> {after:.0%}  "
           f"({'+' if delta >= 0 else ''}{delta:.0%})")
