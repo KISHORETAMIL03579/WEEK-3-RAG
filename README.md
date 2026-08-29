@@ -7,6 +7,30 @@ instead of guessing.
 
 ---
 
+## ⚡ Quick Start & Setup
+
+```bash
+git clone <repository-url>
+cd WEEK-3-RAG
+python -m venv .venv
+.venv\Scripts\Activate.ps1
+python -c "import sys; print(sys.executable)"
+python -m pip install -r requirements.txt
+python -c "import pymupdf, flask, werkzeug, waitress, qdrant_client; print('ALL IMPORTS OK')"
+code .
+```
+
+### VS Code Interpreter Selection:
+```text
+Ctrl + Shift + P
+       ↓
+Python: Select Interpreter
+       ↓
+.venv\Scripts\python.exe
+```
+
+---
+
 ## 1. Project structure
 
 ```
@@ -509,6 +533,10 @@ assuming a technique helps just because it's implemented.
 
 
 
+---
+
+## 10. Troubleshooting
+
 | Symptom | Likely cause |
 |---|---|
 | "TF-IDF (offline fallback)" mode always, even after setting the key | `.env` not being picked up — confirm it's named exactly `.env` and sits next to `app.py`, or export the var in your shell instead |
@@ -521,9 +549,19 @@ assuming a technique helps just because it's implemented.
 | A `/load-url` request gets rejected with "resolves to a non-public address" | Working as intended — that URL points at an internal/private address; this is the SSRF protection, not a bug |
 | `docker compose up` starts with no errors, but `localhost:5000` refuses to connect / hangs | `HOST` isn't set to `0.0.0.0` inside the container — `docker-compose.yml` already sets this, but if you're running the Dockerfile directly (`docker run` without compose), pass `-e HOST=0.0.0.0` yourself. Binding to `127.0.0.1` (the default, correct for a bare-metal run) is invisible from outside a container, so the port mapping silently does nothing |
 
+---
 
+## 11. Running with Docker / GHCR Container
 
-docker pull ghcr.io/your-username/your-repo:abc1234...
+Pull the pre-built container image from GitHub Container Registry (GHCR):
 
+```bash
+# Pull by specific SHA / tag
+docker pull ghcr.io/your-username/your-repo:latest
+```
 
-docker run -p 5000:5000 --env-file .env ghcr.io/your-username/your-repo:latest
+Run the container with your `.env` file mounted:
+
+```bash
+docker run -p 5000:5000 --env-file .env -e HOST=0.0.0.0 ghcr.io/your-username/your-repo:latest
+```

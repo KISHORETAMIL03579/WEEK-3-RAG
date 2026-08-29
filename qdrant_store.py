@@ -52,7 +52,10 @@ import app as _app
 def _client() -> QdrantClient:
     if _QdrantSingleton.client is None:
         _QdrantSingleton.client = QdrantClient(
-            url=_app.QDRANT_URL, api_key=_app.QDRANT_API_KEY, timeout=_app.QDRANT_TIMEOUT,
+            url=_app.QDRANT_URL,
+            api_key=_app.QDRANT_API_KEY,
+            timeout=_app.QDRANT_TIMEOUT,
+            prefer_grpc=False,
         )
     return _QdrantSingleton.client
 
