@@ -6,7 +6,7 @@ version: "3.9"
 #   docker compose up --build
 #
 # To point at Qdrant Cloud INSTEAD of self-hosting, set these in your
-# .env (same file docker-compose already reads for OPENROUTER_API_KEY,
+# .env (same file docker-compose already reads for GEMINI_API_KEY,
 # etc. — no need to edit this file):
 #   QDRANT_URL=https://xxxx.aws.cloud.qdrant.io:6333
 #   QDRANT_API_KEY=<your cluster's key>
@@ -41,9 +41,9 @@ services:
       # Qdrant Cloud credentials in .env was silently ignored.
       QDRANT_URL: ${QDRANT_URL:-http://qdrant:6333}
       QDRANT_API_KEY: ${QDRANT_API_KEY:-}
-      OPENROUTER_API_KEY: ${OPENROUTER_API_KEY:-}
-      LLM_MODEL: ${LLM_MODEL:-openai/gpt-5-mini}
-      EMBED_MODEL: ${EMBED_MODEL:-openai/text-embedding-3-small}
+      GEMINI_API_KEY: ${GEMINI_API_KEY:-}
+      LLM_MODEL: ${LLM_MODEL:-gemini-3.7-flash}
+      EMBED_MODEL: ${EMBED_MODEL:-gemini-embedding-001}
       EMBED_MIN_SCORE: ${EMBED_MIN_SCORE:-0.55}
       RETRIEVAL_MODE: ${RETRIEVAL_MODE:-hybrid}
       HYBRID_ALPHA: ${HYBRID_ALPHA:-0.6}

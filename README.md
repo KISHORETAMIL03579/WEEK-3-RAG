@@ -75,7 +75,7 @@ where Flask's `render_template()` looks for them by default.
    irrelevant text rides along with the answer; too small and related
    context gets separated.
 4. **Embed** — each chunk's text is sent to an embedding model (via
-   OpenRouter) which returns a vector — a list of numbers representing
+   Google Gemini API) which returns a vector — a list of numbers representing
    the chunk's *meaning*, not just its words. This is what lets the app
    match "How do I get my money back?" to a chunk about "refunds" even
    though no words overlap.
@@ -119,8 +119,8 @@ Copy the template and fill in your own values:
 cp .env.example .env
 ```
 
-At minimum, set `OPENROUTER_API_KEY` (get one at
-[openrouter.ai](https://openrouter.ai)). Everything else has a working
+At minimum, set `GEMINI_API_KEY` (get one at
+[aistudio.google.com](https://aistudio.google.com)). Everything else has a working
 default. **Never commit a real `.env` or paste its contents anywhere**
 (chat, issues, screenshots) — treat any key that leaves that file as
 compromised and rotate it immediately.
@@ -129,9 +129,9 @@ Every environment variable the app actually reads:
 
 | Variable | Default | What it controls |
 |---|---|---|
-| `OPENROUTER_API_KEY` | *(empty)* | Without it, the app runs in fully offline BM25-only mode — no embeddings, no LLM, no network calls |
-| `LLM_MODEL` | `deepseek/deepseek-chat` | Any OpenRouter chat model slug. Confirmed alternatives: `openai/gpt-5-mini` (400k context), `openai/gpt-4o-mini` (cheaper, 128k) |
-| `EMBED_MODEL` | `openai/text-embedding-3-small` | Any OpenRouter embedding model slug. Confirmed alternatives: `baai/bge-base-en-v1.5`, `baai/bge-m3`. **Switching requires re-indexing** — old and new vectors are incompatible; `/clear` and re-upload |
+| `GEMINI_API_KEY` | *(empty)* | Without it, the app runs in fully offline BM25-only mode — no embeddings, no LLM, no network calls |
+| `LLM_MODEL` | `gemini-3.7-flash` | Gemini model name (e.g. `gemini-3.7-flash`, `gemini-2.5-flash`) |
+| `EMBED_MODEL` | `gemini-embedding-001` | Gemini embedding model name (`gemini-embedding-001`). **Switching requires re-indexing** — old and new vectors are incompatible; `/clear` and re-upload |
 | `EMBED_MIN_SCORE` | `0.55` | Minimum score on **Reciprocal Rank Fusion's normalized scale** (not a raw cosine similarity — see §6) before the app will answer at all |
 | `TFIDF_MIN_SCORE` | `0.15` | Same idea, for the offline BM25 fallback path — without this gate, a single incidentally-shared word could produce a confident-looking answer to a completely unrelated question |
 | `RETRIEVAL_MODE` | `hybrid` | `hybrid` (default) = BM25 + embeddings combined via Reciprocal Rank Fusion. `hybrid-legacy` = the older weighted-average blend, kept only for A/B comparison. `embed` = embeddings alone |
@@ -355,7 +355,7 @@ running it against a live instance of the app, not just reasoned about.
   replaced every silent `except Exception: pass`. The most important one:
   the embeddings/LLM path in `/ask` used to fail silently and fall back
   to TF-IDF with zero signal that anything was wrong — a bad API key, a
-  rate limit, or an OpenRouter outage would look identical to normal
+  rate limit, or an API outage would look identical to normal
   offline operation. Now it logs a warning with the full traceback before
   falling back.
 - **`GET /healthz`** — a liveness endpoint that doesn't touch session
@@ -435,7 +435,7 @@ docker compose up --build
 One command builds the app image and starts both the app and Qdrant.
 `docker-compose.yml` already sets `VECTOR_BACKEND=qdrant` and
 `QDRANT_URL=http://qdrant:6333` for you — just set your real
-`OPENROUTER_API_KEY` in a `.env` file first (docker-compose reads it from
+`GEMINI_API_KEY` in a `.env` file first (docker-compose reads it from
 there automatically).
 
 ### Running against Qdrant Cloud instead

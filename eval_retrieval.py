@@ -29,11 +29,11 @@
 #    That's your before-and-after number. The per-question ✓/✗ list under
 #    each mode tells you exactly which failures were NOT fixed.
 
-# Requires OPENROUTER_API_KEY to be set in the environment (or .env next to
-# app.py) for the embed/hybrid modes to do anything meaningful — without it
-# their embedding score is just 0 for every chunk, so they degrade to
-# TF-IDF ranking, which will make embed == hybrid == tfidf. That's expected
-# and tells you your key isn't configured, not that hybrid doesn't help.
+# Requires GEMINI_API_KEY to be set in the environment (or .env next to app.py)
+# for the embed/hybrid modes to do anything meaningful — without a key their
+# embedding score is just 0 for every chunk, so they degrade to TF-IDF ranking,
+# which will make embed == hybrid == tfidf. That's expected and tells you your
+# key isn't configured, not that hybrid doesn't help.
 # """
 
 import json
@@ -45,7 +45,7 @@ sys.path.insert(0, str(Path(__file__).parent))
 from app import (  # noqa: E402
     chunk_text, embed_texts, embed_text, VectorStore, cosine,
     build_index, tokenize, compute_tf, tfidf_vector, cosine_sim,
-    extract_pdf_pages, extract_txt_pages, OPENROUTER_API_KEY,
+    extract_pdf_pages, extract_txt_pages, GEMINI_API_KEY,
 )
 
 TOP_K = 5
@@ -91,19 +91,19 @@ def build_eval_store() -> VectorStore:
         store.chunks.extend(chunks)
         all_texts.extend(c["text"] for c in chunks)
 
-    if OPENROUTER_API_KEY and all_texts:
-        print(f"Embedding {len(all_texts)} chunks…")
+    if GEMINI_API_KEY and all_texts:
+        print(f"Embedding {len(all_texts)} chunks via Gemini…")
         store.vectors = embed_texts(all_texts)
     else:
         store.vectors = []
-        if not OPENROUTER_API_KEY:
-            print("⚠ OPENROUTER_API_KEY not set — embed/hybrid will fall back to TF-IDF-only ranking.")
+        if not GEMINI_API_KEY:
+            print("⚠ GEMINI_API_KEY not set — embed/hybrid will fall back to TF-IDF-only ranking.")
 
     return store
 
 
 def _embed_scores(store: VectorStore, query: str) -> list[float]:
-    if not (OPENROUTER_API_KEY and store.vectors and len(store.vectors) == len(store.chunks)):
+    if not (GEMINI_API_KEY and store.vectors and len(store.vectors) == len(store.chunks)):
         return [0.0] * len(store.chunks)
     return [cosine(embed_text(query), v) for v in store.vectors]
 

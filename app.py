@@ -32,13 +32,6 @@ try:
 except Exception:
     pass
 
-logging.basicConfig(
-    level=os.environ.get("LOG_LEVEL", "INFO"),
-    format="%(asctime)s %(levelname)s [%(name)s] %(message)s",
-)
-logger = logging.getLogger("ask_my_docs")
-
-
 def _load_env():
     env_path = Path(__file__).parent / ".env"
     if env_path.exists():
@@ -50,6 +43,57 @@ def _load_env():
 
 
 _load_env()
+
+
+class ColoredFormatter(logging.Formatter):
+    """Custom logging formatter that adds ANSI color codes and file:lineno to terminal log output."""
+    COLORS = {
+        logging.DEBUG: "\033[36m",      # Cyan
+        logging.INFO: "\033[32m",       # Green
+        logging.WARNING: "\033[33m",    # Yellow
+        logging.ERROR: "\033[31m",      # Red
+        logging.CRITICAL: "\033[41;1m", # White on Red
+    }
+    RESET = "\033[0m"
+    BOLD = "\033[1m"
+    DIM = "\033[2m"
+
+    def format(self, record):
+        color = self.COLORS.get(record.levelno, self.RESET)
+        time_str = f"{self.DIM}{self.formatTime(record, '%Y-%m-%d %H:%M:%S')}{self.RESET}"
+        level_str = f"{color}{self.BOLD}{record.levelname:7s}{self.RESET}"
+        loc_str = f"{self.DIM}[{record.name}:{record.filename}:{record.lineno}]{self.RESET}"
+        msg = record.getMessage()
+        return f"{time_str} {level_str} {loc_str} {color}{msg}{self.RESET}"
+
+
+def setup_logger():
+    level_name = os.environ.get("LOG_LEVEL", "INFO").upper()
+    log_level = getattr(logging, level_name, logging.INFO)
+    log = logging.getLogger("ask_my_docs")
+    log.setLevel(log_level)
+    if not log.handlers:
+        handler = logging.StreamHandler(sys.stdout)
+        handler.setLevel(log_level)
+        handler.setFormatter(ColoredFormatter())
+        log.addHandler(handler)
+        log.propagate = False
+    return log
+
+
+logger = setup_logger()
+
+
+class RAGTracer:
+    """Provides formatted step-by-step trace logging for document ingestion and retrieval pipelines."""
+
+    @staticmethod
+    def trace(pipeline: str, step: int, total_steps: int, name: str, details: dict):
+        header = f"\033[1;35m[TRACE | {pipeline}] \033[1;36mStep {step}/{total_steps}: {name}\033[0m"
+        lines = [header]
+        for key, value in details.items():
+            lines.append(f"  \033[33m├─ {key:<24}\033[0m: \033[1;32m{value}\033[0m")
+        logger.info("\n" + "\n".join(lines))
 
 # ─────────────────────────────────────────────────────────────────────────────
 #  App Setup
@@ -120,13 +164,13 @@ SESSION_TTL = 60 * 60  # 1 hour
 MAX_SESSIONS = 20
 
 # ─────────────────────────────────────────────────────────────────────────────
-#  OpenRouter config (embeddings + LLM)
+#  Google Gemini config (embeddings + LLM)
 # ─────────────────────────────────────────────────────────────────────────────
 
-OPENROUTER_API_KEY = os.environ.get("OPENROUTER_API_KEY", "")
-OPENROUTER_URL = "https://openrouter.ai/api/v1"
-LLM_MODEL = os.environ.get("LLM_MODEL", "deepseek/deepseek-chat")
-EMBED_MODEL = os.environ.get("EMBED_MODEL", "openai/text-embedding-3-small")
+GEMINI_API_KEY = os.environ.get("GEMINI_API_KEY", "")
+GEMINI_URL = "https://generativelanguage.googleapis.com/v1beta"
+LLM_MODEL = os.environ.get("LLM_MODEL", "gemini-3.7-flash")
+EMBED_MODEL = os.environ.get("EMBED_MODEL", "gemini-embedding-001")
 EMBED_MIN_SCORE = float(os.environ.get("EMBED_MIN_SCORE", "0.55"))  # recalibrated
 # for reciprocal_rank_fusion()'s normalized scale (see RRF_K comment) —
 # NOT comparable to the old weighted-average blend's raw-cosine scale.
@@ -219,27 +263,108 @@ def fit_to_token_budget(results: list[dict], max_tokens: int) -> list[dict]:
 _simple_tokenizer = re.compile(r"[\w]+")
 
 
-def _openrouter_call(path: str, payload: dict) -> dict:
-    req = urllib.request.Request(
-        f"{OPENROUTER_URL}/{path}",
-        data=json.dumps(payload).encode("utf-8"),
-        headers={
-            "Authorization": f"Bearer {OPENROUTER_API_KEY}",
-            "Content-Type": "application/json",
-        },
-        method="POST",
-    )
-    with urllib.request.urlopen(req, timeout=90) as resp:
-        return json.loads(resp.read().decode("utf-8"))
+def _gemini_chat_call(system: str, user: str,
+                      temperature: float = 0,
+                      max_tokens: int | None = None) -> str:
+    """Call the Gemini generateContent API with automatic exponential backoff retry on HTTP 429/503."""
+    url = f"{GEMINI_URL}/models/{LLM_MODEL}:generateContent?key={GEMINI_API_KEY}"
+    gen_config: dict = {"temperature": temperature}
+    if max_tokens is not None:
+        gen_config["maxOutputTokens"] = max_tokens
+
+    payload = {
+        "system_instruction": {"parts": [{"text": system}]},
+        "contents": [{"role": "user", "parts": [{"text": user}]}],
+        "generationConfig": gen_config,
+    }
+
+    max_retries = 5
+    base_delay = 2.0
+    for attempt in range(1, max_retries + 1):
+        try:
+            t0 = time.time()
+            req = urllib.request.Request(
+                url,
+                data=json.dumps(payload).encode("utf-8"),
+                headers={"Content-Type": "application/json"},
+                method="POST",
+            )
+            with urllib.request.urlopen(req, timeout=90) as resp:
+                data = json.loads(resp.read().decode("utf-8"))
+            elapsed = time.time() - t0
+            result_text = data["candidates"][0]["content"]["parts"][0]["text"].strip()
+            logger.info("🤖 Gemini LLM call succeeded in %.2fs (model: %s)", elapsed, LLM_MODEL)
+            return result_text
+        except urllib.error.HTTPError as exc:
+            if exc.code in (429, 500, 503) and attempt < max_retries:
+                delay = base_delay * (2 ** (attempt - 1))
+                logger.warning("⏳ Gemini LLM rate-limited (HTTP %d). Retrying in %.1fs (attempt %d/%d)...",
+                               exc.code, delay, attempt, max_retries)
+                time.sleep(delay)
+            else:
+                logger.error("❌ Gemini LLM call failed with HTTP %d: %s", exc.code, exc)
+                raise
+        except Exception as exc:
+            logger.error("❌ Gemini LLM call exception: %s", exc, exc_info=True)
+            raise
+
+
+def _gemini_embed_batch(texts: list[str]) -> list[list[float]]:
+    """Embed a batch of texts via Gemini batchEmbedContents API with automatic backoff on HTTP 429/503."""
+    url = f"{GEMINI_URL}/models/{EMBED_MODEL}:batchEmbedContents?key={GEMINI_API_KEY}"
+    model_name = EMBED_MODEL if EMBED_MODEL.startswith("models/") else f"models/{EMBED_MODEL}"
+    payload = {
+        "requests": [
+            {
+                "model": model_name,
+                "content": {"parts": [{"text": t}]},
+            }
+            for t in texts
+        ]
+    }
+
+    max_retries = 5
+    base_delay = 2.0
+    for attempt in range(1, max_retries + 1):
+        try:
+            t0 = time.time()
+            req = urllib.request.Request(
+                url,
+                data=json.dumps(payload).encode("utf-8"),
+                headers={"Content-Type": "application/json"},
+                method="POST",
+            )
+            with urllib.request.urlopen(req, timeout=90) as resp:
+                data = json.loads(resp.read().decode("utf-8"))
+            elapsed = time.time() - t0
+            vectors = [e["values"] for e in data["embeddings"]]
+            logger.info("🧠 Gemini Embedding batch of %d chunks succeeded in %.2fs (vector dim: %d)",
+                        len(texts), elapsed, len(vectors[0]) if vectors else 0)
+            return vectors
+        except urllib.error.HTTPError as exc:
+            if exc.code in (429, 500, 503) and attempt < max_retries:
+                delay = base_delay * (2 ** (attempt - 1))
+                logger.warning("⏳ Gemini Embeddings rate-limited (HTTP %d). Retrying in %.1fs (attempt %d/%d)...",
+                               exc.code, delay, attempt, max_retries)
+                time.sleep(delay)
+            else:
+                logger.error("❌ Gemini Embeddings batch failed with HTTP %d: %s", exc.code, exc)
+                raise
+        except Exception as exc:
+            logger.error("❌ Gemini Embeddings batch exception: %s", exc, exc_info=True)
+            raise
 
 
 def embed_texts(texts: list[str]) -> list[list[float]]:
-    """Batch-embed texts via OpenRouter. Returns list of vectors."""
+    """Batch-embed texts via Gemini API at full network speed."""
     out: list[list[float]] = []
-    for i in range(0, len(texts), EMBED_BATCH):
+    total_batches = math.ceil(len(texts) / EMBED_BATCH)
+    logger.info("🧠 Starting batch embedding for %d total chunks (%d batch(es) of max %d)",
+                len(texts), total_batches, EMBED_BATCH)
+    for idx, i in enumerate(range(0, len(texts), EMBED_BATCH), start=1):
         batch = texts[i:i + EMBED_BATCH]
-        data = _openrouter_call("embeddings", {"model": EMBED_MODEL, "input": batch})
-        vectors = [d["embedding"] for d in sorted(data["data"], key=lambda x: x["index"])]
+        logger.info("🧠 Processing embedding batch %d/%d (%d chunks)...", idx, total_batches, len(batch))
+        vectors = _gemini_embed_batch(batch)
         out.extend(vectors)
     return out
 
@@ -1496,7 +1621,7 @@ def rerank_with_llm(query: str, results: list[dict]) -> tuple[list[dict], float 
     to the token-overlap check in that case) rather than breaking
     retrieval.
     """
-    if not results or not OPENROUTER_API_KEY:
+    if not results or not GEMINI_API_KEY:
         return results, None
 
     candidates = results[:RERANK_TOP_N]
@@ -1513,14 +1638,7 @@ def rerank_with_llm(query: str, results: list[dict]) -> tuple[list[dict], float 
     )
     user = f"Question: {query}\n\nCandidates:\n{numbered}"
     try:
-        data = _openrouter_call("chat/completions", {
-            "model": LLM_MODEL,
-            "messages": [{"role": "system", "content": system},
-                        {"role": "user", "content": user}],
-            "temperature": 0,
-            "max_tokens": 300,
-        })
-        raw = data["choices"][0]["message"]["content"].strip()
+        raw = _gemini_chat_call(system, user, temperature=0, max_tokens=300)
         raw = re.sub(r"^```(?:json)?|```$", "", raw, flags=re.MULTILINE).strip()
         scored = json.loads(raw)
         indices = sorted(item["index"] for item in scored)
@@ -1553,7 +1671,7 @@ def rewrite_query(query: str) -> str:
 
     Fails open: returns the original query unchanged on any error.
     """
-    if not query.strip() or not OPENROUTER_API_KEY:
+    if not query.strip() or not GEMINI_API_KEY:
         return query
     system = (
         "Rewrite the user's question into a short, keyword-rich search "
@@ -1563,14 +1681,7 @@ def rewrite_query(query: str) -> str:
         "the rewritten query, nothing else."
     )
     try:
-        data = _openrouter_call("chat/completions", {
-            "model": LLM_MODEL,
-            "messages": [{"role": "system", "content": system},
-                        {"role": "user", "content": query}],
-            "temperature": 0,
-            "max_tokens": 60,
-        })
-        rewritten = data["choices"][0]["message"]["content"].strip().strip('"')
+        rewritten = _gemini_chat_call(system, query, temperature=0, max_tokens=60).strip('"')
         return rewritten if rewritten else query
     except Exception:
         logger.warning("Query rewriting failed — using the original question as-is.",
@@ -1605,17 +1716,9 @@ def generate_answer(query: str, results: list[dict]) -> str:
         f"\n\nQUESTION: {query}\n\nANSWER:"
     )
 
-    data = _openrouter_call("chat/completions", {
-        "model": LLM_MODEL,
-        "temperature": 0,
-        "messages": [
-            {"role": "system", "content": system},
-            {"role": "user", "content": user},
-        ],
-    })
     try:
-        return data["choices"][0]["message"]["content"].strip()
-    except (KeyError, IndexError, TypeError):
+        return _gemini_chat_call(system, user, temperature=0)
+    except Exception:
         return ""
 
 
@@ -1678,13 +1781,23 @@ def upload():
     if not files:
         return jsonify({"error": "No files provided"}), 400
 
+    logger.info("📤 Upload request received: %d file(s) (chunk_mode: %s, session: %s)",
+                len(files), chunk_mode, sid[:8])
     hashes = HASH_STORE.setdefault(sid, set())
-    embedding_ok = bool(OPENROUTER_API_KEY)
+    embedding_ok = bool(GEMINI_API_KEY)
     results = []
     pending: list[dict] = []
 
+    RAGTracer.trace("INGESTION", 1, 5, "Upload Request Received", {
+        "Files Count": len(files),
+        "Chunk Strategy": chunk_mode,
+        "Session ID": sid[:8],
+        "Embeddings Enabled": embedding_ok,
+    })
+
     for f in files:
         if not f or not allowed_file(f.filename):
+            logger.warning("⚠️ Unsupported file type uploaded: %s", getattr(f, "filename", "?"))
             results.append({"filename": getattr(f, "filename", "?") or "?",
                             "error": "Unsupported file type (allowed: PDF, TXT, MD)"})
             continue
@@ -1705,6 +1818,7 @@ def upload():
 
             if dedupe_key in hashes:
                 filepath.unlink(missing_ok=True)
+                logger.info("ℹ️ Duplicate upload skipped for '%s' under mode '%s'", original_name, chunk_mode)
                 results.append({"filename": original_name,
                                 "error": f"Already indexed under the '{chunk_mode}' strategy — "
                                          f"pick a different chunking strategy to compare, or remove "
@@ -1723,6 +1837,7 @@ def upload():
                 hashes.discard(dedupe_key)
                 reason = ("No extractable text (password-protected or scanned PDF?)"
                           if ext == "pdf" else "Empty file")
+                logger.warning("⚠️ Text extraction returned empty for '%s': %s", original_name, reason)
                 results.append({"filename": original_name, "error": reason})
                 continue
 
@@ -1730,8 +1845,17 @@ def upload():
             if not new_chunks:
                 filepath.unlink(missing_ok=True)
                 hashes.discard(dedupe_key)
+                logger.warning("⚠️ Chunking produced 0 chunks for '%s'", original_name)
                 results.append({"filename": original_name, "error": "No chunks produced"})
                 continue
+
+            RAGTracer.trace("INGESTION", 2, 5, "Text Extraction & Chunking", {
+                "File Name": original_name,
+                "Format": ext.upper(),
+                "Pages Extracted": len(pages),
+                "Chunks Generated": len(new_chunks),
+                "Doc ID": doc_id,
+            })
 
             CHUNK_COUNTS.setdefault(sid, {})
             for mode in ("structured", "128", "256", "512"):
@@ -1755,6 +1879,7 @@ def upload():
             filepath.unlink(missing_ok=True)
             if "dedupe_key" in locals():
                 hashes.discard(dedupe_key)
+            logger.error("❌ Exception during processing '%s': %s", original_name, exc, exc_info=True)
             results.append({"filename": original_name, "error": f"Failed to index: {exc}"})
 
     if not pending:
@@ -1774,6 +1899,7 @@ def upload():
             was_cancelled = True
             item["filepath"].unlink(missing_ok=True)
             hashes.discard(item["hash"])
+            logger.warning("🚫 Upload cancelled by client for upload_id %s", upload_id)
             continue
         try:
             if embedding_ok:
@@ -1799,9 +1925,19 @@ def upload():
             item["result"]["openable"] = True
             results.append(item["result"])
             committed_doc_ids.append(item["doc_id"])
+            RAGTracer.trace("INGESTION", 5, 5, "Store Commit Completed", {
+                "File Name": item["filename"],
+                "Doc ID": item["doc_id"],
+                "Chunks Indexed": len(item["chunks"]),
+                "Vector Backend": VECTOR_BACKEND,
+                "Total Session Chunks": len(store.chunks),
+            })
+            logger.info("✅ Indexed '%s' (%d chunks, vectors: %s, total store: %d chunks)",
+                        item["filename"], len(item["chunks"]), "yes" if embedding_ok else "no", len(store.chunks))
         except Exception as exc:
             item["filepath"].unlink(missing_ok=True)
             hashes.discard(item["hash"])
+            logger.error("❌ Failed to index '%s': %s", item["filename"], exc, exc_info=True)
             results.append({"filename": item["filename"],
                             "error": f"Failed to index: {exc}"})
 
@@ -1813,6 +1949,7 @@ def upload():
     if upload_id and upload_id in CANCELLED_UPLOADS:
         was_cancelled = True
     if was_cancelled:
+        logger.warning("🚫 Rolling back %d committed doc(s) due to upload cancellation", len(committed_doc_ids))
         for doc_id in committed_doc_ids:
             store.remove_doc(doc_id)
             info = SESSION_FILES.get(sid, {}).pop(doc_id, None)
@@ -1848,7 +1985,7 @@ def load_url():
     if parsed.scheme not in ("http", "https") or not parsed.netloc:
         return jsonify({"error": "URL must start with http:// or https://"}), 400
 
-    embedding_ok = bool(OPENROUTER_API_KEY)
+    embedding_ok = bool(GEMINI_API_KEY)
 
     try:
         title, text = fetch_web_page(url)
@@ -1951,27 +2088,29 @@ def ask():
     sid = session["session_id"]
     data = request.get_json()
     query = (data or {}).get("query", "").strip()
-    # Optional: restrict retrieval to one chunking strategy, so you can
-    # directly compare "does hybrid search find the answer under 128-word
-    # chunks?" vs. 512-word, etc. Requires the same document to have been
-    # uploaded under that strategy already (see /upload's dedupe key).
     method_filter = (data or {}).get("chunk_mode", "").strip() or None
 
-    if not query:
-        return jsonify({"error": "Empty query"}), 400
+    store = _get_store(sid)
 
-    # search_query is what actually goes to retrieval (RRF/BM25/embeddings);
-    # query itself is untouched and still what's shown to the user and
-    # sent to generate_answer() for the actual answer.
+    RAGTracer.trace("RETRIEVAL", 1, 6, "Question Received", {
+        "User Question": query,
+        "Session ID": sid[:8],
+        "Strategy Filter": method_filter or "All",
+        "Total Session Chunks": len(store.chunks),
+    })
+
     search_query = rewrite_query(query) if QUERY_REWRITE_ENABLED else query
+    if QUERY_REWRITE_ENABLED and search_query != query:
+        RAGTracer.trace("RETRIEVAL", 2, 6, "Query Rewriting", {
+            "Original Question": query,
+            "Rewritten Search Query": search_query,
+        })
 
     def annotate_openable(results):
         files = SESSION_FILES.get(sid, {})
         for r in results:
             r["openable"] = r["doc_id"] in files
         return results
-
-    store = _get_store(sid)
     if not store.chunks:
         return jsonify({
             "found": False,
@@ -1992,35 +2131,46 @@ def ask():
             })
 
     # Path 1: embeddings + LLM (if configured and vectors exist)
-    if OPENROUTER_API_KEY and active_store.vectors and len(active_store.vectors) == len(active_store.chunks):
+    if GEMINI_API_KEY and active_store.vectors and len(active_store.vectors) == len(active_store.chunks):
         try:
             if RETRIEVAL_MODE == "hybrid-legacy":
                 raw_results = hybrid_search(active_store, search_query, top_k=TOP_K)
             elif RETRIEVAL_MODE == "embed":
                 q_vec = embed_text(search_query)
-                # min_score=0.0 here deliberately — capture the true top
-                # candidate before any threshold filtering, so a below-
-                # threshold rejection below can still report what it was
-                # closest to, instead of an empty list with no diagnostic
-                # information at all (see closest_match below).
                 raw_results = active_store.query(q_vec, top_k=TOP_K, min_score=0.0)
             else:  # "hybrid" (default) — Reciprocal Rank Fusion
                 raw_results = reciprocal_rank_fusion(active_store, search_query, top_k=TOP_K)
             near_miss = raw_results[0] if raw_results else None
             results = [r for r in raw_results if r["score"] >= EMBED_MIN_SCORE]
+            
+            RAGTracer.trace("RETRIEVAL", 3, 6, "Hybrid Retrieval & RRF Fusion", {
+                "Retrieval Mode": RETRIEVAL_MODE,
+                "Raw Candidates Returned": len(raw_results),
+                "Above Min Threshold (" + str(EMBED_MIN_SCORE) + ")": len(results),
+                "Top Match Score": f"{near_miss['score']:.4f}" if near_miss else "0.0000",
+                "Top Source File": near_miss["filename"] if near_miss else "None",
+            })
+
             rerank_score = None
             if RERANK_ENABLED and len(results) > 1:
-                # Reranking judges relevance to what the user actually
-                # meant — the ORIGINAL query, not the rewritten search
-                # terms used just now to find these candidates.
                 results, rerank_score = rerank_with_llm(query, results)
-            # TOP_K caps how many CHUNKS come back, not how many TOKENS
-            # they add up to — trim to the context budget before this
-            # goes anywhere near the LLM. Applied here (not just inside
-            # generate_answer) so the "sources" shown to the user are
-            # exactly what actually grounded the answer, never more.
+                RAGTracer.trace("RETRIEVAL", 4, 6, "LLM Reranker Evaluation", {
+                    "Reranker Status": "Active",
+                    "Candidates Evaluated": len(results),
+                    "Top Relevance Score": f"{rerank_score:.1f}/10" if rerank_score else "N/A",
+                })
+
             results = fit_to_token_budget(results, MAX_CONTEXT_TOKENS)
-            if not validate_context(results, EMBED_MIN_SCORE, query, rerank_score):
+            valid = validate_context(results, EMBED_MIN_SCORE, query, rerank_score)
+            
+            RAGTracer.trace("RETRIEVAL", 5, 6, "Context Validation Gate", {
+                "Threshold Gate": "PASSED" if valid else "FAILED",
+                "Min Required Score": EMBED_MIN_SCORE,
+                "Context Token Budget": f"{MAX_CONTEXT_TOKENS} tokens",
+                "Valid Grounding Chunks": len(results),
+            })
+
+            if not valid:
                 return jsonify({
                     "found": False,
                     "answer": "I don't know — no document content matched your question closely enough.",
@@ -2034,6 +2184,11 @@ def ask():
                     } if near_miss else None),
                 })
             answer = generate_answer(query, results)
+            RAGTracer.trace("RETRIEVAL", 6, 6, "LLM Answer Generation", {
+                "Model Identifier": LLM_MODEL,
+                "Sources Grounded": len(results),
+                "Answer Character Count": len(answer),
+            })
             return jsonify({
                 "found": not _is_dont_know(answer),
                 "answer": answer or "I don't know.",
@@ -2041,11 +2196,11 @@ def ask():
             })
         except urllib.error.HTTPError as exc:
             reason = {
-                401: "Invalid or expired OpenRouter API key — check OPENROUTER_API_KEY.",
-                402: "OpenRouter account has insufficient credits (Payment Required) — "
-                    "add credits or check your balance at openrouter.ai.",
-                429: "Rate limited by OpenRouter — too many requests too quickly.",
-            }.get(exc.code, f"Unexpected HTTP {exc.code} from OpenRouter.")
+                400: "Bad request — check your API key format and model name.",
+                401: "Invalid or expired API key — check GEMINI_API_KEY.",
+                403: "Access forbidden — verify your Gemini API key has the required permissions.",
+                429: "Rate limited by Gemini API — too many requests too quickly.",
+            }.get(exc.code, f"Unexpected HTTP {exc.code} from Gemini API.")
             logger.warning(
                 "Embeddings/LLM path failed for a query — falling back to TF-IDF-only. %s",
                 reason, exc_info=True,
@@ -2054,7 +2209,7 @@ def ask():
         except Exception:
             logger.warning(
                 "Embeddings/LLM path failed for a query — falling back to TF-IDF-only. "
-                "This usually means a network issue reaching OpenRouter.",
+                "This usually means a network issue reaching Gemini API.",
                 exc_info=True,
             )
             # fall through to TF-IDF
@@ -2266,7 +2421,7 @@ def _retrieve_for_eval(active_store, query: str, k: int, mode: str, force_tfidf:
     baseline against a document that DOES have embeddings, rather than
     only ever being available when no API key exists at all.
     """
-    has_embeddings = (OPENROUTER_API_KEY and active_store.vectors
+    has_embeddings = (GEMINI_API_KEY and active_store.vectors
                       and len(active_store.vectors) == len(active_store.chunks))
     if has_embeddings and not force_tfidf:
         if mode == "hybrid-legacy":
@@ -2397,14 +2552,14 @@ def healthz():
     touch session state — it should return 200 even for a caller with no
     cookies at all, which is exactly what a healthcheck request looks
     like. Reports whether the embeddings/LLM path is configured, not
-    whether it's currently reachable — an actual OpenRouter call on every
+    whether it's currently reachable — an actual Gemini API call on every
     healthcheck would be slow and cost money for something checked every
     few seconds.
     """
     return jsonify({
         "status": "ok",
-        "embeddings_configured": bool(OPENROUTER_API_KEY),
-        "retrieval_mode": RETRIEVAL_MODE if OPENROUTER_API_KEY else "tfidf-only",
+        "embeddings_configured": bool(GEMINI_API_KEY),
+        "retrieval_mode": RETRIEVAL_MODE if GEMINI_API_KEY else "tfidf-only",
         "vector_backend": VECTOR_BACKEND,
         "active_sessions": len(SESSION_ACCESS),
     })
@@ -2433,7 +2588,7 @@ def status():
         "total_chunks": len(chunks),
         "documents": list(docs_seen.values()),
         "methods": sorted({c["method"] for c in chunks}),
-        "mode": (RETRIEVAL_MODE if OPENROUTER_API_KEY else "tfidf-only"),
+        "mode": (RETRIEVAL_MODE if GEMINI_API_KEY else "tfidf-only"),
         "vector_backend": VECTOR_BACKEND,
     })
 
@@ -2456,8 +2611,10 @@ if __name__ == "__main__":
     # unless you actually want this reachable from your whole network.
     host = os.environ.get("HOST", "127.0.0.1")
     debug = os.environ.get("APP_DEBUG", "").lower() in ("1", "true", "yes")
+    mode_label = ("embeddings + LLM (Gemini)" if GEMINI_API_KEY
+                  else "TF-IDF (offline fallback)")
     print(f"\n🚀 Ask My Docs is running → http://localhost:{port}")
-    print(f"   Mode: {'embeddings + LLM' if OPENROUTER_API_KEY else 'TF-IDF (offline fallback)'}\n")
+    print(f"   Mode: {mode_label}\n")
     try:
         from waitress import serve
         serve(app, host=host, port=port)
