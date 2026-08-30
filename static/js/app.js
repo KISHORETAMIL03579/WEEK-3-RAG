@@ -139,7 +139,7 @@ function Sidebar({
             ref={fileInputRef}
             type="file"
             multiple
-            accept=".pdf,.txt,.md,.markdown,.docx,.doc,.csv,.tsv,.json,.yaml,.yml,.xml,.py,.js,.ts,.jsx,.tsx,.html,.css,.c,.cpp,.java,.go,.rs,.php,.sql,.sh,.png,.jpg,.jpeg,.webp,.bmp"
+            accept=".pdf,.txt,.md,.markdown,.rst,.docx,.doc,.csv,.tsv,.json,.yaml,.yml,.xml,.py,.js,.ts,.jsx,.tsx,.html,.css,.c,.cpp,.h,.hpp,.java,.go,.rs,.php,.sql,.sh,.bat,.ps1,.png,.jpg,.jpeg,.webp,.bmp,.tiff,.gif"
             style={{ display: 'none' }}
             onChange={(e) => e.target.files?.length && setSelectedFiles((prev) => [...prev, ...Array.from(e.target.files)])}
           />
@@ -314,6 +314,98 @@ function Sidebar({
   );
 }
 
+/* ── Source Card Item Component ───────────────────────────────── */
+function SourceCardItem({ src }) {
+  const [expanded, setExpanded] = useState(false);
+
+  const embedPct = (src.embed_score !== undefined && src.embed_score !== null && src.embed_score > 0)
+    ? (src.embed_score * 100).toFixed(0) + '%'
+    : null;
+  const kwPct = (src.keyword_score !== undefined && src.keyword_score !== null && src.keyword_score > 0)
+    ? (src.keyword_score * 100).toFixed(0) + '%'
+    : (src.tfidf_score !== undefined && src.tfidf_score !== null && src.tfidf_score > 0)
+    ? (src.tfidf_score * 100).toFixed(0) + '%'
+    : null;
+
+  return (
+    <div style={{
+      background: 'rgba(255, 255, 255, 0.03)',
+      border: '1px solid rgba(255, 255, 255, 0.08)',
+      borderRadius: '8px',
+      padding: '10px 12px',
+      marginTop: '8px'
+    }}>
+      <div style={{ display: 'flex', justifyContent: 'space-between', alignItems: 'center' }}>
+        <div>
+          <div style={{ fontWeight: 600, fontSize: '0.82rem', color: '#fff' }}>
+            📄 {src.filename} {src.section ? `• ${src.section}` : ''} {src.page ? `(Page ${src.page})` : ''}
+          </div>
+          <div style={{ fontSize: '0.72rem', color: 'var(--text-muted)', marginTop: '3px', display: 'flex', gap: '10px' }}>
+            <span title="Reciprocal Rank Fusion Score" style={{ color: 'var(--accent)', fontWeight: 600 }}>
+              RRF: {(src.score * 100).toFixed(0)}%
+            </span>
+            {embedPct && (
+              <span title="Cosine Similarity Score from Gemini Embeddings" style={{ color: '#60a5fa' }}>
+                Cosine Sim: {embedPct}
+              </span>
+            )}
+            {kwPct && (
+              <span title="BM25 Keyword Match Score" style={{ color: '#f59e0b' }}>
+                BM25 Keyword: {kwPct}
+              </span>
+            )}
+          </div>
+        </div>
+        <div style={{ display: 'flex', gap: '6px', alignItems: 'center' }}>
+          <button
+            onClick={() => setExpanded(!expanded)}
+            style={{
+              background: 'rgba(255, 255, 255, 0.08)',
+              border: '1px solid rgba(255, 255, 255, 0.12)',
+              color: '#fff',
+              borderRadius: '4px',
+              padding: '3px 8px',
+              fontSize: '0.72rem',
+              cursor: 'pointer'
+            }}
+          >
+            {expanded ? 'Hide Text ▲' : 'View Content ▾'}
+          </button>
+          {src.openable && (
+            <a
+              href={`/file/${src.doc_id}`}
+              target="_blank"
+              rel="noopener noreferrer"
+              className="doc-open"
+              style={{ fontSize: '0.72rem' }}
+            >
+              Open ↗
+            </a>
+          )}
+        </div>
+      </div>
+
+      {expanded && (
+        <div style={{
+          marginTop: '8px',
+          padding: '8px 10px',
+          background: 'rgba(0, 0, 0, 0.4)',
+          borderRadius: '6px',
+          fontSize: '0.76rem',
+          color: '#e2e8f0',
+          fontFamily: 'monospace',
+          whiteSpace: 'pre-wrap',
+          maxHeight: '220px',
+          overflowY: 'auto',
+          borderLeft: '3px solid var(--accent)'
+        }}>
+          {src.text || 'No text snippet available.'}
+        </div>
+      )}
+    </div>
+  );
+}
+
 /* ── Chat Container Component ────────────────────────────────── */
 function ChatArea({ messages, onSend, isThinking, filesCount, selectedFilesCount }) {
   const [input, setInput] = useState('');
@@ -385,19 +477,14 @@ function ChatArea({ messages, onSend, isThinking, filesCount, selectedFilesCount
           messages.map((m, idx) => (
             <div key={idx} className={`message-row ${m.role}`}>
               <div className="message-bubble">
-                <div>{m.text}</div>
+                <div style={{ whiteSpace: 'pre-wrap' }}>{m.text}</div>
                 {m.sources && m.sources.length > 0 && (
-                  <div className="sources-card">
-                    <div className="sources-header">Sources ({m.sources.length})</div>
+                  <div className="sources-card" style={{ marginTop: '12px' }}>
+                    <div className="sources-header" style={{ fontSize: '0.8rem', fontWeight: 700, marginBottom: '4px' }}>
+                      Sources ({m.sources.length})
+                    </div>
                     {m.sources.map((src, i) => (
-                      <div key={i} style={{ fontSize: '0.78rem', marginTop: '6px', display: 'flex', justifyContent: 'space-between', alignItems: 'center' }}>
-                        <span>📄 {src.filename} (Score: {(src.score * 100).toFixed(0)}%)</span>
-                        {src.openable && (
-                          <a href={`/file/${src.doc_id}`} target="_blank" rel="noopener noreferrer" className="doc-open">
-                            Open ↗
-                          </a>
-                        )}
-                      </div>
+                      <SourceCardItem key={i} src={src} />
                     ))}
                   </div>
                 )}

@@ -57,15 +57,13 @@ EVAL_CHUNK_MODE = os.environ.get("EVAL_CHUNK_MODE", "structured")
 # ── 1. Point this at your own documents ─────────────────────────────────
 # [(filepath_on_disk, display_name), ...]
 DOCS = [
-    # ("./uploads/errors.md", "errors.md"),
-    # ("./uploads/refund_policy.pdf", "refund_policy.pdf"),
+    ("./WEEKLY_RAG_TASK/HRPolicy.pdf", "HRPolicy.pdf"),
 ]
 
-# ── 2. Point this at your own failing-question set ──────────────────────
-# expected_doc: a substring that appears in the correct source's filename
 QUESTIONS = [
-    # {"question": "What does error code ERR-4032 mean?", "expected_doc": "errors.md"},
-    # {"question": "How many days do I have to request a refund?", "expected_doc": "refund_policy.pdf"},
+    {"question": "What is the policy for annual leave entitlement?", "expected_doc": "HRPolicy.pdf"},
+    {"question": "What is the password length requirement under security policy?", "expected_doc": "HRPolicy.pdf"},
+    {"question": "What are the rules regarding work from home allowance?", "expected_doc": "HRPolicy.pdf"},
 ]
 
 # Optionally load a bigger set from JSON instead of editing this file:

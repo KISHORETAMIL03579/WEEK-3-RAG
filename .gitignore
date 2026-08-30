@@ -1,7 +1,11 @@
 .env
-.venv/
+.venv*/
 vectorstore/
 uploads/
 __pycache__/
+traces/*.jsonl
+.pytest_cache/
+.coverage
+htmlcov/
 server.log
 server.err.log

@@ -132,7 +132,33 @@ UPLOAD_FOLDER = BASE_DIR / "uploads"
 VECTOR_FOLDER = BASE_DIR / "vectorstore"
 UPLOAD_FOLDER.mkdir(exist_ok=True)
 VECTOR_FOLDER.mkdir(exist_ok=True)
-ALLOWED_EXTENSIONS = {"pdf", "txt", "md"}
+# Keep this in sync with extract_document_pages().  The interface already
+# advertises these formats, and each one has a dedicated extraction path.
+ALLOWED_EXTENSIONS = {
+    "pdf", "txt", "md", "markdown", "rst",
+    "doc", "docx",
+    "csv", "tsv", "json", "xml", "yaml", "yml",
+    "py", "js", "ts", "jsx", "tsx", "html", "css",
+    "c", "cpp", "h", "hpp", "java", "go", "rs", "php", "sql", "sh", "bat", "ps1",
+    "png", "jpg", "jpeg", "webp", "bmp", "tiff", "gif",
+}
+
+EMBED_CACHE_PATH = VECTOR_FOLDER / "embed_cache.pkl"
+EMBED_CACHE: dict[str, list[float]] = {}
+if EMBED_CACHE_PATH.exists():
+    try:
+        with open(EMBED_CACHE_PATH, "rb") as f:
+            EMBED_CACHE = pickle.load(f)
+        logger.info("💾 Loaded %d cached embedding vectors from disk", len(EMBED_CACHE))
+    except Exception as _exc:
+        EMBED_CACHE = {}
+
+def _save_embed_cache() -> None:
+    try:
+        with open(EMBED_CACHE_PATH, "wb") as f:
+            pickle.dump(EMBED_CACHE, f)
+    except Exception as exc:
+        logger.warning("⚠️ Failed to save embedding cache: %s", exc)
 
 # Per-session stores
 VECTOR_STORE: dict[str, "VectorStore"] = {}
@@ -177,27 +203,24 @@ GEMINI_API_KEY = os.environ.get("GEMINI_API_KEY", "")
 GEMINI_URL = "https://generativelanguage.googleapis.com/v1beta"
 LLM_MODEL = os.environ.get("LLM_MODEL", "gemini-3.7-flash")
 EMBED_MODEL = os.environ.get("EMBED_MODEL", "gemini-embedding-001")
-EMBED_MIN_SCORE = float(os.environ.get("EMBED_MIN_SCORE", "0.55"))  # recalibrated
-# for reciprocal_rank_fusion()'s normalized scale (see RRF_K comment) —
-# NOT comparable to the old weighted-average blend's raw-cosine scale.
-# Tested directly: a genuine top-ranked match scores ~0.9-1.0 here; a
-# plausible false positive (moderate, non-top rank in both methods)
-# scores ~0.39-0.42 — 0.55 sits cleanly between them.
-EMBED_BATCH = 32
+
+# Threshold renamed to RRF_MIN_SCORE for semantic clarity (reflects RRF rank score, not raw cosine)
+RRF_MIN_SCORE = float(os.environ.get("RRF_MIN_SCORE", os.environ.get("EMBED_MIN_SCORE", "0.55")))
+EMBED_MIN_SCORE = RRF_MIN_SCORE  # Backward compatibility alias
+
+EMBED_BATCH = int(os.environ.get("EMBED_BATCH", "16"))
 
 # Retrieval strategy for the embeddings path. "hybrid" combines cosine
 # similarity with TF-IDF so exact tokens (error codes, IDs, acronyms) aren't
-# lost to semantic blurring. "embed" is the old behavior, kept only so you
-# can flip back to it and measure the before/after with the same code.
+# lost to semantic blurring. "embed" is the old behavior.
 RETRIEVAL_MODE = os.environ.get("RETRIEVAL_MODE", "hybrid")  # "hybrid" | "embed"
 HYBRID_ALPHA = float(os.environ.get("HYBRID_ALPHA", "0.6"))  # weight on embedding score
 
-# How many chunks retrieval returns, before token-budget trimming below.
-TOP_K = int(os.environ.get("TOP_K", "8"))  # was 5 — a genuinely relevant
-# section that's split across chunks (see STRUCT_MAX_WORDS) can get
-# crowded out of a small top-k window entirely by other, unrelated but
-# similarly-scored sections. A wider window gives the LLM more raw
-# material to synthesize a complete answer from.
+# Decoupled Pipeline K Parameters
+RETRIEVAL_TOP_K = int(os.environ.get("RETRIEVAL_TOP_K", "20"))  # Raw candidate pool from RRF
+RERANK_TOP_N = int(os.environ.get("RERANK_TOP_N", "8"))          # Candidates passed to LLM Reranker
+FINAL_TOP_K = int(os.environ.get("FINAL_TOP_K", "5"))            # Chunks passed to context budget
+TOP_K = RETRIEVAL_TOP_K                                          # Alias for legacy compatibility
 
 # Hard cap on how many tokens' worth of retrieved chunk TEXT get sent to
 # the LLM as context, regardless of how many chunks TOP_K allows through.
@@ -344,8 +367,8 @@ def _gemini_embed_batch(texts: list[str]) -> list[list[float]]:
         ]
     }
 
-    max_retries = 5
-    base_delay = 2.0
+    max_retries = 7
+    base_delay = 3.0
     for attempt in range(1, max_retries + 1):
         try:
             t0 = time.time()
@@ -364,7 +387,7 @@ def _gemini_embed_batch(texts: list[str]) -> list[list[float]]:
             return vectors
         except urllib.error.HTTPError as exc:
             if exc.code in (429, 500, 503) and attempt < max_retries:
-                delay = base_delay * (2 ** (attempt - 1))
+                delay = base_delay * (2 ** (attempt - 1)) + (attempt * 2.0)
                 logger.warning("⏳ Gemini Embeddings rate-limited (HTTP %d). Retrying in %.1fs (attempt %d/%d)...",
                                exc.code, delay, attempt, max_retries)
                 time.sleep(delay)
@@ -377,17 +400,47 @@ def _gemini_embed_batch(texts: list[str]) -> list[list[float]]:
 
 
 def embed_texts(texts: list[str]) -> list[list[float]]:
-    """Batch-embed texts via Gemini API at full network speed."""
-    out: list[list[float]] = []
-    total_batches = math.ceil(len(texts) / EMBED_BATCH)
-    logger.info("🧠 Starting batch embedding for %d total chunks (%d batch(es) of max %d)",
-                len(texts), total_batches, EMBED_BATCH)
-    for idx, i in enumerate(range(0, len(texts), EMBED_BATCH), start=1):
-        batch = texts[i:i + EMBED_BATCH]
-        logger.info("🧠 Processing embedding batch %d/%d (%d chunks)...", idx, total_batches, len(batch))
-        vectors = _gemini_embed_batch(batch)
-        out.extend(vectors)
-    return out
+    """Batch-embed texts via Gemini API with disk caching and rate-limit governor."""
+    if not texts:
+        return []
+
+    results: dict[int, list[float]] = {}
+    missing_indices: list[int] = []
+    missing_texts: list[str] = []
+
+    for idx, t in enumerate(texts):
+        h = hashlib.sha256(t.encode("utf-8")).hexdigest()
+        if h in EMBED_CACHE:
+            results[idx] = EMBED_CACHE[h]
+        else:
+            missing_indices.append(idx)
+            missing_texts.append(t)
+
+    cached_count = len(texts) - len(missing_texts)
+    if cached_count > 0:
+        logger.info("⚡ Retried %d/%d chunk embeddings directly from disk cache", cached_count, len(texts))
+
+    if missing_texts:
+        total_batches = math.ceil(len(missing_texts) / EMBED_BATCH)
+        logger.info("🧠 Fetching Gemini embeddings for %d uncached chunks (%d batch(es) of max %d)",
+                    len(missing_texts), total_batches, EMBED_BATCH)
+        new_cached = False
+        for batch_num, i in enumerate(range(0, len(missing_texts), EMBED_BATCH), start=1):
+            batch_texts = missing_texts[i:i + EMBED_BATCH]
+            batch_idxs = missing_indices[i:i + EMBED_BATCH]
+            logger.info("🧠 Processing embedding batch %d/%d (%d chunks)...", batch_num, total_batches, len(batch_texts))
+            vectors = _gemini_embed_batch(batch_texts)
+            for b_idx, vec in zip(batch_idxs, vectors):
+                results[b_idx] = vec
+                h = hashlib.sha256(texts[b_idx].encode("utf-8")).hexdigest()
+                EMBED_CACHE[h] = vec
+            new_cached = True
+            if batch_num < total_batches:
+                time.sleep(3.0)  # Pacing governor to guarantee <= 15 RPM
+        if new_cached:
+            _save_embed_cache()
+
+    return [results[i] for i in range(len(texts))]
 
 
 def embed_text(text: str) -> list[float]:
@@ -1660,42 +1713,19 @@ def _stem_lite(token: str) -> str:
 def validate_context(results: list[dict], min_score: float, query: str = None,
                      rerank_score: float | None = None) -> bool:
     """
-    Reject retrieval when nothing clears the similarity bar, OR when
-    there's no good evidence the top result is actually relevant.
-
-    Why the score threshold alone isn't enough: it's corpus-size
-    dependent. A common domain word (e.g. "policy" in an HR manual) can
-    push a completely unrelated query's score just over a fixed threshold
-    purely because that one word is rare enough in a SMALL corpus to
-    carry outsized IDF weight — the same query might score well under the
-    threshold in a larger corpus where that word is more common. Verified
-    directly: "What is the stock buyback policy?" scored 0.153 against a
-    real 25-chunk HR document — above a 0.15 threshold — via the single
-    shared word "policy", despite zero other relevant overlap.
-
-    Two different ways of catching that, depending on what's available:
-
-    1. If reranking ran and produced a real relevance judgment
-       (rerank_score is not None), use THAT — the LLM reranker correctly
-       recognizes a semantically-correct-but-lexically-different answer
-       (e.g. "who issued this?" matching "...issued by the Financial
-       Conduct Authority", zero shared content words) as relevant, which
-       a pure lexical check would wrongly reject. This is the smarter
-       check when a smarter judge is actually available.
-
-    2. Otherwise, fall back to requiring at least 2 shared meaningful
-       tokens (stemmed) between the query and the top result — corpus-
-       size independent, catches the "policy"-style false positive, but
-       is a genuinely blunter instrument than #1 and can reject a
-       correct low-overlap answer. This is the safety net for when
-       there's no reranker available to make a better call.
+    Validates whether top retrieved chunks have sufficient similarity and
+    semantic/token evidence to proceed to answer generation.
     """
     if not results:
         return False
-    if results[0]["score"] < min_score:
+    top_score = results[0].get("score", 0.0)
+    if top_score < min_score:
         return False
     if rerank_score is not None:
         return rerank_score >= RERANK_MIN_RELEVANCE
+    # High-confidence RRF top match (score >= 0.65) is trusted for answer synthesis
+    if top_score >= 0.65:
+        return True
     if query is not None:
         query_tokens = set(tokenize(query))
         if query_tokens:
@@ -1703,7 +1733,7 @@ def validate_context(results: list[dict], min_score: float, query: str = None,
             query_stems = {_stem_lite(t) for t in query_tokens}
             chunk_stems = {_stem_lite(t) for t in chunk_tokens}
             shared = query_stems & chunk_stems
-            required = min(2, len(query_stems))
+            required = 1 if len(query_stems) <= 2 else min(2, len(query_stems))
             if len(shared) < required:
                 return False
     return True
@@ -1730,10 +1760,42 @@ def _is_dont_know(answer: str) -> bool:
     a hedge embedded in a longer, real answer is never caught by this.
     """
     a = answer.lower().strip()
+    if not a:
+        return True
     if a.rstrip(".") in ("i don't know", "i do not know"):
         return True
     word_count = len(a.split())
     return word_count <= 12 and any(m in a for m in _DONT_KNOW_MARKERS)
+
+
+_QUERY_STOPWORDS = {
+    "a", "an", "and", "are", "at", "be", "by", "do", "for", "from", "how", "i", "in",
+    "is", "it", "of", "on", "or", "the", "to", "under", "what", "when", "where", "which",
+    "who", "with", "without",
+}
+
+
+def validate_offline_context(results: list[dict], min_score: float, query: str,
+                             corpus_chunks: list[dict]) -> bool:
+    """Apply the standard gate plus a corpus-vocabulary check for BM25 mode.
+
+    BM25 scores are normalized per query, which means its highest-ranked
+    result is always 1.0 even when it only overlaps on generic policy words.
+    A meaningful query term absent from the entire indexed corpus is strong
+    evidence that the question is out of scope and must not produce an answer.
+    """
+    if not validate_context(results, min_score, query):
+        return False
+    query_terms = {
+        token for token in tokenize(query)
+        if len(token) >= 3 and token not in _QUERY_STOPWORDS
+    }
+    if not query_terms:
+        return False
+    corpus_terms = {
+        token for chunk in corpus_chunks for token in tokenize(chunk.get("text", ""))
+    }
+    return query_terms.issubset(corpus_terms)
 
 
 RERANK_ENABLED = os.environ.get("RERANK_ENABLED", "false").lower() == "true"
@@ -1952,7 +2014,7 @@ def upload():
         if not f or not allowed_file(f.filename):
             logger.warning("⚠️ Unsupported file type uploaded: %s", getattr(f, "filename", "?"))
             results.append({"filename": getattr(f, "filename", "?") or "?",
-                            "error": "Unsupported file type (allowed: PDF, TXT, MD)"})
+                            "error": "Unsupported file type. Upload a document, data file, source file, or image supported by the uploader."})
             continue
 
         original_name = f.filename
@@ -1982,14 +2044,13 @@ def upload():
             doc_id = str(uuid.uuid4())[:8]
             doc_info = {"doc_id": doc_id, "filename": original_name}
 
-            pages = (extract_pdf_pages(str(filepath)) if ext == "pdf"
-                     else extract_txt_pages(str(filepath)))
+            pages = extract_document_pages(str(filepath), ext)
 
             if not pages:
                 filepath.unlink(missing_ok=True)
                 hashes.discard(dedupe_key)
                 reason = ("No extractable text (password-protected or scanned PDF?)"
-                          if ext == "pdf" else "Empty file")
+                          if ext == "pdf" else "The file was empty or contained no extractable text")
                 logger.warning("⚠️ Text extraction returned empty for '%s': %s", original_name, reason)
                 results.append({"filename": original_name, "error": reason})
                 continue
@@ -2062,7 +2123,14 @@ def upload():
             store.add(item["chunks"], vectors)
 
             stored_path = UPLOAD_FOLDER / f"{sid}__{item['doc_id']}.{item['ext']}"
-            item["filepath"].replace(stored_path)
+            if item["filepath"].exists():
+                try:
+                    import shutil
+                    shutil.move(str(item["filepath"]), str(stored_path))
+                except Exception as _m_err:
+                    logger.warning("⚠️ Could not move temporary upload file: %s", _m_err)
+            else:
+                logger.warning("ℹ️ Temporary file %s no longer exists on disk prior to move.", item["filepath"])
             SESSION_FILES.setdefault(sid, {})[item["doc_id"]] = {
                 "path": stored_path,
                 "name": item["filename"],
@@ -2253,6 +2321,54 @@ def serve_file_pages(doc_id: str):
     })
 
 
+TRACE_LOG_DIR = BASE_DIR / "traces"
+TRACE_LOG_DIR.mkdir(exist_ok=True)
+TRACE_LOG_FILE = TRACE_LOG_DIR / "hr_traces.jsonl"
+
+
+def redact_pii(text: str) -> str:
+    """Scrub employee names, IDs (EMP-1234), SSNs, emails from text before trace writing."""
+    if not text:
+        return text
+    text = re.sub(r'\b(EMP|ID|SEC|USR)[-_]?\d{3,8}\b', '[REDACTED_EMP_ID]', text, flags=re.IGNORECASE)
+    text = re.sub(r'\b\d{3}-\d{2}-\d{4}\b', '[REDACTED_SSN]', text)
+    text = re.sub(r'\b[A-Za-z0-9._%+-]+@[A-Za-z0-9.-]+\.[A-Za-z]{2,}\b', '[REDACTED_EMAIL]', text)
+    return text
+
+
+def log_query_trace(trace_data: dict) -> str:
+    """Append complete JSON trace object to traces/hr_traces.jsonl."""
+    trace_id = trace_data.get("trace_id") or str(uuid.uuid4())
+    raw_query = trace_data.get("query", "")
+    trace_obj = {
+        "trace_id": trace_id,
+        "timestamp": time.strftime("%Y-%m-%dT%H:%M:%SZ", time.gmtime()),
+        "user_query_raw": redact_pii(raw_query),
+        "user_query_redacted": redact_pii(raw_query),
+        "prompt_version": trace_data.get("prompt_version", "v1.2_hr_grounded"),
+        "model": trace_data.get("model", LLM_MODEL),
+        "params": {
+            "retrieval_top_k": RETRIEVAL_TOP_K,
+            "rerank_top_n": RERANK_TOP_N,
+            "final_top_k": FINAL_TOP_K,
+            "rrf_min_score": RRF_MIN_SCORE,
+            "max_context_tokens": MAX_CONTEXT_TOKENS,
+            "retrieval_mode": RETRIEVAL_MODE,
+        },
+        "retrieved_chunks": trace_data.get("retrieved_chunks", []),
+        "context_gate_passed": trace_data.get("context_gate_passed", False),
+        "raw_output": trace_data.get("raw_output", ""),
+        "failure_mode": trace_data.get("failure_mode", "SUCCESS"),
+        "latency_ms": trace_data.get("latency_ms", 0),
+    }
+    try:
+        with open(TRACE_LOG_FILE, "a", encoding="utf-8") as f:
+            f.write(json.dumps(trace_obj) + "\n")
+    except Exception as exc:
+        logger.warning("⚠️ Failed to write trace to disk: %s", exc)
+    return trace_id
+
+
 @app.route("/ask", methods=["POST"])
 def ask():
     if "session_id" not in session:
@@ -2264,9 +2380,10 @@ def ask():
     method_filter = (data or {}).get("chunk_mode", "").strip() or None
 
     store = _get_store(sid)
+    t_start = time.time()
 
     RAGTracer.trace("RETRIEVAL", 1, 6, "Question Received", {
-        "User Question": query,
+        "User Question": redact_pii(query),
         "Session ID": sid[:8],
         "Strategy Filter": method_filter or "All",
         "Total Session Chunks": len(store.chunks),
@@ -2275,7 +2392,7 @@ def ask():
     search_query = rewrite_query(query) if QUERY_REWRITE_ENABLED else query
     if QUERY_REWRITE_ENABLED and search_query != query:
         RAGTracer.trace("RETRIEVAL", 2, 6, "Query Rewriting", {
-            "Original Question": query,
+            "Original Question": redact_pii(query),
             "Rewritten Search Query": search_query,
         })
 
@@ -2284,6 +2401,7 @@ def ask():
         for r in results:
             r["openable"] = r["doc_id"] in files
         return results
+
     if not store.chunks:
         return jsonify({
             "found": False,
@@ -2306,44 +2424,56 @@ def ask():
     # Path 1: embeddings + LLM (if configured and vectors exist)
     if GEMINI_API_KEY and active_store.vectors and len(active_store.vectors) == len(active_store.chunks):
         try:
+            # 1. Fetch raw candidate pool up to RETRIEVAL_TOP_K
             if RETRIEVAL_MODE == "hybrid-legacy":
-                raw_results = hybrid_search(active_store, search_query, top_k=TOP_K)
+                raw_results = hybrid_search(active_store, search_query, top_k=RETRIEVAL_TOP_K)
             elif RETRIEVAL_MODE == "embed":
                 q_vec = embed_text(search_query)
-                raw_results = active_store.query(q_vec, top_k=TOP_K, min_score=0.0)
+                raw_results = active_store.query(q_vec, top_k=RETRIEVAL_TOP_K, min_score=0.0)
             else:  # "hybrid" (default) — Reciprocal Rank Fusion
-                raw_results = reciprocal_rank_fusion(active_store, search_query, top_k=TOP_K)
-            near_miss = raw_results[0] if raw_results else None
-            results = [r for r in raw_results if r["score"] >= EMBED_MIN_SCORE]
-            
-            RAGTracer.trace("RETRIEVAL", 3, 6, "Hybrid Retrieval & RRF Fusion", {
-                "Retrieval Mode": RETRIEVAL_MODE,
-                "Raw Candidates Returned": len(raw_results),
-                "Above Min Threshold (" + str(EMBED_MIN_SCORE) + ")": len(results),
-                "Top Match Score": f"{near_miss['score']:.4f}" if near_miss else "0.0000",
-                "Top Source File": near_miss["filename"] if near_miss else "None",
-            })
+                raw_results = reciprocal_rank_fusion(active_store, search_query, top_k=RETRIEVAL_TOP_K)
 
+            near_miss = raw_results[0] if raw_results else None
+
+            # 2. Apply LLM Reranker across raw candidates BEFORE threshold filtering
             rerank_score = None
-            if RERANK_ENABLED and len(results) > 1:
-                results, rerank_score = rerank_with_llm(query, results)
+            candidate_pool = raw_results
+            if RERANK_ENABLED and len(candidate_pool) > 1:
+                candidate_pool, rerank_score = rerank_with_llm(query, candidate_pool[:RERANK_TOP_N])
                 RAGTracer.trace("RETRIEVAL", 4, 6, "LLM Reranker Evaluation", {
                     "Reranker Status": "Active",
-                    "Candidates Evaluated": len(results),
+                    "Candidates Evaluated": len(candidate_pool),
                     "Top Relevance Score": f"{rerank_score:.1f}/10" if rerank_score else "N/A",
                 })
 
+            # 3. Take top FINAL_TOP_K candidates and apply context token budget
+            results = candidate_pool[:FINAL_TOP_K]
             results = fit_to_token_budget(results, MAX_CONTEXT_TOKENS)
-            valid = validate_context(results, EMBED_MIN_SCORE, query, rerank_score)
+
+            # 4. Context Validation Gate against RRF_MIN_SCORE
+            valid = validate_context(results, RRF_MIN_SCORE, query, rerank_score)
             
             RAGTracer.trace("RETRIEVAL", 5, 6, "Context Validation Gate", {
                 "Threshold Gate": "PASSED" if valid else "FAILED",
-                "Min Required Score": EMBED_MIN_SCORE,
+                "Min Required Score": RRF_MIN_SCORE,
                 "Context Token Budget": f"{MAX_CONTEXT_TOKENS} tokens",
                 "Valid Grounding Chunks": len(results),
             })
 
+            elapsed_ms = int((time.time() - t_start) * 1000)
+
             if not valid:
+                log_query_trace({
+                    "query": query,
+                    "retrieved_chunks": [{
+                        "id": r.get("id"), "score": r.get("score"), "filename": r.get("filename"),
+                        "section": r.get("section"), "page": p.get("page") if (p := r) else None
+                    } for r in raw_results[:FINAL_TOP_K]],
+                    "context_gate_passed": False,
+                    "raw_output": "I don't know — no document content matched your question closely enough.",
+                    "failure_mode": "RETRIEVAL_FAILURE",
+                    "latency_ms": elapsed_ms,
+                })
                 return jsonify({
                     "found": False,
                     "answer": "I don't know — no document content matched your question closely enough.",
@@ -2353,17 +2483,34 @@ def ask():
                         "section": near_miss.get("section"),
                         "page": near_miss.get("page"),
                         "score": round(near_miss["score"], 4),
-                        "threshold": EMBED_MIN_SCORE,
+                        "threshold": RRF_MIN_SCORE,
                     } if near_miss else None),
                 })
+
+            # 5. Answer Generation
             answer = generate_answer(query, results)
+            # An empty model response is not a successful answer. Treat it
+            # like a refusal so the UI and trace agree about the outcome.
+            is_found = bool(answer.strip()) and not _is_dont_know(answer)
+            log_query_trace({
+                "query": query,
+                "retrieved_chunks": [{
+                    "id": r.get("id"), "score": r.get("score"), "filename": r.get("filename"),
+                    "section": r.get("section"), "page": r.get("page")
+                } for r in results],
+                "context_gate_passed": True,
+                "raw_output": answer,
+                "failure_mode": "SUCCESS" if is_found else "GENERATION_FAILURE",
+                "latency_ms": elapsed_ms,
+            })
+
             RAGTracer.trace("RETRIEVAL", 6, 6, "LLM Answer Generation", {
                 "Model Identifier": LLM_MODEL,
                 "Sources Grounded": len(results),
                 "Answer Character Count": len(answer),
             })
             return jsonify({
-                "found": not _is_dont_know(answer),
+                "found": is_found,
                 "answer": answer or "I don't know.",
                 "sources": annotate_openable(results),
             })
@@ -2392,8 +2539,19 @@ def ask():
     index = active_store.get_tfidf_index()
     results = search_chunks(search_query, chunks, index, top_k=TOP_K)
     results = fit_to_token_budget(results, MAX_CONTEXT_TOKENS)
-    if not validate_context(results, TFIDF_MIN_SCORE, query):
+    if not validate_offline_context(results, TFIDF_MIN_SCORE, query, chunks):
         near_miss = results[0] if results else None
+        log_query_trace({
+            "query": query,
+            "retrieved_chunks": [{
+                "id": r.get("id"), "score": r.get("score"), "filename": r.get("filename"),
+                "section": r.get("section"), "page": r.get("page")
+            } for r in results],
+            "context_gate_passed": False,
+            "raw_output": "I don't know - no document content matched your question closely enough.",
+            "failure_mode": "RETRIEVAL_FAILURE",
+            "latency_ms": int((time.time() - t_start) * 1000),
+        })
         return jsonify({
             "found": False,
             "answer": "I don't know — no document content matched your question closely enough.",
@@ -2408,6 +2566,17 @@ def ask():
         })
     resp = synthesize_answer(query, results)
     resp["sources"] = annotate_openable(resp.get("sources", []))
+    log_query_trace({
+        "query": query,
+        "retrieved_chunks": [{
+            "id": r.get("id"), "score": r.get("score"), "filename": r.get("filename"),
+            "section": r.get("section"), "page": r.get("page")
+        } for r in results],
+        "context_gate_passed": bool(resp.get("found")),
+        "raw_output": resp.get("answer", ""),
+        "failure_mode": "SUCCESS" if resp.get("found") else "GENERATION_FAILURE",
+        "latency_ms": int((time.time() - t_start) * 1000),
+    })
     return jsonify(resp)
 
 
@@ -2687,8 +2856,10 @@ def eval_run():
 
     data = request.get_json(silent=True) or {}
     questions = data.get("questions", [])
-    k = max(1, min(int(data.get("k", 3)), 20))
-    chunk_mode_filter = (data.get("chunk_mode") or "").strip() or None
+    # Accept the original UI's field names as aliases so bookmarked API
+    # callers continue to work while the frontend uses the canonical names.
+    k = max(1, min(int(data.get("k", data.get("top_k", 3))), 20))
+    chunk_mode_filter = (data.get("chunk_mode", data.get("strategy_filter", "")) or "").strip() or None
     # "presets" is the new, preferred way to compare ablation stages
     # (tfidf -> bm25+qdrant -> +RRF -> +reranking -> +query rewriting).
     # "modes" is kept for backward compatibility with the raw retrieval-

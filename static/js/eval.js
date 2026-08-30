@@ -49,9 +49,9 @@ function EvalApp() {
         headers: { 'Content-Type': 'application/json' },
         body: JSON.stringify({
           questions: validQuestions,
-          top_k: parseInt(topK, 10),
+          k: parseInt(topK, 10),
           presets: activePresets,
-          strategy_filter: strategyFilter
+          chunk_mode: strategyFilter
         })
       });
       const data = await res.json();
