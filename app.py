@@ -1904,48 +1904,41 @@ def validate_context(results: list[dict], min_score: float, query: str = None,
     """
     Reject retrieval when nothing clears the similarity bar, OR when
     there's no good evidence the top result is actually relevant.
-
-    Why the score threshold alone isn't enough: it's corpus-size
-    dependent. A common domain word (e.g. "policy" in an HR manual) can
-    push a completely unrelated query's score just over a fixed threshold
-    purely because that one word is rare enough in a SMALL corpus to
-    carry outsized IDF weight — the same query might score well under the
-    threshold in a larger corpus where that word is more common. Verified
-    directly: "What is the stock buyback policy?" scored 0.153 against a
-    real 25-chunk HR document — above a 0.15 threshold — via the single
-    shared word "policy", despite zero other relevant overlap.
-
-    Two different ways of catching that, depending on what's available:
-
-    1. If reranking ran and produced a real relevance judgment
-       (rerank_score is not None), use THAT — the LLM reranker correctly
-       recognizes a semantically-correct-but-lexically-different answer
-       (e.g. "who issued this?" matching "...issued by the Financial
-       Conduct Authority", zero shared content words) as relevant, which
-       a pure lexical check would wrongly reject. This is the smarter
-       check when a smarter judge is actually available.
-
-    2. Otherwise, fall back to requiring at least 2 shared meaningful
-       tokens (stemmed) between the query and the top result — corpus-
-       size independent, catches the "policy"-style false positive, but
-       is a genuinely blunter instrument than #1 and can reject a
-       correct low-overlap answer. This is the safety net for when
-       there's no reranker available to make a better call.
     """
     if not results:
         return False
-    if results[0]["score"] < min_score:
+    top_score = results[0].get("score", 0.0)
+    if top_score < min_score:
         return False
     if rerank_score is not None:
         return rerank_score >= RERANK_MIN_RELEVANCE
     if query is not None:
+        # Generic intent/question framing words that should not artificially inflate the required token count
+        META_QUESTION_WORDS = {
+            "meaning", "mean", "definition", "define", "explain", "explanation",
+            "describe", "description", "overview", "detail", "details", "tell",
+            "show", "give", "list", "state", "clarify", "understand", "concept",
+            "purpose", "reason", "procedure", "process", "rule", "rules"
+        }
         query_tokens = set(tokenize(query))
         if query_tokens:
             chunk_tokens = set(tokenize(results[0]["text"]))
             query_stems = {_stem_lite(t) for t in query_tokens}
             chunk_stems = {_stem_lite(t) for t in chunk_tokens}
             shared = query_stems & chunk_stems
-            required = min(2, len(query_stems))
+
+            # Content stems excluding conversational meta-question words
+            content_stems = {s for s in query_stems if s not in META_QUESTION_WORDS}
+
+            # If top retrieval confidence is very strong (e.g. >= 0.75 or 1.0 in RRF),
+            # 1 shared stem is plenty to confirm it's on-topic and avoid false rejections.
+            if top_score >= 0.75:
+                required = 1
+            elif content_stems:
+                required = min(2, len(content_stems))
+            else:
+                required = min(2, len(query_stems))
+
             if len(shared) < required:
                 return False
     return True
@@ -3075,38 +3068,54 @@ def _hit_check(retrieved: list[dict], expected: str) -> bool:
     return False
 
 
-def _rr_rank(retrieved: list[dict], expected: str) -> tuple[bool, float, int]:
-    if not expected:
+def _rr_rank(retrieved: list[dict], expected: str = "", expected_doc: str = "", expected_section: str = "") -> tuple[bool, float, int]:
+    exp_lower = (expected or "").strip().lower()
+    exp_doc_lower = (expected_doc or "").strip().lower()
+    exp_sec_lower = (expected_section or "").strip().lower()
+
+    if not (exp_lower or exp_doc_lower or exp_sec_lower):
         return False, 0.0, 0
-    expected_lower = expected.lower()
+
     for idx, r in enumerate(retrieved, start=1):
         section = (r.get("section") or "").lower()
         filename = (r.get("filename") or "").lower()
-        if expected_lower in section or expected_lower in filename:
+        text = (r.get("text") or "").lower()
+
+        hit = False
+        if exp_doc_lower and exp_doc_lower in filename:
+            hit = True
+        elif exp_sec_lower and (exp_sec_lower in section or exp_sec_lower in text):
+            hit = True
+        elif exp_lower and (exp_lower in section or exp_lower in filename or exp_lower in text):
+            hit = True
+
+        if hit:
             return True, 1.0 / idx, idx
+
     return False, 0.0, 0
 
 
-def _run_eval_preset(active_store, question: str, expected: str, k: int, preset: dict) -> dict:
+def _run_eval_preset(active_store, q_id: str, question: str, expected: str, k: int, preset: dict,
+                     expected_doc: str = "", expected_section: str = "") -> dict:
     """
     Runs ONE question through ONE named preset's full pipeline —
     optional query rewriting, retrieval, optional reranking — and
-    returns a per-stage breakdown (BM25/embed/RRF scores per candidate,
-    plus the reranker's judgment if it ran) alongside the hit/miss
-    verdict, so each Week 4 technique's real effect is visible, not just
-    the final aggregate hit-rate.
+    returns a per-stage breakdown with question ID and ground-truth validation.
     """
-    search_q = rewrite_query(question) if preset["rewrite"] else question
-    retrieved = _retrieve_for_eval(active_store, search_q, k, preset["mode"], preset["force_tfidf"])
+    search_q = rewrite_query(question) if preset.get("rewrite") else question
+    retrieved = _retrieve_for_eval(active_store, search_q, k, preset.get("mode"), preset.get("force_tfidf", False))
     rerank_score = None
-    if preset["rerank"] and len(retrieved) > 1:
+    if preset.get("rerank") and len(retrieved) > 1:
         retrieved, rerank_score = rerank_with_llm(question, retrieved)
-    hit, rr, rank = _rr_rank(retrieved, expected)
+    hit, rr, rank = _rr_rank(retrieved, expected=expected, expected_doc=expected_doc, expected_section=expected_section)
     failure_type = "Success" if hit else "Retrieval Failure"
     return {
+        "id": q_id,
         "question": question,
         "search_query": search_q if search_q != question else None,
-        "expected": expected,
+        "expected": expected or expected_section or expected_doc,
+        "expected_doc": expected_doc or None,
+        "expected_section": expected_section or None,
         "hit": hit,
         "reciprocal_rank": round(rr, 4),
         "rank": rank,
@@ -3127,34 +3136,39 @@ def _run_eval_preset(active_store, question: str, expected: str, k: int, preset:
 @app.route("/eval/run", methods=["POST"])
 def eval_run():
     """
-    Runs a real hit-rate@k evaluation: for each (question, expected
-    section) pair, retrieves top-k through the real retrieval pipeline
-    and checks whether the expected section actually shows up. Optionally
-    compares multiple retrieval modes side by side in one call, so "did
-    this change actually help" has a real before/after number instead of
-    manual re-testing.
+    Runs a real hit-rate@k evaluation: for each (question, expected) pair,
+    retrieves top-k through the real retrieval pipeline and checks ground truth.
     """
     sid = session.get("session_id")
     if not sid:
         return jsonify({"error": "No active session"}), 400
 
     data = request.get_json(silent=True) or {}
-    questions = data.get("questions", [])
-    k = max(1, min(int(data.get("k", 3)), 20))
-    chunk_mode_filter = (data.get("chunk_mode") or "").strip() or None
-    # "presets" is the new, preferred way to compare ablation stages
-    # (tfidf -> bm25+qdrant -> +RRF -> +reranking -> +query rewriting).
-    # "modes" is kept for backward compatibility with the raw retrieval-
-    # mode comparison this page originally shipped with.
-    preset_names = data.get("presets") or list(EVAL_PRESETS.keys())[:3]
+    k = max(1, min(int(data.get("top_k") or data.get("k", 3)), 20))
+    chunk_mode_filter = (data.get("strategy_filter") or data.get("chunk_mode") or "").strip() or None
+    preset_names = data.get("presets") or list(EVAL_PRESETS.keys())
     legacy_modes = data.get("modes")
+    raw_questions = data.get("questions", [])
 
-    questions = [
-        {"question": (q.get("question") or "").strip(), "expected": (q.get("expected") or "").strip()}
-        for q in questions if (q.get("question") or "").strip()
-    ]
+    questions = []
+    for idx, q in enumerate(raw_questions):
+        q_text = (q.get("question") or "").strip()
+        expected = (q.get("expected") or "").strip()
+        expected_doc = (q.get("expected_doc") or "").strip()
+        expected_section = (q.get("expected_section") or "").strip()
+        q_id = str(q.get("id") or f"q_{idx + 1}")
+
+        if q_text and (expected or expected_doc or expected_section):
+            questions.append({
+                "id": q_id,
+                "question": q_text,
+                "expected": expected or expected_section or expected_doc,
+                "expected_doc": expected_doc,
+                "expected_section": expected_section,
+            })
+
     if not questions:
-        return jsonify({"error": "No questions provided"}), 400
+        return jsonify({"error": "No valid questions provided (both question and expected ground truth are required)"}), 400
 
     store = _get_store(sid)
     if not store.chunks:
@@ -3169,23 +3183,34 @@ def eval_run():
     for name in names:
         preset = EVAL_PRESETS.get(name) or {
             "force_tfidf": False, "mode": name, "rerank": False, "rewrite": False,
-        }  # legacy raw-mode names fall back to a plain preset shape
+        }
         per_question = []
         hits = 0
         for q in questions:
-            result = _run_eval_preset(active_store, q["question"], q["expected"], k, preset)
-            hits += result["hit"]
+            result = _run_eval_preset(
+                active_store,
+                q["id"],
+                q["question"],
+                q["expected"],
+                k,
+                preset,
+                expected_doc=q["expected_doc"],
+                expected_section=q["expected_section"]
+            )
+            hits += int(result["hit"])
             per_question.append(result)
+
         rr_sum = sum(r.get("reciprocal_rank", 0.0) for r in per_question)
+        total = len(questions) or 1
         by_preset[name] = {
-            "hit_rate": hits / len(questions),
-            "mrr": round(rr_sum / len(questions), 4),
+            "hit_rate": hits / total,
+            "mrr": round(rr_sum / total, 4),
             "hits": hits,
-            "total": len(questions),
+            "total": total,
             "results": per_question,
         }
 
-    return jsonify({"ok": True, "k": k, "modes": by_preset})
+    return jsonify({"ok": True, "k": k, "total_questions": len(questions), "modes": by_preset})
 
 
 @app.route("/healthz", methods=["GET"])

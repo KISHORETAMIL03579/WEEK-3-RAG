@@ -1,76 +1,43 @@
+# eval_retrieval.py — Unified 5-Stage Ablation & Recall@K Evaluator for Ask My Docs.
 
-# eval_retrieval.py — Recall@k evaluation for Ask My Docs retrieval.
-
-# WHAT THIS MEASURES
-# -------------------
-# For a set of questions you already know the answer to, this checks whether
-# the CORRECT document shows up in the top-k retrieved chunks — regardless of
-# whether the final generated answer was right. That's the "wrong document
-# fetched" vs. "right document, wrong answer" split from this week's task:
-
-#     - If recall@k says the doc WASN'T retrieved  -> retrieval problem.
-#     - If recall@k says the doc WAS retrieved but your /ask answer was still
-#       wrong -> that's a generation problem, and this script can't fix or
-#       measure it. Note those separately; don't let this number hide them.
-
-# It runs the SAME question set through three retrieval strategies so you get
-# a real before/after instead of a vibe:
-#     - embed   : embeddings + cosine similarity only (old behavior)
-#     - hybrid  : embeddings + TF-IDF blended         (this week's change)
-#     - tfidf   : TF-IDF only (for reference / sanity check)
-
-# HOW TO USE
-# ----------
-# 1. Fill in DOCS below with paths to a handful of real documents.
-# 2. Fill in QUESTIONS with real questions + which document should answer
-#    each one (a substring of its filename is enough).
-# 3. Run: python eval_retrieval.py
-# 4. Read the recall@k line for "embed" (before) and "hybrid" (after).
-#    That's your before-and-after number. The per-question ✓/✗ list under
-#    each mode tells you exactly which failures were NOT fixed.
-
-# Requires GEMINI_API_KEY to be set in the environment (or .env next to app.py)
-# for the embed/hybrid modes to do anything meaningful — without a key their
-# embedding score is just 0 for every chunk, so they degrade to TF-IDF ranking,
-# which will make embed == hybrid == tfidf. That's expected and tells you your
-# key isn't configured, not that hybrid doesn't help.
-# """
+"""
+Ablation Stages:
+  1. tfidf               : Lexical TF-IDF baseline
+  2. bm25-qdrant-blend   : Weighted blend (BM25 + Qdrant Embeddings)
+  3. bm25-qdrant-rrf     : BM25 + Qdrant Reciprocal Rank Fusion (RRF)
+  4. rrf-rerank          : RRF + Cross-Encoder Reranking
+  5. rrf-rerank-rewrite  : Query Rewriting + RRF + Reranking
+"""
 
 import json
+import os
 import sys
 from pathlib import Path
 
 sys.path.insert(0, str(Path(__file__).parent))
 
-from app import (  # noqa: E402
+from app import (
     chunk_text, embed_texts, embed_text, VectorStore, cosine,
     build_index, tokenize, compute_tf, tfidf_vector, cosine_sim,
     extract_pdf_pages, extract_txt_pages, GEMINI_API_KEY,
+    EVAL_PRESETS, _run_eval_preset
 )
 
-import os
-
-TOP_K = int(os.environ.get("TOP_K", "5"))
-HYBRID_ALPHA = float(os.environ.get("HYBRID_ALPHA", "0.6"))
+TOP_K = int(os.environ.get("TOP_K", "3"))
 EVAL_CHUNK_MODE = os.environ.get("EVAL_CHUNK_MODE", "structured")
 
-# ── 1. Point this at your own documents ─────────────────────────────────
+# ── 1. Point this at your documents ─────────────────────────────────────
 # [(filepath_on_disk, display_name), ...]
 DOCS = [
-    # ("./uploads/errors.md", "errors.md"),
-    # ("./uploads/refund_policy.pdf", "refund_policy.pdf"),
+    # ("./uploads/HRPolicy.pdf", "HRPolicy.pdf"),
 ]
 
-# ── 2. Point this at your own failing-question set ──────────────────────
-# expected_doc: a substring that appears in the correct source's filename
+# ── 2. Test questions + expected ground truth ───────────────────────────
+# expected: section title, filename substring, or chunk keyword
 QUESTIONS = [
-    # {"question": "What does error code ERR-4032 mean?", "expected_doc": "errors.md"},
-    # {"question": "How many days do I have to request a refund?", "expected_doc": "refund_policy.pdf"},
+    # {"question": "How many days of annual leave?", "expected": "annual leave"},
+    # {"question": "What is the probation period?", "expected": "probation"},
 ]
-
-# Optionally load a bigger set from JSON instead of editing this file:
-#   python eval_retrieval.py questions.json
-# where questions.json is a list of {"question": ..., "expected_doc": ...}
 
 
 def _extract_pages(filepath: str, ext: str):
@@ -99,71 +66,45 @@ def build_eval_store() -> VectorStore:
     else:
         store.vectors = []
         if not GEMINI_API_KEY:
-            print("⚠ GEMINI_API_KEY not set — embed/hybrid will fall back to TF-IDF-only ranking.")
+            print("⚠ GEMINI_API_KEY not set — dense retrieval will fall back to TF-IDF.")
 
     return store
 
 
-def _embed_scores(store: VectorStore, query: str) -> list[float]:
-    if not (GEMINI_API_KEY and store.vectors and len(store.vectors) == len(store.chunks)):
-        return [0.0] * len(store.chunks)
-    return [cosine(embed_text(query), v) for v in store.vectors]
-
-
-def _tfidf_scores(query: str, index: dict) -> list[float]:
-    q_vec = tfidf_vector(compute_tf(tokenize(query)), index["idf"])
-    return [
-        cosine_sim(q_vec, tfidf_vector(compute_tf(tokens), index["idf"]))
-        for tokens in index["corpus_tokens"]
-    ]
-
-
-def _top_k_filenames(scores: list[float], chunks: list[dict], k: int) -> set:
-    ranked = sorted(range(len(scores)), key=lambda i: -scores[i])[:k]
-    return {chunks[i]["filename"] for i in ranked}
-
-
-def recall_at_k(store: VectorStore, questions: list[dict], k: int, mode: str):
+def evaluate_preset(store: VectorStore, questions: list[dict], k: int, preset_name: str) -> dict:
     if not store.chunks:
-        return 0.0, 0.0, []
+        return {"hit_rate": 0.0, "mrr": 0.0, "hits": 0, "total": len(questions), "results": []}
 
-    index = build_index(store.chunks)
-    hits = 0
-    rr_total = 0.0
+    preset = EVAL_PRESETS.get(preset_name)
+    if not preset:
+        preset = {
+            "force_tfidf": (preset_name == "tfidf"),
+            "mode": "hybrid" if preset_name in ("hybrid", "embed") else "tfidf",
+            "rerank": False,
+            "rewrite": False,
+        }
+
     per_question = []
+    hits = 0
 
     for q in questions:
-        embed_s = _embed_scores(store, q["question"])
-        tfidf_s = _tfidf_scores(q["question"], index)
-
-        if mode == "embed":
-            scores = embed_s
-        elif mode == "tfidf":
-            scores = tfidf_s
-        else:  # hybrid
-            scores = [HYBRID_ALPHA * e + (1 - HYBRID_ALPHA) * t
-                      for e, t in zip(embed_s, tfidf_s)]
-
-        ranked_indices = sorted(range(len(scores)), key=lambda i: -scores[i])[:k]
-        top_docs = [store.chunks[i]["filename"] for i in ranked_indices]
+        q_text = q.get("question", "").strip()
+        expected = q.get("expected") or q.get("expected_doc", "").strip()
         
-        hit = False
-        rr = 0.0
-        for rank_idx, doc_name in enumerate(top_docs, start=1):
-            if q["expected_doc"].lower() in doc_name.lower():
-                hit = True
-                rr = 1.0 / rank_idx
-                break
+        res = _run_eval_preset(store, q_text, expected, k, preset)
+        hits += int(res["hit"])
+        per_question.append(res)
 
-        hits += int(hit)
-        rr_total += rr
-        
-        failure_type = "Success" if hit else "Retrieval Failure"
-        per_question.append((q["question"], hit, rr, failure_type))
+    rr_sum = sum(r.get("reciprocal_rank", 0.0) for r in per_question)
+    total = len(questions) or 1
 
-    hit_rate = hits / len(questions)
-    mrr = rr_total / len(questions)
-    return hit_rate, mrr, per_question
+    return {
+        "hit_rate": hits / total,
+        "mrr": round(rr_sum / total, 4),
+        "hits": hits,
+        "total": total,
+        "results": per_question,
+    }
 
 
 def main():
@@ -181,42 +122,37 @@ def main():
         print("No chunks indexed — check DOCS paths.")
         return
 
-    results_by_mode = {}
-    for mode in ("embed", "hybrid", "tfidf"):
-        hit_rate, mrr, per_question = recall_at_k(store, questions, TOP_K, mode)
-        results_by_mode[mode] = (hit_rate, mrr, per_question)
-
-    print(f"\n{'MODE':10s} {'HIT-RATE@' + str(TOP_K):14s} {'MRR':10s}")
-    print("-" * 38)
-    for mode in ("embed", "hybrid", "tfidf"):
-        hr, mrr, _ = results_by_mode[mode]
-        print(f"{mode:10s} {hr:6.0%} ({int(round(hr*len(questions)))}/{len(questions)})    {mrr:.4f}")
-
-    before, _, _ = results_by_mode["embed"]
-    after, _, _ = results_by_mode["hybrid"]
-    delta = after - before
-    print(f"\nBefore (embed-only) -> After (hybrid): {before:.0%} -> {after:.0%}  "
-          f"({'+' if delta >= 0 else ''}{delta:.0%})")
-
-    print("\nPer-question detail (which failures were fixed, which weren't):")
-    for mode in ("embed", "hybrid"):
-        print(f"\n  [{mode}]")
-        for question, hit in results_by_mode[mode][1]:
-            print(f"    {'✓' if hit else '✗'} {question}")
-
-    # Explicitly call out anything hybrid still doesn't fix, so it doesn't
-    # get lost in the aggregate recall number.
-    still_failing = [
-        q for (q, hit_e), (_, hit_h) in
-        zip(results_by_mode["embed"][1], results_by_mode["hybrid"][1])
-        if not hit_h
+    stages = [
+        "tfidf",
+        "bm25-qdrant-blend",
+        "bm25-qdrant-rrf",
+        "rrf-rerank",
+        "rrf-rerank-rewrite",
     ]
-    if still_failing:
-        print("\nStill NOT retrieving the right doc after hybrid "
-              "(these are not retrieval fixes — look at generation, or the "
-              "chunking/section boundaries for these docs):")
-        for q in still_failing:
-            print(f"    ✗ {q}")
+
+    results_by_mode = {}
+    print(f"\n{'STAGE / STRATEGY':32s} {'HIT-RATE@' + str(TOP_K):14s} {'MRR':10s}")
+    print("-" * 58)
+
+    for stage in stages:
+        res = evaluate_preset(store, questions, TOP_K, stage)
+        results_by_mode[stage] = res
+        hr = res["hit_rate"]
+        mrr = res["mrr"]
+        hits = res["hits"]
+        total = res["total"]
+        print(f"{stage:32s} {hr:6.0%} ({hits}/{total})      {mrr:.4f}")
+
+    baseline = results_by_mode.get("tfidf", {}).get("hit_rate", 0.0)
+    final = results_by_mode.get("rrf-rerank-rewrite", {}).get("hit_rate", 0.0)
+    delta = final - baseline
+    print(f"\nBaseline (TF-IDF) -> Full Pipeline (Rewrite+RRF+Rerank): {baseline:.0%} -> {final:.0%} ({'+' if delta >= 0 else ''}{delta:.0%})")
+
+    print("\nPer-question breakdown (Final Pipeline):")
+    for r in results_by_mode.get("rrf-rerank-rewrite", {}).get("results", []):
+        mark = "✓" if r["hit"] else "✗"
+        rank_str = f" (rank #{r['rank']})" if r["hit"] else ""
+        print(f"  {mark} {r['question']}{rank_str}")
 
 
 if __name__ == "__main__":
