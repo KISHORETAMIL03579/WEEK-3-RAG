@@ -16,6 +16,18 @@
 <body>
   <div id="root"></div>
 
+  <!-- doc_id/filename/ext come from serve_file() in app.py via render_template().
+       view.js reads window.DOC_ID as its fallback when the URL has no
+       ?doc_id= query param — which it never does, since the Flask route
+       is /file/<doc_id> (a path segment), not a query string. Without
+       this block, view.js always saw an empty doc_id and showed
+       "No document ID specified." regardless of which document was opened. -->
+  <script>
+    window.DOC_ID = {{ doc_id | tojson }};
+    window.DOC_FILENAME = {{ filename | tojson }};
+    window.DOC_EXT = {{ ext | tojson }};
+  </script>
+
   <!-- React 18 Document Viewer Application Bundle -->
   <script type="text/babel" src="/static/js/view.js"></script>
 </body>

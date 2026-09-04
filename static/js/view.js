@@ -2,11 +2,11 @@ const { useState, useEffect, useRef } = React;
 
 function DocViewerApp() {
   const [docId, setDocId] = useState('');
-  const [filename, setFilename] = useState('');
+  const [filename, setFilename] = useState(window.DOC_FILENAME || '');
   const [pages, setPages] = useState([]);
   const [curPage, setCurPage] = useState(1);
   const [zoom, setZoom] = useState(1);
-  const [ext, setExt] = useState('pdf');
+  const [ext, setExt] = useState(window.DOC_EXT || 'pdf');
   const [searchQuery, setSearchQuery] = useState('');
   const [highlightQuery, setHighlightQuery] = useState('');
   const [searchCount, setSearchCount] = useState('');
@@ -77,9 +77,29 @@ function DocViewerApp() {
 
   const highlightText = (text, query) => {
     if (!query) return text;
-    const parts = text.split(new RegExp(`(${query.replace(/[.*+?^${}()|[\]\\]/g, '\\$&')})`, 'gi'));
+    const trimmed = query.trim();
+    if (!trimmed) return text;
+    const escaped = trimmed.replace(/[.*+?^${}()|[\]\\]/g, '\\$&');
+    // Chunk text is whitespace-normalized during ingestion (newlines and
+    // repeated spaces collapsed to single spaces), but this raw page text
+    // keeps its original line breaks — so a highlight snippet built from
+    // chunk text would otherwise never match here at all. Treat any run
+    // of literal spaces in the query as "any run of whitespace" so it
+    // still finds its original (non-normalized) location on the page.
+    const flexible = escaped.replace(/ +/g, '\\s+');
+    let regex;
+    try {
+      regex = new RegExp(`(${flexible})`, 'gi');
+    } catch {
+      return text;
+    }
+    const parts = text.split(regex);
+    // With exactly one capturing group, String.split places the matched
+    // text at every odd index and surrounding non-matches at every even
+    // index — reliable regardless of what the (whitespace-flexible) match
+    // actually looked like, unlike comparing part === query by value.
     return parts.map((part, i) =>
-      part.toLowerCase() === query.toLowerCase() ? (
+      i % 2 === 1 ? (
         <mark key={i} style={{ background: 'var(--hl)', borderRadius: '2px', padding: '0 2px' }}>
           {part}
         </mark>
@@ -170,18 +190,39 @@ function DocViewerApp() {
         )}
 
         {!loading && !error && isPdf && (
-          <embed
-            type="application/pdf"
-            src={`/file/${docId}/raw`}
-            style={{
-              width: `${100 / zoom}%`,
-              height: '100%',
-              border: '1px solid var(--border)',
-              borderRadius: 'var(--radius-md)',
-              transform: `scale(${zoom})`,
-              transformOrigin: 'top center'
-            }}
-          />
+          <div style={{ width: '100%', maxWidth: '900px', display: 'flex', flexDirection: 'column', gap: '10px' }}>
+            {highlightQuery && (
+              <div style={{
+                background: 'var(--accent-glow)', border: '1px solid var(--accent)',
+                borderRadius: 'var(--radius-md)', padding: '10px 16px', fontSize: '0.8rem',
+                color: 'var(--text-primary)', lineHeight: 1.5,
+              }}>
+                {/* A plain <embed> for a PDF hands rendering straight to the
+                    browser's own native PDF plugin — there's no API for us
+                    to inject a highlight into that renderer's page content.
+                    We CAN still jump to the right page (via the #page=N
+                    fragment below); for finding the exact passage on that
+                    page, showing what to look for is the honest fallback,
+                    rather than silently doing nothing and looking broken. */}
+                🔍 Looking for this passage (use your browser's Find, Ctrl/Cmd+F, if it's not immediately visible):
+                <div style={{ marginTop: '4px', fontFamily: 'var(--mono)', fontSize: '0.76rem', color: 'var(--text-secondary)' }}>
+                  "{highlightQuery}"
+                </div>
+              </div>
+            )}
+            <embed
+              type="application/pdf"
+              src={`/file/${docId}/raw#page=${curPage}`}
+              style={{
+                width: `${100 / zoom}%`,
+                height: '80vh',
+                border: '1px solid var(--border)',
+                borderRadius: 'var(--radius-md)',
+                transform: `scale(${zoom})`,
+                transformOrigin: 'top center'
+              }}
+            />
+          </div>
         )}
 
         {!loading && !error && !isPdf && currentPageData && (
@@ -215,4 +256,3 @@ function DocViewerApp() {
 
 const root = ReactDOM.createRoot(document.getElementById('root'));
 root.render(<DocViewerApp />);
-

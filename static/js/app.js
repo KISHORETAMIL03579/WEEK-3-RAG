@@ -40,6 +40,68 @@ const api = {
   }
 };
 
+/* ── Source Card Component ─────────────────────────────────────
+   Renders one grounded source: numbered badge, filename, page/section
+   badges, score, an Open link that deep-links to the exact page with the
+   matching text highlighted, and a collapsible excerpt of the actual
+   retrieved chunk text. */
+function SourceItem({ src, index }) {
+  const [expanded, setExpanded] = useState(false);
+  const scorePct = Math.max(0, Math.min(100, Math.round((src.score || 0) * 100)));
+  const scoreClass = scorePct >= 80 ? 'score-high' : scorePct >= 60 ? 'score-mid' : 'score-low';
+
+  const openHref = (() => {
+    const params = new URLSearchParams();
+    if (src.page) params.set('page', src.page);
+    // Highlighting on the viewer page does an exact-phrase match against
+    // that page's raw extracted text. The user's raw question ("work from
+    // home means?") almost never appears verbatim in the document, so it
+    // would never actually highlight anything — a short leading snippet
+    // of the retrieved chunk's OWN text is what was actually pulled from
+    // that page, so it's what's actually findable there.
+    const snippet = (src.text || '').trim().slice(0, 100);
+    if (snippet) params.set('hl', snippet);
+    const qs = params.toString();
+    return `/file/${src.doc_id}${qs ? `?${qs}` : ''}`;
+  })();
+
+  return (
+    <div className="source-item">
+      <div className="source-item-row">
+        <span className="source-badge">[{index + 1}]</span>
+        <span className="source-filename">📄 {src.filename}</span>
+        {src.page != null && <span className="source-tag">p. {src.page}</span>}
+        {src.section && <span className="source-tag">{src.section}</span>}
+        <span className={`source-score ${scoreClass}`}>Score: {scorePct}%</span>
+        <span className="source-item-spacer" />
+        {src.openable && (
+          <a href={openHref} target="_blank" rel="noopener noreferrer" className="doc-open">
+            Open ↗
+          </a>
+        )}
+        {src.text && (
+          <button
+            type="button"
+            className="view-content-toggle"
+            onClick={() => setExpanded((v) => !v)}
+          >
+            {expanded ? '▲ Hide' : '▼ View Content'}
+          </button>
+        )}
+      </div>
+      {expanded && src.text && (
+        <div className="source-excerpt-wrap">
+          <div className="source-excerpt-label">
+            📄 DOCUMENT EXCERPT [{index + 1}]
+            {src.method && <span className="source-excerpt-strategy"> · STRATEGY: {src.method.toUpperCase()}</span>}
+          </div>
+          <div className="source-excerpt">{src.text}</div>
+        </div>
+      )}
+    </div>
+  );
+}
+
 /* ── Topbar Component ──────────────────────────────────────── */
 function Topbar({ backendMode, docsCount, retrievalMode }) {
   return (
@@ -388,16 +450,9 @@ function ChatArea({ messages, onSend, isThinking, filesCount, selectedFilesCount
                 <div>{m.text}</div>
                 {m.sources && m.sources.length > 0 && (
                   <div className="sources-card">
-                    <div className="sources-header">Sources ({m.sources.length})</div>
+                    <div className="sources-header">📄 GROUNDED SOURCES ({m.sources.length})</div>
                     {m.sources.map((src, i) => (
-                      <div key={i} style={{ fontSize: '0.78rem', marginTop: '6px', display: 'flex', justifyContent: 'space-between', alignItems: 'center' }}>
-                        <span>📄 {src.filename} (Score: {(src.score * 100).toFixed(0)}%)</span>
-                        {src.openable && (
-                          <a href={`/file/${src.doc_id}`} target="_blank" rel="noopener noreferrer" className="doc-open">
-                            Open ↗
-                          </a>
-                        )}
-                      </div>
+                      <SourceItem key={i} src={src} index={i} />
                     ))}
                   </div>
                 )}
@@ -472,6 +527,26 @@ function App() {
       if (res.ok) {
         setSelectedFiles([]);
         await fetchStatus();
+        // res.ok only means the /upload REQUEST itself succeeded — each
+        // file in res.documents can still have its own per-file "error"
+        // (failed to index entirely) or "warning" (indexed, but degraded —
+        // e.g. embeddings failed so it's keyword-search-only). Previously
+        // neither was ever surfaced: a partially-failed multi-file upload
+        // looked identical to a fully successful one.
+        const failed = (res.documents || []).filter((d) => d.error);
+        const degraded = (res.documents || []).filter((d) => d.warning);
+        if (failed.length > 0) {
+          alert(
+            `${failed.length} file(s) failed to index:\n` +
+            failed.map((d) => `• ${d.filename}: ${d.error}`).join('\n')
+          );
+        }
+        if (degraded.length > 0) {
+          alert(
+            `${degraded.length} file(s) indexed with reduced functionality:\n` +
+            degraded.map((d) => `• ${d.filename}: ${d.warning}`).join('\n')
+          );
+        }
       } else {
         alert(res.error || 'Upload failed');
       }
@@ -512,7 +587,8 @@ function App() {
       const aiMsg = {
         role: 'ai',
         text: res.answer || "I don't know.",
-        sources: res.sources || []
+        sources: res.sources || [],
+        query,
       };
       setMessages((prev) => [...prev, aiMsg]);
     } catch (err) {

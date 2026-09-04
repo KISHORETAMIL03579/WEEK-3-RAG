@@ -201,16 +201,61 @@ GEMINI_VISION_MODEL = os.environ.get("GEMINI_VISION_MODEL", "gemini-3.7-flash")
 # xAI does not currently offer a public embeddings API, so embeddings have
 # nowhere else to go without also swapping the vector store's dimensionality.
 
-# ── xAI (Grok) config — chat/generation only ────────────────────────────
+# ── Embeddings backend selector ─────────────────────────────────────────
+# "gemini" = Gemini's batchEmbedContents API — free tier has a real
+# requests-per-minute quota, which is exactly what "HTTP 429 Too Many
+# Requests" during a big upload means: not a bug, just the free-tier
+# throughput ceiling for a 300+ chunk document going out in rapid batches.
+# "ollama" (default here) = a locally-running Ollama server — no API
+# key, no rate limit, no per-token cost, since it's your own machine
+# doing the inference. Requires `ollama serve` running and the model
+# pulled first:
+#   ollama pull nomic-embed-text
+# Switching AFTER you've already indexed documents under the other
+# backend requires clearing and re-uploading — the two backends produce
+# different-dimension vectors (Gemini: 3072-dim, nomic-embed-text:
+# 768-dim) that live in incompatible vector spaces; Qdrant infers its
+# collection's dimension from whichever vectors arrive first.
+EMBED_BACKEND = os.environ.get("EMBED_BACKEND", "ollama")  # "gemini" | "ollama"
+OLLAMA_URL = os.environ.get("OLLAMA_URL", "http://localhost:11434")
+OLLAMA_EMBED_MODEL = os.environ.get("OLLAMA_EMBED_MODEL", "nomic-embed-text")
+
+# ── Vision OCR (image uploads) backend selector ──────────────────────────
+# "gemini" uses GEMINI_API_KEY + GEMINI_VISION_MODEL above. "ollama"
+# (default here) uses a local vision-capable Ollama model instead — same
+# no-key, no-rate-limit, runs-on-your-machine tradeoff as embeddings.
+#   ollama pull llava             (7B, solid general-purpose default)
+#   ollama pull moondream         (1.8B, much lighter/faster, less accurate)
+#   ollama pull llama3.2-vision   (stronger OCR/chart reading, needs more RAM)
+# Local vision models are noticeably weaker at dense-text OCR than
+# Gemini's — expect more missed/garbled text on small print or busy
+# scans. Worth checking output quality on a real image before relying on it.
+VISION_BACKEND = os.environ.get("VISION_BACKEND", "ollama")  # "gemini" | "ollama"
+OLLAMA_VISION_MODEL = os.environ.get("OLLAMA_VISION_MODEL", "llava")
+
+# ── xAI (Grok) config — used for chat/generation when CHAT_BACKEND=xai ──
 XAI_API_KEY = os.environ.get("XAI_API_KEY", "")
 XAI_URL = os.environ.get("XAI_URL", "https://api.x.ai/v1")
 XAI_MODEL = os.environ.get("XAI_MODEL", "grok-4.3")
 
+# ── Chat / generation backend selector ───────────────────────────────────
+# "xai" = xAI's Grok models via the cloud API (needs XAI_API_KEY, costs
+# per token, but noticeably stronger at grounded citation-following and
+# staying strictly within the retrieved excerpts). "ollama" = a fully
+# local chat model instead — no API key, no cost, nothing leaves your
+# machine, but a locally-runnable model is meaningfully weaker at
+# instruction-following (expect looser citation discipline and more
+# hallucination) and can be much slower without a real GPU.
+#   ollama pull llama3.1     (8B, solid general default)
+#   ollama pull qwen2.5      (good instruction-following for its size)
+#   ollama pull mistral      (7B, fast, lighter weight)
+CHAT_BACKEND = os.environ.get("CHAT_BACKEND", "ollama")  # "xai" | "ollama"
+OLLAMA_CHAT_MODEL = os.environ.get("OLLAMA_CHAT_MODEL", "llama3.1")
+
 # LLM_MODEL is kept as the generic "which chat model is answering right
 # now" name used everywhere else in this file (trace logs, RAGTracer,
-# /status) — it now just mirrors XAI_MODEL so none of those call sites
-# needed to change.
-LLM_MODEL = XAI_MODEL
+# /status) — it now follows whichever CHAT_BACKEND is active.
+LLM_MODEL = OLLAMA_CHAT_MODEL if CHAT_BACKEND == "ollama" else XAI_MODEL
 EMBED_MIN_SCORE = float(os.environ.get("EMBED_MIN_SCORE", "0.55"))  # recalibrated
 # for reciprocal_rank_fusion()'s normalized scale (see RRF_K comment) —
 # NOT comparable to the old weighted-average blend's raw-cosine scale.
@@ -373,6 +418,77 @@ def _xai_chat_call(system: str, user: str,
             raise
 
 
+def _ollama_chat_call(system: str, user: str,
+                      temperature: float = 0,
+                      max_tokens: int | None = None) -> str:
+    """Call a locally-running Ollama chat model via its native /api/chat
+    endpoint. No API key, no rate limit, no per-token cost — but a
+    locally-runnable model is meaningfully weaker at grounded
+    citation-following than a frontier cloud model; expect looser
+    instruction adherence. Same (system, user, temperature, max_tokens)
+    -> str signature as _xai_chat_call so callers don't need to care
+    which backend is actually running."""
+    url = f"{OLLAMA_URL}/api/chat"
+    options: dict = {"temperature": temperature}
+    if max_tokens is not None:
+        options["num_predict"] = max_tokens
+    payload = {
+        "model": OLLAMA_CHAT_MODEL,
+        "messages": [
+            {"role": "system", "content": system},
+            {"role": "user", "content": user},
+        ],
+        "stream": False,
+        "options": options,
+    }
+    try:
+        t0 = time.time()
+        req = urllib.request.Request(
+            url,
+            data=json.dumps(payload).encode("utf-8"),
+            headers={"Content-Type": "application/json"},
+            method="POST",
+        )
+        with urllib.request.urlopen(req, timeout=180) as resp:
+            data = json.loads(resp.read().decode("utf-8"))
+        elapsed = time.time() - t0
+        result_text = (data.get("message", {}).get("content") or "").strip()
+        logger.info("🤖 Ollama (%s) LLM call succeeded in %.2fs", OLLAMA_CHAT_MODEL, elapsed)
+        return result_text
+    except urllib.error.URLError as exc:
+        logger.error(
+            "❌ Could not reach Ollama at %s — is `ollama serve` running and "
+            "`%s` pulled? (%s)", OLLAMA_URL, OLLAMA_CHAT_MODEL, exc,
+        )
+        raise
+    except Exception as exc:
+        logger.error("❌ Ollama LLM call exception: %s", exc, exc_info=True)
+        raise
+
+
+def _chat_call(system: str, user: str,
+               temperature: float = 0,
+               max_tokens: int | None = None) -> str:
+    """Single entry point for every chat/generation call in this file —
+    routes to xAI or a local Ollama model per CHAT_BACKEND. generate_answer,
+    rerank_with_llm, rewrite_query, and the /replay endpoint all go through
+    this instead of calling _xai_chat_call/_ollama_chat_call directly, so
+    CHAT_BACKEND is the only place that decision gets made."""
+    if CHAT_BACKEND == "ollama":
+        return _ollama_chat_call(system, user, temperature=temperature, max_tokens=max_tokens)
+    return _xai_chat_call(system, user, temperature=temperature, max_tokens=max_tokens)
+
+
+def _chat_configured() -> bool:
+    """True if the selected chat backend is actually usable right now:
+    CHAT_BACKEND=ollama needs no key (a local server is assumed reachable;
+    a connection failure surfaces at call time rather than being
+    pre-checked here); CHAT_BACKEND=xai needs XAI_API_KEY."""
+    if CHAT_BACKEND == "ollama":
+        return True
+    return bool(XAI_API_KEY)
+
+
 def _gemini_embed_batch(texts: list[str]) -> list[list[float]]:
     """Embed a batch of texts via Gemini batchEmbedContents API with automatic backoff on HTTP 429/503."""
     url = f"{GEMINI_URL}/models/{EMBED_MODEL}:batchEmbedContents?key={GEMINI_API_KEY}"
@@ -419,22 +535,70 @@ def _gemini_embed_batch(texts: list[str]) -> list[list[float]]:
             raise
 
 
+def _ollama_embed_batch(texts: list[str]) -> list[list[float]]:
+    """Embed a batch of texts via a locally-running Ollama server's
+    native /api/embed endpoint. No API key, no rate limit, no per-token
+    cost — it's your own machine doing the inference. Requires
+    `ollama serve` running and the embedding model already pulled
+    (`ollama pull nomic-embed-text`)."""
+    url = f"{OLLAMA_URL}/api/embed"
+    payload = {"model": OLLAMA_EMBED_MODEL, "input": texts}
+    try:
+        t0 = time.time()
+        req = urllib.request.Request(
+            url,
+            data=json.dumps(payload).encode("utf-8"),
+            headers={"Content-Type": "application/json"},
+            method="POST",
+        )
+        with urllib.request.urlopen(req, timeout=120) as resp:
+            data = json.loads(resp.read().decode("utf-8"))
+        elapsed = time.time() - t0
+        vectors = data.get("embeddings", [])
+        logger.info("🧠 Ollama embedding batch of %d chunks succeeded in %.2fs (vector dim: %d, model: %s)",
+                    len(texts), elapsed, len(vectors[0]) if vectors else 0, OLLAMA_EMBED_MODEL)
+        return vectors
+    except urllib.error.URLError as exc:
+        logger.error(
+            "❌ Could not reach Ollama at %s — is `ollama serve` running and "
+            "`%s` pulled? (%s)", OLLAMA_URL, OLLAMA_EMBED_MODEL, exc,
+        )
+        raise
+    except Exception as exc:
+        logger.error("❌ Ollama embedding batch exception: %s", exc, exc_info=True)
+        raise
+
+
 def embed_texts(texts: list[str]) -> list[list[float]]:
-    """Batch-embed texts via Gemini API at full network speed."""
+    """Batch-embed texts via whichever backend EMBED_BACKEND selects
+    (Gemini API or a local Ollama server)."""
     out: list[list[float]] = []
     total_batches = math.ceil(len(texts) / EMBED_BATCH)
-    logger.info("🧠 Starting batch embedding for %d total chunks (%d batch(es) of max %d)",
-                len(texts), total_batches, EMBED_BATCH)
+    backend_label = "Ollama (local)" if EMBED_BACKEND == "ollama" else "Gemini"
+    logger.info("🧠 Starting batch embedding for %d total chunks (%d batch(es) of max %d) via %s",
+                len(texts), total_batches, EMBED_BATCH, backend_label)
     for idx, i in enumerate(range(0, len(texts), EMBED_BATCH), start=1):
         batch = texts[i:i + EMBED_BATCH]
         logger.info("🧠 Processing embedding batch %d/%d (%d chunks)...", idx, total_batches, len(batch))
-        vectors = _gemini_embed_batch(batch)
+        vectors = (_ollama_embed_batch(batch) if EMBED_BACKEND == "ollama"
+                   else _gemini_embed_batch(batch))
         out.extend(vectors)
     return out
 
 
 def embed_text(text: str) -> list[float]:
     return embed_texts([text])[0]
+
+
+def _embeddings_configured() -> bool:
+    """True if the selected embeddings backend is actually usable right
+    now: EMBED_BACKEND=ollama needs no key at all (a local server is
+    assumed reachable — a connection failure surfaces at embed time
+    instead of being pre-checked here, to avoid an extra network round
+    trip on every call site); EMBED_BACKEND=gemini needs GEMINI_API_KEY."""
+    if EMBED_BACKEND == "ollama":
+        return True
+    return bool(GEMINI_API_KEY)
 
 
 # ─────────────────────────────────────────────────────────────────────────────
@@ -724,8 +888,71 @@ def extract_txt_pages(filepath: str) -> list[dict]:
     return [{"page": i + 1, "text": s} for i, s in enumerate(sections)]
 
 
+_OCR_PROMPT = (
+    "Extract all text, table content, diagram descriptions, titles, bullet points, "
+    "and key information from this image into clean, structured Markdown text."
+)
+
+
+def _gemini_vision_ocr(img_b64: str, mime_type: str, filename: str) -> str:
+    """Vision OCR via Gemini's generateContent API (multimodal inline_data)."""
+    url = f"{GEMINI_URL}/models/{GEMINI_VISION_MODEL}:generateContent?key={GEMINI_API_KEY}"
+    payload = {
+        "contents": [
+            {
+                "role": "user",
+                "parts": [
+                    {"inline_data": {"mime_type": mime_type, "data": img_b64}},
+                    {"text": _OCR_PROMPT},
+                ]
+            }
+        ],
+        "generationConfig": {"temperature": 0}
+    }
+    req = urllib.request.Request(
+        url,
+        data=json.dumps(payload).encode("utf-8"),
+        headers={"Content-Type": "application/json"},
+        method="POST"
+    )
+    with urllib.request.urlopen(req, timeout=90) as resp:
+        data = json.loads(resp.read().decode("utf-8"))
+    extracted_text = data["candidates"][0]["content"]["parts"][0]["text"].strip()
+    logger.info("🖼️ Gemini Vision OCR extracted %d characters from image %s", len(extracted_text), filename)
+    return extracted_text
+
+
+def _ollama_vision_ocr(img_b64: str, filename: str) -> str:
+    """Vision OCR via a locally-running Ollama vision model (llava/moondream/
+    llama3.2-vision/etc.) using the native /api/generate endpoint's
+    `images` field. No API key, no rate limit, runs on your own machine.
+    Expect noticeably weaker dense-text OCR than Gemini's — worth
+    checking output quality on a real scan before relying on it."""
+    url = f"{OLLAMA_URL}/api/generate"
+    payload = {
+        "model": OLLAMA_VISION_MODEL,
+        "prompt": _OCR_PROMPT,
+        "images": [img_b64],
+        "stream": False,
+        "options": {"temperature": 0},
+    }
+    req = urllib.request.Request(
+        url,
+        data=json.dumps(payload).encode("utf-8"),
+        headers={"Content-Type": "application/json"},
+        method="POST"
+    )
+    with urllib.request.urlopen(req, timeout=180) as resp:
+        data = json.loads(resp.read().decode("utf-8"))
+    extracted_text = (data.get("response") or "").strip()
+    logger.info("🖼️ Ollama (%s) Vision OCR extracted %d characters from image %s",
+                OLLAMA_VISION_MODEL, len(extracted_text), filename)
+    return extracted_text
+
+
 def extract_image_pages(filepath: str) -> list[dict]:
-    """Extract text and visual content from images using Gemini Vision API OCR."""
+    """Extract text and visual content from images via Vision OCR — Gemini
+    or a local Ollama vision model, per VISION_BACKEND."""
     ext = filepath.rsplit(".", 1)[-1].lower()
     mime_type = {
         "png": "image/png",
@@ -738,7 +965,8 @@ def extract_image_pages(filepath: str) -> list[dict]:
     }.get(ext, "image/jpeg")
 
     filename = Path(filepath).name
-    if not GEMINI_API_KEY:
+
+    if VISION_BACKEND == "gemini" and not GEMINI_API_KEY:
         logger.warning("⚠️ Gemini API Key missing for Image Vision OCR: %s", filename)
         return [{"page": 1, "text": f"Document Image: {filename}\nNote: Configure GEMINI_API_KEY to enable full Vision OCR extraction."}]
 
@@ -746,44 +974,15 @@ def extract_image_pages(filepath: str) -> list[dict]:
         with open(filepath, "rb") as img_file:
             img_b64 = base64.b64encode(img_file.read()).decode("utf-8")
 
-        url = f"{GEMINI_URL}/models/{GEMINI_VISION_MODEL}:generateContent?key={GEMINI_API_KEY}"
-        payload = {
-            "contents": [
-                {
-                    "role": "user",
-                    "parts": [
-                        {
-                            "inline_data": {
-                                "mime_type": mime_type,
-                                "data": img_b64
-                            }
-                        },
-                        {
-                            "text": (
-                                "Extract all text, table content, diagram descriptions, titles, bullet points, "
-                                "and key information from this image into clean, structured Markdown text."
-                            )
-                        }
-                    ]
-                }
-            ],
-            "generationConfig": {"temperature": 0}
-        }
+        if VISION_BACKEND == "ollama":
+            extracted_text = _ollama_vision_ocr(img_b64, filename)
+        else:
+            extracted_text = _gemini_vision_ocr(img_b64, mime_type, filename)
 
-        req = urllib.request.Request(
-            url,
-            data=json.dumps(payload).encode("utf-8"),
-            headers={"Content-Type": "application/json"},
-            method="POST"
-        )
-        with urllib.request.urlopen(req, timeout=90) as resp:
-            data = json.loads(resp.read().decode("utf-8"))
-        
-        extracted_text = data["candidates"][0]["content"]["parts"][0]["text"].strip()
-        logger.info("🖼️ Gemini Vision OCR extracted %d characters from image %s", len(extracted_text), filename)
         return [{"page": 1, "text": f"# Image OCR Content: {filename}\n\n{extracted_text}"}]
     except Exception as exc:
-        logger.error("❌ Gemini Vision OCR failed for %s: %s", filename, exc, exc_info=True)
+        backend_label = "Ollama" if VISION_BACKEND == "ollama" else "Gemini"
+        logger.error("❌ %s Vision OCR failed for %s: %s", backend_label, filename, exc, exc_info=True)
         return [{"page": 1, "text": f"Image Document: {filename}\n(Error during image text extraction)"}]
 
 
@@ -1817,7 +2016,7 @@ def rerank_with_llm(query: str, results: list[dict]) -> tuple[list[dict], float 
     to the token-overlap check in that case) rather than breaking
     retrieval.
     """
-    if not results or not XAI_API_KEY:
+    if not results or not _chat_configured():
         return results, None
 
     candidates = results[:RERANK_TOP_N]
@@ -1834,7 +2033,7 @@ def rerank_with_llm(query: str, results: list[dict]) -> tuple[list[dict], float 
     )
     user = f"Question: {query}\n\nCandidates:\n{numbered}"
     try:
-        raw = _xai_chat_call(system, user, temperature=0, max_tokens=300)
+        raw = _chat_call(system, user, temperature=0, max_tokens=300)
         raw = re.sub(r"^```(?:json)?|```$", "", raw, flags=re.MULTILINE).strip()
         scored = json.loads(raw)
         indices = sorted(item["index"] for item in scored)
@@ -1867,7 +2066,7 @@ def rewrite_query(query: str) -> str:
 
     Fails open: returns the original query unchanged on any error.
     """
-    if not query.strip() or not XAI_API_KEY:
+    if not query.strip() or not _chat_configured():
         return query
     system = (
         "Rewrite the user's question into a short, keyword-rich search "
@@ -1877,7 +2076,7 @@ def rewrite_query(query: str) -> str:
         "the rewritten query, nothing else."
     )
     try:
-        rewritten = _xai_chat_call(system, query, temperature=0, max_tokens=60).strip('"')
+        rewritten = _chat_call(system, query, temperature=0, max_tokens=60).strip('"')
         return rewritten if rewritten else query
     except Exception:
         logger.warning("Query rewriting failed — using the original question as-is.",
@@ -1903,7 +2102,7 @@ def generate_answer(query: str, results: list[dict]) -> str:
     user = build_qa_user_prompt(query, results)
 
     try:
-        return _xai_chat_call(system, user, temperature=0)
+        return _chat_call(system, user, temperature=0)
     except Exception:
         return ""
 
@@ -1983,7 +2182,7 @@ def upload():
     logger.info("📤 Upload request received: %d file(s) (chunk_mode: %s, session: %s)",
                 len(files), chunk_mode, sid[:8])
     hashes = HASH_STORE.setdefault(sid, set())
-    embedding_ok = bool(GEMINI_API_KEY)
+    embedding_ok = _embeddings_configured()
     results = []
     pending: list[dict] = []
 
@@ -2101,8 +2300,28 @@ def upload():
             logger.warning("🚫 Upload cancelled by client for upload_id %s", upload_id)
             continue
         try:
+            embedding_degraded = False
             if embedding_ok:
-                vectors = embed_texts([c["text"] for c in item["chunks"]])
+                try:
+                    vectors = embed_texts([c["text"] for c in item["chunks"]])
+                except Exception as embed_exc:
+                    # EMBED_BACKEND being *configured* (embedding_ok=True)
+                    # doesn't mean the embedding call will actually succeed
+                    # — e.g. EMBED_BACKEND=ollama with no local `ollama
+                    # serve` running. Previously this fell all the way
+                    # through to the outer except below and failed the
+                    # WHOLE document with no indexing at all. Degrade
+                    # gracefully instead: index this document without
+                    # vectors (BM25/TF-IDF keyword search still works for
+                    # it) and surface the degradation to the caller rather
+                    # than silently losing the upload.
+                    logger.warning(
+                        "⚠️ Embedding failed for '%s', indexing without vectors "
+                        "(keyword search only for this document): %s",
+                        item["filename"], embed_exc,
+                    )
+                    vectors = []
+                    embedding_degraded = True
             else:
                 vectors = []
             store.add(item["chunks"], vectors)
@@ -2122,6 +2341,12 @@ def upload():
 
             item["result"]["doc_id"] = item["doc_id"]
             item["result"]["openable"] = True
+            if embedding_degraded:
+                item["result"]["warning"] = (
+                    "Indexed with keyword search only — embeddings failed "
+                    "(check EMBED_BACKEND config / Ollama server). Semantic "
+                    "search won't work for this document until re-uploaded."
+                )
             results.append(item["result"])
             committed_doc_ids.append(item["doc_id"])
             RAGTracer.trace("INGESTION", 5, 5, "Store Commit Completed", {
@@ -2184,7 +2409,7 @@ def load_url():
     if parsed.scheme not in ("http", "https") or not parsed.netloc:
         return jsonify({"error": "URL must start with http:// or https://"}), 400
 
-    embedding_ok = bool(GEMINI_API_KEY)
+    embedding_ok = _embeddings_configured()
 
     try:
         title, text = fetch_web_page(url)
@@ -2395,12 +2620,15 @@ def ask():
             })
 
     # Path 1: embeddings + LLM (if configured and vectors exist)
-    # Path 1 needs BOTH: GEMINI_API_KEY for embeddings-based retrieval and
-    # XAI_API_KEY for the actual answer generation. Gating on only one
-    # meant a missing XAI_API_KEY still ran full retrieval before failing
-    # inside generate_answer() and falling back to TF-IDF anyway — correct
-    # but wasteful. Checking both up front skips straight to Path 2.
-    if GEMINI_API_KEY and XAI_API_KEY and active_store.vectors and len(active_store.vectors) == len(active_store.chunks):
+    # Path 1 needs BOTH: a working embeddings backend (Gemini w/ key, or a
+    # local Ollama server — see _embeddings_configured()) for retrieval,
+    # and a working chat backend (xAI w/ key, or local Ollama — see
+    # _chat_configured()) for the actual answer generation. Gating on
+    # only one meant a missing/misconfigured chat backend still ran full
+    # retrieval before failing inside generate_answer() and falling back
+    # to TF-IDF anyway — correct but wasteful. Checking both up front
+    # skips straight to Path 2.
+    if _embeddings_configured() and _chat_configured() and active_store.vectors and len(active_store.vectors) == len(active_store.chunks):
         try:
             if RETRIEVAL_MODE == "hybrid-legacy":
                 raw_results = hybrid_search(active_store, search_query, top_k=TOP_K)
@@ -2482,7 +2710,7 @@ def ask():
         except urllib.error.HTTPError as exc:
             reason = {
                 400: "Bad request — check your API key format and model name.",
-                401: "Invalid or expired API key — check GEMINI_API_KEY (embeddings) and XAI_API_KEY (chat).",
+                401: "Invalid or expired API key — check GEMINI_API_KEY (if EMBED_BACKEND/VISION_BACKEND=gemini) and XAI_API_KEY (if CHAT_BACKEND=xai).",
                 403: "Access forbidden — verify your Gemini API key has the required permissions.",
                 429: "Rate limited by Gemini API — too many requests too quickly.",
             }.get(exc.code, f"Unexpected HTTP {exc.code} from Gemini API.")
@@ -2609,7 +2837,7 @@ def replay_trace(trace_id):
     user_prompt = build_qa_user_prompt(record["question"], results_for_prompt)
 
     try:
-        replayed_raw = _xai_chat_call(prompt_text, user_prompt, temperature=record.get("temperature") or 0)
+        replayed_raw = _chat_call(prompt_text, user_prompt, temperature=record.get("temperature") or 0)
         replay_error = None
     except Exception as exc:
         replayed_raw = None
@@ -2819,7 +3047,7 @@ def _retrieve_for_eval(active_store, query: str, k: int, mode: str, force_tfidf:
     baseline against a document that DOES have embeddings, rather than
     only ever being available when no API key exists at all.
     """
-    has_embeddings = (GEMINI_API_KEY and active_store.vectors
+    has_embeddings = (_embeddings_configured() and active_store.vectors
                       and len(active_store.vectors) == len(active_store.chunks))
     if has_embeddings and not force_tfidf:
         if mode == "hybrid-legacy":
@@ -2974,9 +3202,11 @@ def healthz():
     """
     return jsonify({
         "status": "ok",
-        "embeddings_configured": bool(GEMINI_API_KEY),
-        "chat_configured": bool(XAI_API_KEY),
-        "retrieval_mode": RETRIEVAL_MODE if GEMINI_API_KEY else "tfidf-only",
+        "embeddings_configured": _embeddings_configured(),
+        "chat_configured": _chat_configured(),
+        "chat_backend": CHAT_BACKEND,
+        "embeddings_backend": EMBED_BACKEND,
+        "retrieval_mode": RETRIEVAL_MODE if _embeddings_configured() else "tfidf-only",
         "vector_backend": VECTOR_BACKEND,
         "active_sessions": len(SESSION_ACCESS),
     })
@@ -3005,7 +3235,7 @@ def status():
         "total_chunks": len(chunks),
         "documents": list(docs_seen.values()),
         "methods": sorted({c["method"] for c in chunks}),
-        "mode": (RETRIEVAL_MODE if GEMINI_API_KEY else "tfidf-only"),
+        "mode": (RETRIEVAL_MODE if _embeddings_configured() else "tfidf-only"),
         "vector_backend": VECTOR_BACKEND,
     })
 
@@ -3028,7 +3258,9 @@ if __name__ == "__main__":
     # unless you actually want this reachable from your whole network.
     host = os.environ.get("HOST", "127.0.0.1")
     debug = os.environ.get("APP_DEBUG", "").lower() in ("1", "true", "yes")
-    mode_label = ("embeddings (Gemini) + LLM (xAI Grok)" if (GEMINI_API_KEY and XAI_API_KEY)
+    embed_label = "Ollama (local)" if EMBED_BACKEND == "ollama" else "Gemini"
+    chat_label = "Ollama (local)" if CHAT_BACKEND == "ollama" else "xAI Grok"
+    mode_label = (f"embeddings ({embed_label}) + LLM ({chat_label})" if (_embeddings_configured() and _chat_configured())
                   else "TF-IDF (offline fallback)")
     print(f"\n🚀 Ask My Docs is running → http://localhost:{port}")
     print(f"   Mode: {mode_label}\n")

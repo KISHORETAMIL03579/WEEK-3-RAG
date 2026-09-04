@@ -158,6 +158,61 @@ html, body { height: 100vh; overflow: hidden; font-family: var(--font); backgrou
 }
 .doc-open:hover { background: #3b82f6; color: #0f131a; border-color: #3b82f6; box-shadow: 0 0 8px rgba(59, 130, 246, 0.4); }
 
+/* Grounded Source Cards (per-answer citation list) */
+.sources-card {
+  margin-top: 10px; padding-top: 10px; border-top: 1px solid var(--border);
+}
+.sources-header {
+  font-size: 0.72rem; font-weight: 700; letter-spacing: 0.04em;
+  text-transform: uppercase; color: var(--text-secondary); margin-bottom: 6px;
+}
+.source-item {
+  background: var(--bg-raised); border: 1px solid var(--border-mid);
+  border-radius: var(--radius-md); padding: 8px 10px; margin-top: 6px;
+}
+.source-item-row {
+  display: flex; align-items: center; gap: 8px; flex-wrap: wrap; font-size: 0.78rem;
+}
+.source-badge {
+  font-family: var(--mono); font-weight: 700; color: var(--accent);
+  background: var(--accent-dim); border-radius: var(--radius-sm);
+  padding: 1px 6px; font-size: 0.72rem;
+}
+.source-filename {
+  color: var(--text-primary); font-weight: 500; overflow: hidden;
+  text-overflow: ellipsis; white-space: nowrap; max-width: 220px;
+}
+.source-tag {
+  font-size: 0.7rem; color: var(--text-secondary); background: var(--bg-hover);
+  border: 1px solid var(--border-mid); border-radius: var(--radius-sm); padding: 1px 7px;
+}
+.source-score {
+  font-size: 0.72rem; font-weight: 700; border-radius: var(--radius-sm); padding: 1px 7px;
+}
+.source-score.score-high { color: var(--green); background: var(--green-dim); }
+.source-score.score-mid  { color: var(--amber); background: var(--amber-dim); }
+.source-score.score-low  { color: var(--red);   background: var(--red-dim); }
+.source-item-spacer { flex: 1; }
+.view-content-toggle {
+  font-size: 0.72rem; font-weight: 600; color: var(--text-secondary);
+  background: transparent; border: 1px solid var(--border-mid);
+  border-radius: var(--radius-sm); padding: 4px 9px; cursor: pointer;
+  transition: all var(--ease);
+}
+.view-content-toggle:hover { color: var(--text-primary); border-color: var(--accent); background: var(--accent-glow); }
+.source-excerpt-wrap { margin-top: 8px; }
+.source-excerpt-label {
+  font-size: 0.68rem; font-weight: 700; letter-spacing: 0.03em;
+  color: var(--accent-hover); text-transform: uppercase; margin-bottom: 6px;
+}
+.source-excerpt-strategy { color: var(--text-muted); font-weight: 600; }
+.source-excerpt {
+  padding: 10px 14px; background: var(--bg);
+  border-left: 3px solid var(--accent); border-radius: 0 var(--radius-sm) var(--radius-sm) 0;
+  font-size: 0.82rem; line-height: 1.6; color: var(--text-primary);
+  white-space: pre-wrap; max-height: 260px; overflow-y: auto;
+}
+
 /* Bright Colored Red ✕ Remove Button */
 .doc-remove {
   background: rgba(239, 68, 68, 0.15); border: 1px solid rgba(239, 68, 68, 0.35);
@@ -225,6 +280,23 @@ html, body { height: 100vh; overflow: hidden; font-family: var(--font); backgrou
   display: flex; flex-direction: column; gap: 20px;
 }
 
+/* Chat Messages: user bubble (right-aligned pill) vs AI answer (wide card) */
+.message-row { display: flex; width: 100%; }
+.message-row.user { justify-content: flex-end; }
+.message-row.ai { justify-content: flex-start; }
+.message-bubble {
+  font-size: 0.9rem; line-height: 1.6; color: var(--text-primary);
+}
+.message-row.user .message-bubble {
+  background: var(--accent-dim); border: 1px solid hsla(217, 91%, 60%, 0.35);
+  border-radius: var(--radius-xl); padding: 12px 20px; max-width: 70%;
+}
+.message-row.ai .message-bubble {
+  background: var(--bg-surface); border: 1px solid var(--border);
+  border-radius: var(--radius-lg); padding: 20px 24px; max-width: 800px;
+  box-shadow: var(--shadow-sm);
+}
+
 /* Empty State Onboarding Cards */
 .onboarding-container {
   margin: auto; max-width: 480px; text-align: center;
@@ -286,3 +358,28 @@ html, body { height: 100vh; overflow: hidden; font-family: var(--font); backgrou
 }
 .send-pill-btn:hover { background: var(--accent-hover); transform: scale(1.05); }
 .send-pill-btn:disabled { opacity: 0.4; cursor: not-allowed; transform: none; }
+
+/* Document Viewer Header (templates/view.html + static/js/view.js) —
+   previously had ZERO css rules at all, so it rendered as an unstyled
+   inline box collapsed to its content width in the top-left corner
+   instead of a proper full-width header bar. */
+.app-header {
+  display: flex; align-items: center; justify-content: space-between;
+  gap: 16px; padding: 0 20px; height: 56px; flex-shrink: 0;
+  border-bottom: 1px solid var(--border); background: var(--bg-surface);
+}
+.nav-link {
+  display: inline-flex; align-items: center; gap: 6px;
+  background: var(--bg-raised); border: 1px solid var(--border-mid);
+  color: var(--text-primary); font-size: 0.8rem; font-weight: 600;
+  padding: 6px 12px; border-radius: var(--radius-sm); cursor: pointer;
+  transition: all var(--ease);
+}
+.nav-link:hover { border-color: var(--accent); background: var(--accent-glow); }
+.brand {
+  display: flex; align-items: center; gap: 8px; color: var(--text-primary);
+  overflow: hidden; text-overflow: ellipsis; white-space: nowrap;
+}
+.doc-page {
+  background: hsl(220, 30%, 96%); color: hsl(220, 30%, 14%);
+}
