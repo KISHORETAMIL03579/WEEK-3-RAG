@@ -1,0 +1,34 @@
+# Secrets — never send these to the Docker daemon as build context.
+.env
+.env.*
+!.env.example
+
+# Version control
+.git
+.gitignore
+
+# Python
+__pycache__/
+*.pyc
+.venv/
+venv/
+*.egg-info/
+
+# Runtime data — these are volume-mounted at run time (see docker-compose.yaml),
+# not baked into the image. Excluding them keeps the build context small and
+# avoids ever accidentally shipping real uploaded documents, vectors, or trace
+# logs (even redacted ones) inside an image layer.
+uploads/
+vectorstore/
+traces/
+
+# Editor / OS cruft
+.vscode/
+.idea/
+.DS_Store
+Thumbs.db
+
+# Logs
+*.log
+server.log
+server.err.log
