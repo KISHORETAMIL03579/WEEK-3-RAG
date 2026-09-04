@@ -35,21 +35,21 @@ Open **http://localhost:5000** in your browser.
 ---
 
 ## 📖 Table of Contents
-1. [System Workflows & How It Works](#1-system-workflows--how-it-works)
-   - [Workflow 1: Document Upload & Indexing](#workflow-1-document-upload--indexing)
-   - [Workflow 2: Grounded Question-Answering](#workflow-2-grounded-question-answering)
-   - [Workflow 3: Multimodal Image OCR](#workflow-3-multimodal-image-ocr)
-   - [Workflow 4: Automated Evaluation & Ablation Matrix (`/eval`)](#workflow-4-automated-evaluation--ablation-matrix-eval)
-   - [Workflow 5: Document Session Lifecycle](#workflow-5-document-session-lifecycle)
-2. [Universal File Extraction & Vision OCR](#2-universal-file-extraction--vision-ocr)
-3. [Retrieval & RAG System Architecture](#3-retrieval--rag-system-architecture)
-4. [Deep Dive: Evaluation Suite & Metrics (`/eval`)](#4-deep-dive-evaluation-suite--metrics-eval)
-5. [Backend API Endpoints Architecture](#5-backend-api-endpoints-architecture)
-6. [Codebase Function & File Mapping](#6-codebase-function--file-mapping)
-7. [Configuration & Environment Variables (`.env`)](#7-configuration--environment-variables-env)
-8. [Docker & Docker-Compose Deployment](#8-docker--docker-compose-deployment)
-9. [GHCR Container Deployment](#9-ghcr-container-deployment)
-10. [Troubleshooting & FAQ](#10-troubleshooting--faq)
+1. ﻿System Workflows & How It Works
+   - ﻿Workflow 1: Document Upload & Indexing
+   - ﻿Workflow 2: Grounded Question-Answering
+   - ﻿Workflow 3: Multimodal Image OCR
+   - ﻿Workflow 4: Automated Evaluation & Ablation Matrix (`/eval`)
+   - ﻿Workflow 5: Document Session Lifecycle
+2. ﻿Universal File Extraction & Vision OCR
+3. ﻿Retrieval & RAG System Architecture
+4. ﻿Deep Dive: Evaluation Suite & Metrics (`/eval`)
+5. ﻿Backend API Endpoints Architecture
+6. ﻿Codebase Function & File Mapping
+7. ﻿Configuration & Environment Variables (`.env`)
+8. ﻿Docker & Docker-Compose Deployment
+9. ﻿GHCR Container Deployment
+10. ﻿Troubleshooting & FAQ
 
 ---
 
@@ -177,6 +177,23 @@ Open **http://localhost:5000** in your browser.
 | `POST` | `/eval/run` | Runs evaluation benchmark matrix across presets |
 | `GET` | `/view/<filename>` | Renders document page viewer |
 | `GET` | `/healthz` | System liveness & health check endpoint |
+| `GET` | `/traces` | Lists all logged trace_ids |
+| `GET` | `/replay/<trace_id>` | Replays a trace from the trace record alone; returns original vs. replayed raw output |
+
+---
+
+## 5a. Trace Logging & Replay (W5 Task Set C)
+
+Every `/ask` call now writes one durable, redacted JSON line to `traces/traces.jsonl` (path configurable via `TRACE_LOG_PATH`), in addition to the existing console-only `RAGTracer` step logs. Each record carries: `trace_id`, `question` (redacted), `retrieval_mode`, `retrieved` (chunk_id + doc_id + filename + page + section + score + text, all redacted), `model`, `temperature`, `prompt_version`, `raw_output` (redacted), `answer`, `found`, and `latency_ms`. See `trace_store.py` for the redaction rules and prompt-version registry.
+
+**Workflow for the Task Set C write-up:**
+1. Run the app and ask it a realistic mix of real HR questions (not just demo questions) so `traces/traces.jsonl` accumulates real traffic.
+2. `python sample_traces.py --n 20 --seed <your_seed>` — prints (and can save) the seeded 20 trace_ids. Paste the seed and the list into `notes.md`.
+3. `python sample_traces.py --replay-pick --seed <your_seed>` to seed-pick one trace_id, then `curl http://localhost:5000/replay/<trace_id>` to get the original-vs-replayed raw output side by side. Paste both into `notes.md`, along with `fields_missing_from_trace` / `reconstruction_note` if either is non-null.
+4. Read all 20 traces by hand (`grep trace_id traces/traces.jsonl` or open the file directly) and write one observation sentence each in `notes.md` — no fixes, no categorizing yet.
+5. Cluster into 4–7 named modes in `taxonomy.md`, write the dated prediction, commit it, and paste the commit hash.
+
+**Redaction note:** `trace_store.redact()` is pattern-based (employee IDs, emails, phone numbers, SSN-shaped strings, and `Name: <Two Words>` style labeled fields) — not an NER model. A free-text employee name typed into a question without a label (e.g. "what's John Smith's leave balance") will NOT reliably be caught. State this limitation explicitly in your submission rather than overclaiming full redaction.
 
 ---
 

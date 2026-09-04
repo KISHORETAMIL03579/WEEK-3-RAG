@@ -32,6 +32,11 @@ import pymupdf as fitz  # PyMuPDF — imports the real module directly, avoiding
 from flask import Flask, request, jsonify, render_template, session, send_file
 from werkzeug.utils import secure_filename
 
+from trace_store import (
+    TraceStore, redact, redact_deep, register_prompt, get_prompt,
+    QA_PROMPT_VERSION,
+)
+
 try:
     sys.stdout.reconfigure(encoding="utf-8")
     sys.stderr.reconfigure(encoding="utf-8")
@@ -128,6 +133,14 @@ else:
 app.config["MAX_CONTENT_LENGTH"] = 50 * 1024 * 1024  # 50 MB per request
 
 BASE_DIR = Path(__file__).parent
+
+# ─────────────────────────────────────────────────────────────────────────────
+#  Trace logging (W5 Task Set C — durable, replayable /ask traces)
+# ─────────────────────────────────────────────────────────────────────────────
+# TRACE_LOG_PATH lets you point separate environments (or an eval run vs a
+# real-traffic run) at separate trace files, without touching code.
+TRACE_LOG_PATH = os.environ.get("TRACE_LOG_PATH", str(BASE_DIR / "traces" / "traces.jsonl"))
+TRACES = TraceStore(TRACE_LOG_PATH)
 UPLOAD_FOLDER = BASE_DIR / "uploads"
 VECTOR_FOLDER = BASE_DIR / "vectorstore"
 UPLOAD_FOLDER.mkdir(exist_ok=True)
@@ -175,8 +188,29 @@ MAX_SESSIONS = 20
 
 GEMINI_API_KEY = os.environ.get("GEMINI_API_KEY", "")
 GEMINI_URL = "https://generativelanguage.googleapis.com/v1beta"
-LLM_MODEL = os.environ.get("LLM_MODEL", "gemini-3.7-flash")
 EMBED_MODEL = os.environ.get("EMBED_MODEL", "gemini-embedding-001")
+# Vision OCR (extract_image_pages) still calls Gemini directly for
+# multimodal image understanding — xAI's chat-completions endpoint isn't
+# used for that path, so it needs its OWN model constant, separate from
+# XAI_MODEL/LLM_MODEL below (which now default to a text-only Grok model
+# and would 400 if pointed at Gemini's generateContent endpoint).
+GEMINI_VISION_MODEL = os.environ.get("GEMINI_VISION_MODEL", "gemini-3.7-flash")
+# NOTE: Gemini is now used for embeddings (EMBED_MODEL) and image Vision
+# OCR (GEMINI_VISION_MODEL) only. Every text chat/generation call (answer
+# synthesis, reranking, query rewriting) goes to xAI's Grok models below —
+# xAI does not currently offer a public embeddings API, so embeddings have
+# nowhere else to go without also swapping the vector store's dimensionality.
+
+# ── xAI (Grok) config — chat/generation only ────────────────────────────
+XAI_API_KEY = os.environ.get("XAI_API_KEY", "")
+XAI_URL = os.environ.get("XAI_URL", "https://api.x.ai/v1")
+XAI_MODEL = os.environ.get("XAI_MODEL", "grok-4.3")
+
+# LLM_MODEL is kept as the generic "which chat model is answering right
+# now" name used everywhere else in this file (trace logs, RAGTracer,
+# /status) — it now just mirrors XAI_MODEL so none of those call sites
+# needed to change.
+LLM_MODEL = XAI_MODEL
 EMBED_MIN_SCORE = float(os.environ.get("EMBED_MIN_SCORE", "0.55"))  # recalibrated
 # for reciprocal_rank_fusion()'s normalized scale (see RRF_K comment) —
 # NOT comparable to the old weighted-average blend's raw-cosine scale.
@@ -269,20 +303,28 @@ def fit_to_token_budget(results: list[dict], max_tokens: int) -> list[dict]:
 _simple_tokenizer = re.compile(r"[\w]+")
 
 
-def _gemini_chat_call(system: str, user: str,
-                      temperature: float = 0,
-                      max_tokens: int | None = None) -> str:
-    """Call the Gemini generateContent API with automatic exponential backoff retry on HTTP 429/503."""
-    url = f"{GEMINI_URL}/models/{LLM_MODEL}:generateContent?key={GEMINI_API_KEY}"
-    gen_config: dict = {"temperature": temperature}
-    if max_tokens is not None:
-        gen_config["maxOutputTokens"] = max_tokens
+def _xai_chat_call(system: str, user: str,
+                   temperature: float = 0,
+                   max_tokens: int | None = None) -> str:
+    """Call xAI's OpenAI-compatible /v1/chat/completions endpoint, with
+    automatic exponential backoff retry on HTTP 429/500/503.
 
-    payload = {
-        "system_instruction": {"parts": [{"text": system}]},
-        "contents": [{"role": "user", "parts": [{"text": user}]}],
-        "generationConfig": gen_config,
+    Replaces the old Gemini generateContent-based chat call. Kept the same
+    signature (system, user, temperature, max_tokens) -> str as the old
+    _gemini_chat_call so every call site (generate_answer, rerank_with_llm,
+    rewrite_query) needed only a name change, not a rewrite.
+    """
+    url = f"{XAI_URL}/chat/completions"
+    payload: dict = {
+        "model": XAI_MODEL,
+        "messages": [
+            {"role": "system", "content": system},
+            {"role": "user", "content": user},
+        ],
+        "temperature": temperature,
     }
+    if max_tokens is not None:
+        payload["max_tokens"] = max_tokens
 
     max_retries = 5
     base_delay = 2.0
@@ -292,41 +334,42 @@ def _gemini_chat_call(system: str, user: str,
             req = urllib.request.Request(
                 url,
                 data=json.dumps(payload).encode("utf-8"),
-                headers={"Content-Type": "application/json"},
+                headers={
+                    "Content-Type": "application/json",
+                    "Authorization": f"Bearer {XAI_API_KEY}",
+                },
                 method="POST",
             )
             with urllib.request.urlopen(req, timeout=90) as resp:
                 data = json.loads(resp.read().decode("utf-8"))
             elapsed = time.time() - t0
-            candidate = data.get("candidates", [{}])[0]
-            content_obj = candidate.get("content", {})
-            parts = content_obj.get("parts", [])
-            if not parts:
-                logger.warning("⚠️ Gemini response candidate has no parts (finish_reason: %s)", candidate.get("finishReason"))
+            choices = data.get("choices", [])
+            if not choices:
+                logger.warning("⚠️ xAI response has no choices (raw: %s)", data)
                 return ""
-            result_text = parts[0].get("text", "").strip()
-            logger.info("🤖 Gemini LLM call succeeded in %.2fs (model: %s)", elapsed, LLM_MODEL)
+            result_text = (choices[0].get("message", {}).get("content") or "").strip()
+            logger.info("🤖 xAI (Grok) LLM call succeeded in %.2fs (model: %s)", elapsed, XAI_MODEL)
             return result_text
         except urllib.error.HTTPError as exc:
             if exc.code in (429, 500, 503) and attempt < max_retries:
                 delay = base_delay * (2 ** (attempt - 1))
-                logger.warning("⏳ Gemini LLM rate-limited (HTTP %d). Retrying in %.1fs (attempt %d/%d)...",
+                logger.warning("⏳ xAI LLM rate-limited (HTTP %d). Retrying in %.1fs (attempt %d/%d)...",
                                exc.code, delay, attempt, max_retries)
                 time.sleep(delay)
             else:
-                logger.error("❌ Gemini LLM call failed with HTTP %d: %s", exc.code, exc)
+                logger.error("❌ xAI LLM call failed with HTTP %d: %s", exc.code, exc)
                 raise
         except (urllib.error.URLError, socket.timeout, TimeoutError, OSError) as exc:
             if attempt < max_retries:
                 delay = base_delay * (2 ** (attempt - 1))
-                logger.warning("⏳ Gemini LLM network timeout (%s). Retrying in %.1fs (attempt %d/%d)...",
+                logger.warning("⏳ xAI LLM network timeout (%s). Retrying in %.1fs (attempt %d/%d)...",
                                exc, delay, attempt, max_retries)
                 time.sleep(delay)
             else:
-                logger.error("❌ Gemini LLM network call timed out after %d attempts: %s", max_retries, exc)
+                logger.error("❌ xAI LLM network call timed out after %d attempts: %s", max_retries, exc)
                 raise
         except Exception as exc:
-            logger.error("❌ Gemini LLM call exception: %s", exc, exc_info=True)
+            logger.error("❌ xAI LLM call exception: %s", exc, exc_info=True)
             raise
 
 
@@ -703,7 +746,7 @@ def extract_image_pages(filepath: str) -> list[dict]:
         with open(filepath, "rb") as img_file:
             img_b64 = base64.b64encode(img_file.read()).decode("utf-8")
 
-        url = f"{GEMINI_URL}/models/{LLM_MODEL}:generateContent?key={GEMINI_API_KEY}"
+        url = f"{GEMINI_URL}/models/{GEMINI_VISION_MODEL}:generateContent?key={GEMINI_API_KEY}"
         payload = {
             "contents": [
                 {
@@ -1774,7 +1817,7 @@ def rerank_with_llm(query: str, results: list[dict]) -> tuple[list[dict], float 
     to the token-overlap check in that case) rather than breaking
     retrieval.
     """
-    if not results or not GEMINI_API_KEY:
+    if not results or not XAI_API_KEY:
         return results, None
 
     candidates = results[:RERANK_TOP_N]
@@ -1791,7 +1834,7 @@ def rerank_with_llm(query: str, results: list[dict]) -> tuple[list[dict], float 
     )
     user = f"Question: {query}\n\nCandidates:\n{numbered}"
     try:
-        raw = _gemini_chat_call(system, user, temperature=0, max_tokens=300)
+        raw = _xai_chat_call(system, user, temperature=0, max_tokens=300)
         raw = re.sub(r"^```(?:json)?|```$", "", raw, flags=re.MULTILINE).strip()
         scored = json.loads(raw)
         indices = sorted(item["index"] for item in scored)
@@ -1824,7 +1867,7 @@ def rewrite_query(query: str) -> str:
 
     Fails open: returns the original query unchanged on any error.
     """
-    if not query.strip() or not GEMINI_API_KEY:
+    if not query.strip() or not XAI_API_KEY:
         return query
     system = (
         "Rewrite the user's question into a short, keyword-rich search "
@@ -1834,7 +1877,7 @@ def rewrite_query(query: str) -> str:
         "the rewritten query, nothing else."
     )
     try:
-        rewritten = _gemini_chat_call(system, query, temperature=0, max_tokens=60).strip('"')
+        rewritten = _xai_chat_call(system, query, temperature=0, max_tokens=60).strip('"')
         return rewritten if rewritten else query
     except Exception:
         logger.warning("Query rewriting failed — using the original question as-is.",
@@ -1844,14 +1887,7 @@ def rewrite_query(query: str) -> str:
 
 def generate_answer(query: str, results: list[dict]) -> str:
     """Ask the LLM to produce a grounded answer with [N] source citations."""
-    context_blocks = []
-    for i, r in enumerate(results, start=1):
-        loc = f"{r['filename']} (page {r['page']})"
-        if r.get("section"):
-            loc += f", section: {r['section']}"
-        context_blocks.append(f"[{i}] {loc}\n{r['text']}")
-
-    system = (
+    system = register_prompt(QA_PROMPT_VERSION, (
         "You are a grounded question-answering assistant. Answer using ONLY the "
         "document excerpts provided. Cite every fact with its source number like "
         "[1] or [2]. If the excerpts do not contain enough information to answer "
@@ -1863,16 +1899,26 @@ def generate_answer(query: str, results: list[dict]) -> str:
         "for a question that calls for it. Never omit relevant details from the "
         "excerpts just to keep the answer short; completeness for the specific "
         "question asked matters more than brevity."
-    )
-    user = (
-        "DOCUMENTS:\n\n" + "\n\n".join(context_blocks) +
-        f"\n\nQUESTION: {query}\n\nANSWER:"
-    )
+    ))
+    user = build_qa_user_prompt(query, results)
 
     try:
-        return _gemini_chat_call(system, user, temperature=0)
+        return _xai_chat_call(system, user, temperature=0)
     except Exception:
         return ""
+
+
+def build_qa_user_prompt(query: str, results: list[dict]) -> str:
+    """Rebuild the exact user-turn text generate_answer() sends, from a
+    results list alone. Shared by generate_answer() and replay so the two
+    can never silently drift apart."""
+    context_blocks = []
+    for i, r in enumerate(results, start=1):
+        loc = f"{r['filename']} (page {r['page']})"
+        if r.get("section"):
+            loc += f", section: {r['section']}"
+        context_blocks.append(f"[{i}] {loc}\n{r['text']}")
+    return "DOCUMENTS:\n\n" + "\n\n".join(context_blocks) + f"\n\nQUESTION: {query}\n\nANSWER:"
 
 
 # ─────────────────────────────────────────────────────────────────────────────
@@ -2263,6 +2309,51 @@ def ask():
     query = (data or {}).get("query", "").strip()
     method_filter = (data or {}).get("chunk_mode", "").strip() or None
 
+    trace_id = str(uuid.uuid4())
+    _t0 = time.time()
+
+    def log_ask_trace(*, retrieval_mode, retrieved, valid_context, model,
+                       temperature, prompt_version, raw_output, answer,
+                       found, rerank_score=None, extra=None):
+        """Writes one durable, replayable /ask trace record. Redaction runs
+        here — the ONLY place a record is built — so no exit path from
+        /ask can accidentally skip it."""
+        record = {
+            "trace_id": trace_id,
+            "session_id_hash": hashlib.sha256(sid.encode()).hexdigest()[:16],
+            "question": redact(query),
+            "search_query": redact(search_query) if search_query != query else None,
+            "chunk_mode_filter": method_filter,
+            "retrieval_mode": retrieval_mode,
+            "top_k": TOP_K,
+            "embed_min_score": EMBED_MIN_SCORE,
+            "rerank_enabled": RERANK_ENABLED,
+            "rerank_score": rerank_score,
+            "retrieved": redact_deep([
+                {
+                    "chunk_id": r.get("id"),
+                    "doc_id": r.get("doc_id"),
+                    "filename": r.get("filename"),
+                    "page": r.get("page"),
+                    "section": r.get("section"),
+                    "score": round(r["score"], 4) if r.get("score") is not None else None,
+                    "text": r.get("text"),
+                }
+                for r in (retrieved or [])
+            ]),
+            "valid_context": valid_context,
+            "model": model,
+            "temperature": temperature,
+            "prompt_version": prompt_version,
+            "raw_output": redact(raw_output),
+            "answer": redact(answer),
+            "found": found,
+            "latency_ms": round((time.time() - _t0) * 1000, 1),
+        }
+        if extra:
+            record.update(redact_deep(extra))
+        TRACES.log(record)
+
     store = _get_store(sid)
 
     RAGTracer.trace("RETRIEVAL", 1, 6, "Question Received", {
@@ -2304,7 +2395,12 @@ def ask():
             })
 
     # Path 1: embeddings + LLM (if configured and vectors exist)
-    if GEMINI_API_KEY and active_store.vectors and len(active_store.vectors) == len(active_store.chunks):
+    # Path 1 needs BOTH: GEMINI_API_KEY for embeddings-based retrieval and
+    # XAI_API_KEY for the actual answer generation. Gating on only one
+    # meant a missing XAI_API_KEY still ran full retrieval before failing
+    # inside generate_answer() and falling back to TF-IDF anyway — correct
+    # but wasteful. Checking both up front skips straight to Path 2.
+    if GEMINI_API_KEY and XAI_API_KEY and active_store.vectors and len(active_store.vectors) == len(active_store.chunks):
         try:
             if RETRIEVAL_MODE == "hybrid-legacy":
                 raw_results = hybrid_search(active_store, search_query, top_k=TOP_K)
@@ -2344,10 +2440,18 @@ def ask():
             })
 
             if not valid:
+                log_ask_trace(
+                    retrieval_mode=RETRIEVAL_MODE, retrieved=raw_results,
+                    valid_context=False, model=LLM_MODEL, temperature=0,
+                    prompt_version=None, raw_output=None,
+                    answer="I don't know — no document content matched your question closely enough.",
+                    found=False, rerank_score=rerank_score,
+                )
                 return jsonify({
                     "found": False,
                     "answer": "I don't know — no document content matched your question closely enough.",
                     "sources": [],
+                    "trace_id": trace_id,
                     "closest_match": ({
                         "filename": near_miss["filename"],
                         "section": near_miss.get("section"),
@@ -2362,15 +2466,23 @@ def ask():
                 "Sources Grounded": len(results),
                 "Answer Character Count": len(answer),
             })
+            log_ask_trace(
+                retrieval_mode=RETRIEVAL_MODE, retrieved=results,
+                valid_context=True, model=LLM_MODEL, temperature=0,
+                prompt_version=QA_PROMPT_VERSION, raw_output=answer,
+                answer=answer or "I don't know.",
+                found=not _is_dont_know(answer), rerank_score=rerank_score,
+            )
             return jsonify({
                 "found": not _is_dont_know(answer),
                 "answer": answer or "I don't know.",
                 "sources": annotate_openable(results),
+                "trace_id": trace_id,
             })
         except urllib.error.HTTPError as exc:
             reason = {
                 400: "Bad request — check your API key format and model name.",
-                401: "Invalid or expired API key — check GEMINI_API_KEY.",
+                401: "Invalid or expired API key — check GEMINI_API_KEY (embeddings) and XAI_API_KEY (chat).",
                 403: "Access forbidden — verify your Gemini API key has the required permissions.",
                 429: "Rate limited by Gemini API — too many requests too quickly.",
             }.get(exc.code, f"Unexpected HTTP {exc.code} from Gemini API.")
@@ -2394,10 +2506,18 @@ def ask():
     results = fit_to_token_budget(results, MAX_CONTEXT_TOKENS)
     if not validate_context(results, TFIDF_MIN_SCORE, query):
         near_miss = results[0] if results else None
+        log_ask_trace(
+            retrieval_mode="tfidf", retrieved=results, valid_context=False,
+            model="tfidf-template", temperature=None, prompt_version=None,
+            raw_output=None,
+            answer="I don't know — no document content matched your question closely enough.",
+            found=False,
+        )
         return jsonify({
             "found": False,
             "answer": "I don't know — no document content matched your question closely enough.",
             "sources": [],
+            "trace_id": trace_id,
             "closest_match": ({
                 "filename": near_miss["filename"],
                 "section": near_miss.get("section"),
@@ -2408,7 +2528,112 @@ def ask():
         })
     resp = synthesize_answer(query, results)
     resp["sources"] = annotate_openable(resp.get("sources", []))
+    resp["trace_id"] = trace_id
+    log_ask_trace(
+        retrieval_mode="tfidf", retrieved=results, valid_context=True,
+        model="tfidf-template", temperature=None, prompt_version=None,
+        raw_output=resp.get("answer"), answer=resp.get("answer"),
+        found=resp.get("found", True),
+    )
     return jsonify(resp)
+
+
+@app.route("/traces", methods=["GET"])
+def list_traces():
+    """List logged trace_ids — the raw material for the seeded random
+    sample requirement#2 asks for. Use sample_traces.py for the actual
+    seeded draw; this endpoint is just for eyeballing what's there."""
+    ids = TRACES.all_ids()
+    return jsonify({"count": len(ids), "trace_ids": ids})
+
+
+@app.route("/replay/<trace_id>", methods=["GET"])
+def replay_trace(trace_id):
+    """Replay requirement#1: reconstruct a trace's exact context + prompt
+    from the trace record ALONE (not from the live vector store, which may
+    have changed or expired) and re-run the LLM call, so original vs
+    replayed output can be shown side by side."""
+    record = TRACES.get(trace_id)
+    if not record:
+        return jsonify({"error": f"No trace found for trace_id={trace_id}"}), 404
+
+    missing = []
+    for field in ("prompt_version", "model", "retrieved", "raw_output"):
+        if record.get(field) in (None, [], ""):
+            missing.append(field)
+
+    if record.get("retrieval_mode") == "tfidf" or not record.get("prompt_version"):
+        return jsonify({
+            "trace_id": trace_id,
+            "replayable": False,
+            "reason": (
+                "This trace has no LLM prompt_version (either the TF-IDF "
+                "offline path answered it, or the context-validation gate "
+                "rejected it before any LLM call was made — both produce "
+                "deterministic, template-based output that reconstructing "
+                "the retrieved chunks alone will reproduce exactly, with no "
+                "LLM re-call needed)."
+            ),
+            "original": {
+                "answer": record.get("answer"),
+                "retrieved": record.get("retrieved"),
+            },
+            "fields_missing_from_trace": missing,
+        })
+
+    prompt_text = get_prompt(record["prompt_version"])
+    reconstructed_note = None
+    if prompt_text is None:
+        # The exact prompt text for this version was never registered in
+        # this process (e.g. replaying against a fresh process that hasn't
+        # served an /ask call yet, or the prompt version was retired).
+        # Fall back to the CURRENT qa prompt and say so explicitly, per
+        # requirement#1 ("note it, and say what you could not reconstruct").
+        prompt_text = get_prompt(QA_PROMPT_VERSION)
+        reconstructed_note = (
+            f"prompt_version {record['prompt_version']!r} text was not found in "
+            f"this process's registry — fell back to the current {QA_PROMPT_VERSION} "
+            f"text. If the prompt has changed since this trace, the replay is NOT "
+            f"a true replay of what ran originally."
+        )
+
+    results_for_prompt = [
+        {
+            "filename": r.get("filename"),
+            "page": r.get("page"),
+            "section": r.get("section"),
+            "text": r.get("text") or "",
+        }
+        for r in record.get("retrieved", [])
+    ]
+    user_prompt = build_qa_user_prompt(record["question"], results_for_prompt)
+
+    try:
+        replayed_raw = _xai_chat_call(prompt_text, user_prompt, temperature=record.get("temperature") or 0)
+        replay_error = None
+    except Exception as exc:
+        replayed_raw = None
+        replay_error = str(exc)
+
+    return jsonify({
+        "trace_id": trace_id,
+        "replayable": True,
+        "original": {
+            "question": record.get("question"),
+            "model": record.get("model"),
+            "prompt_version": record.get("prompt_version"),
+            "raw_output": record.get("raw_output"),
+        },
+        "replayed": {
+            "model": record.get("model"),
+            "prompt_version": record.get("prompt_version"),
+            "raw_output": replayed_raw,
+            "error": replay_error,
+        },
+        "outputs_match_exactly": (replayed_raw == record.get("raw_output")) if replayed_raw is not None else None,
+        "fields_missing_from_trace": missing,
+        "reconstruction_note": reconstructed_note,
+    })
 
 
 @app.route("/clear", methods=["POST"])
@@ -2750,6 +2975,7 @@ def healthz():
     return jsonify({
         "status": "ok",
         "embeddings_configured": bool(GEMINI_API_KEY),
+        "chat_configured": bool(XAI_API_KEY),
         "retrieval_mode": RETRIEVAL_MODE if GEMINI_API_KEY else "tfidf-only",
         "vector_backend": VECTOR_BACKEND,
         "active_sessions": len(SESSION_ACCESS),
@@ -2802,7 +3028,7 @@ if __name__ == "__main__":
     # unless you actually want this reachable from your whole network.
     host = os.environ.get("HOST", "127.0.0.1")
     debug = os.environ.get("APP_DEBUG", "").lower() in ("1", "true", "yes")
-    mode_label = ("embeddings + LLM (Gemini)" if GEMINI_API_KEY
+    mode_label = ("embeddings (Gemini) + LLM (xAI Grok)" if (GEMINI_API_KEY and XAI_API_KEY)
                   else "TF-IDF (offline fallback)")
     print(f"\n🚀 Ask My Docs is running → http://localhost:{port}")
     print(f"   Mode: {mode_label}\n")
