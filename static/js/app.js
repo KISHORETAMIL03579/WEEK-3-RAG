@@ -856,6 +856,43 @@ function App() {
     };
   }, []);
 
+  // Display toast after browser hard refresh (Ctrl+Shift+R / Cmd+Shift+R / Ctrl+F5)
+  useEffect(() => {
+    const HARD_REFRESH_TOAST_KEY = 'ask-my-docs-hard-refresh';
+    try {
+      if (sessionStorage.getItem(HARD_REFRESH_TOAST_KEY) === '1') {
+        sessionStorage.removeItem(HARD_REFRESH_TOAST_KEY);
+        const timer = setTimeout(() => {
+          showToast('↻ Hard refresh completed. Latest resources loaded.', 'success', 3500);
+        }, 300);
+        return () => clearTimeout(timer);
+      }
+    } catch (e) {
+      // Gracefully handle restricted storage environments
+    }
+  }, [showToast]);
+
+  // Global key listener to detect hard refresh combinations before page unload
+  useEffect(() => {
+    const HARD_REFRESH_TOAST_KEY = 'ask-my-docs-hard-refresh';
+    const handleKeyDown = (event) => {
+      const isHardRefresh =
+        (event.shiftKey && (event.ctrlKey || event.metaKey) && event.key && event.key.toLowerCase() === 'r') ||
+        ((event.ctrlKey || event.shiftKey) && (event.key === 'F5' || event.code === 'F5'));
+
+      if (isHardRefresh) {
+        try {
+          sessionStorage.setItem(HARD_REFRESH_TOAST_KEY, '1');
+        } catch (e) {
+          // Gracefully handle storage write errors
+        }
+      }
+    };
+
+    window.addEventListener('keydown', handleKeyDown);
+    return () => window.removeEventListener('keydown', handleKeyDown);
+  }, []);
+
   // Staged files lifecycle management with preview URLs
   const handleAddSelectedFiles = useCallback((rawFiles) => {
     const newItems = rawFiles.map((file) => ({

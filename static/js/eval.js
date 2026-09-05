@@ -36,6 +36,7 @@
     '.btn-primary { background: var(--primary); color: #fff; font-weight: 600; font-size: 0.84rem; border-radius: 8px; border: none; padding: 10px 22px; cursor: pointer; transition: background 0.15s ease; display: inline-flex; align-items: center; justify-content: center; gap: 8px; }',
     '.btn-primary:hover:not(:disabled) { background: var(--primary-hover); }',
     '.btn-primary:disabled { opacity: 0.5; cursor: not-allowed; }',
+    '.btn-primary:focus-visible, .btn-secondary:focus-visible, .input-field:focus-visible, .stage-checkbox:focus-within { outline: 2px solid var(--primary); outline-offset: 2px; }',
     '.btn-secondary { background: var(--surface-raised); border: 1px solid var(--border); color: var(--text); padding: 7px 14px; border-radius: 8px; font-size: 0.78rem; font-weight: 500; cursor: pointer; transition: all 0.15s ease; text-decoration: none; display: inline-flex; align-items: center; gap: 6px; }',
     '.btn-secondary:hover { background: #374151; border-color: #4b5563; }',
     '.btn-danger { color: #f87171; border-color: rgba(239, 68, 68, 0.3); }',
@@ -50,15 +51,19 @@
     '.badge-hit { display: inline-flex; align-items: center; gap: 4px; padding: 2px 8px; border-radius: 6px; background: var(--green-bg); border: 1px solid var(--green-border); color: var(--green-text); font-weight: 600; font-size: 0.74rem; }',
     '.badge-miss { display: inline-flex; align-items: center; justify-content: center; width: 22px; height: 22px; border-radius: 5px; background: var(--red-bg); border: 1px solid var(--red-border); color: var(--red-text); font-weight: 700; font-size: 0.8rem; }',
     '.score-pill { display: inline-flex; align-items: center; padding: 3px 8px; border-radius: 6px; font-weight: 700; font-family: ui-monospace, monospace; font-size: 0.78rem; }',
+    '.sr-only { position: absolute; width: 1px; height: 1px; padding: 0; margin: -1px; overflow: hidden; clip: rect(0, 0, 0, 0); white-space: nowrap; border-width: 0; }',
     'input[type=number]::-webkit-inner-spin-button, input[type=number]::-webkit-outer-spin-button { -webkit-appearance: none; margin: 0; }',
     'input[type=number] { -moz-appearance: textfield; }'
   ].join('\n');
   document.head.appendChild(s);
 }());
 
-const { useState, useRef } = React;
+const { useState, useEffect, useRef, useCallback } = React;
 
 function generateId() {
+  if (typeof crypto !== 'undefined' && typeof crypto.randomUUID === 'function') {
+    return 'q_' + crypto.randomUUID();
+  }
   return 'q_' + Math.random().toString(36).substring(2, 11);
 }
 
@@ -170,6 +175,15 @@ function FormView({ questions, setQuestions, topK, setTopK, strategyFilter, setS
 
   const [selectedFile, setSelectedFile] = useState(null);
   const [isImporting, setIsImporting]   = useState(false);
+  const importAbortRef                  = useRef(null);
+
+  useEffect(() => {
+    return () => {
+      if (importAbortRef.current) {
+        importAbortRef.current.abort();
+      }
+    };
+  }, []);
 
   const addQ = function() {
     setQuestions(prev => [...prev, { id: generateId(), question: '', expected: '' }]);
@@ -192,11 +206,21 @@ function FormView({ questions, setQuestions, topK, setTopK, strategyFilter, setS
 
   const handleImport = async function() {
     if (!selectedFile) { alert('Please choose a file (.pdf, .txt, .md) first.'); return; }
+    if (importAbortRef.current) {
+      importAbortRef.current.abort();
+    }
+    const controller = new AbortController();
+    importAbortRef.current = controller;
     setIsImporting(true);
+
     const fd = new FormData();
     fd.append('file', selectedFile);
     try {
-      const res  = await fetch('/eval/parse-qa-pdf', { method: 'POST', body: fd });
+      const res = await fetch('/eval/parse-qa-pdf', {
+        method: 'POST',
+        body: fd,
+        signal: controller.signal
+      });
       const contentType = res.headers.get('content-type') || '';
       let data;
       if (contentType.includes('application/json')) {
@@ -212,9 +236,14 @@ function FormView({ questions, setQuestions, topK, setTopK, strategyFilter, setS
         alert(data.error || 'No Q/A pairs found in file.');
       }
     } catch(e) {
-      alert('Import error: ' + e.message);
+      if (e.name !== 'AbortError') {
+        alert('Import error: ' + e.message);
+      }
     } finally {
-      setIsImporting(false);
+      if (importAbortRef.current === controller) {
+        importAbortRef.current = null;
+        setIsImporting(false);
+      }
     }
   };
 
@@ -516,10 +545,11 @@ function FormView({ questions, setQuestions, topK, setTopK, strategyFilter, setS
             </div>
           </div>
           <div>
-            <label style={{ display: 'block', fontSize: '0.75rem', color: 'var(--text-muted)', marginBottom: '6px' }}>
+            <label htmlFor="strategy-filter-input" style={{ display: 'block', fontSize: '0.75rem', color: 'var(--text-muted)', marginBottom: '6px' }}>
               Chunk strategy filter (optional)
             </label>
             <input
+              id="strategy-filter-input"
               type="text"
               placeholder="e.g. structured — leave blank for all"
               value={strategyFilter}
@@ -530,9 +560,9 @@ function FormView({ questions, setQuestions, topK, setTopK, strategyFilter, setS
           </div>
         </div>
 
-        <label style={{ display: 'block', fontSize: '0.75rem', color: 'var(--text-muted)', marginBottom: '10px' }}>
+        <div style={{ fontSize: '0.75rem', color: 'var(--text-muted)', marginBottom: '10px', fontWeight: 600 }}>
           Ablation stages to compare
-        </label>
+        </div>
         <div style={{ display: 'grid', gridTemplateColumns: 'repeat(auto-fit, minmax(220px, 1fr))', gap: '10px', marginBottom: '22px' }}>
           {Object.keys(PRESETS).map(function(key) {
             const meta = PRESETS[key];
@@ -647,6 +677,9 @@ function ResultsView({ results, onBack, onClear }) {
 
         <div style={{ overflowX: 'auto' }}>
           <table className="clean-table">
+            <caption className="sr-only">
+              Overall retrieval evaluation results across ablation stages
+            </caption>
             <thead>
               <tr>
                 <th>Strategy</th>
@@ -657,8 +690,10 @@ function ResultsView({ results, onBack, onClear }) {
             </thead>
             <tbody>
               {modeKeys.map(function(mk) {
-                const m = results.modes[mk];
-                const pct = Math.round((m.hit_rate || 0) * 100);
+                const m = results.modes[mk] || {};
+                const hitRate = typeof m.hit_rate === 'number' ? m.hit_rate : Number(m.hit_rate || 0);
+                const mrrVal = typeof m.mrr === 'number' ? m.mrr : Number(m.mrr || 0);
+                const pct = Math.round(hitRate * 100);
                 const meta = PRESETS[mk] || { label: mk };
                 return (
                   <tr key={mk}>
@@ -669,15 +704,15 @@ function ResultsView({ results, onBack, onClear }) {
                       <div style={{ display: 'flex', alignItems: 'center', gap: '8px' }}>
                         <ScoreBadge pct={pct} />
                         <span style={{ fontSize: '0.74rem', color: 'var(--text-subtle)', fontFamily: 'ui-monospace, monospace' }}>
-                          ({m.hits}/{m.total})
+                          ({m.hits || 0}/{m.total || 0})
                         </span>
                       </div>
                     </td>
                     <td style={{ fontFamily: 'ui-monospace, monospace', color: 'var(--text)', fontWeight: 600 }}>
-                      {m.mrr ? m.mrr.toFixed(3) : '0.000'}
+                      {mrrVal.toFixed(3)}
                     </td>
                     <td style={{ color: 'var(--text-muted)' }}>
-                      {m.hits} / {m.total}
+                      {m.hits || 0} / {m.total || 0}
                     </td>
                   </tr>
                 );
@@ -698,6 +733,9 @@ function ResultsView({ results, onBack, onClear }) {
 
         <div style={{ overflowX: 'auto' }}>
           <table className="clean-table" style={{ minWidth: '700px' }}>
+            <caption className="sr-only">
+              Per-question retrieval hit status and rank position matrix
+            </caption>
             <thead>
               <tr>
                 <th style={{ width: '32px', textAlign: 'center' }}>#</th>
@@ -778,12 +816,25 @@ function EvalApp() {
 
   const abortControllerRef = useRef(null);
 
+  useEffect(() => {
+    return () => {
+      if (abortControllerRef.current) {
+        abortControllerRef.current.abort();
+      }
+    };
+  }, []);
+
+  useEffect(() => {
+    window.scrollTo({ top: 0, behavior: 'smooth' });
+  }, [view]);
+
   const handleCancel = function() {
-    if (abortControllerRef.current) {
-      abortControllerRef.current.abort();
+    const controller = abortControllerRef.current;
+    if (controller) {
+      controller.abort();
       abortControllerRef.current = null;
+      setIsRunning(false);
     }
-    setIsRunning(false);
   };
 
   const handleRun = async function() {
@@ -854,17 +905,47 @@ function EvalApp() {
       }
 
       // SR-03 & SR-06: Response schema and result integrity validation
-      if (!data || typeof data !== 'object' || !data.modes) {
+      if (!data || typeof data !== 'object' || !data.modes || typeof data.modes !== 'object') {
         throw new Error('Malformed evaluation response: missing modes dictionary.');
       }
 
       const submittedIds = new Set(validQ.map(q => q.id));
       for (const mk of active) {
         const modeData = data.modes[mk];
-        if (!modeData || !Array.isArray(modeData.results)) {
+        if (!modeData || typeof modeData !== 'object' || !Array.isArray(modeData.results)) {
           throw new Error(`Strategy "${PRESETS[mk]?.label || mk}" missing results array in server response.`);
         }
-        const resultIds = modeData.results.map(r => r.id);
+
+        // Defensively normalize strategy-level metrics
+        modeData.hit_rate = typeof modeData.hit_rate === 'number' && !isNaN(modeData.hit_rate) ? modeData.hit_rate : (Number(modeData.hit_rate) || 0);
+        modeData.mrr      = typeof modeData.mrr === 'number' && !isNaN(modeData.mrr) ? modeData.mrr : (Number(modeData.mrr) || 0);
+        modeData.hits     = typeof modeData.hits === 'number' && !isNaN(modeData.hits) ? modeData.hits : (Number(modeData.hits) || 0);
+        modeData.total    = typeof modeData.total === 'number' && !isNaN(modeData.total) ? modeData.total : (Number(modeData.total) || 0);
+
+        const resultIds = [];
+        for (const r of modeData.results) {
+          if (!r || typeof r !== 'object' || typeof r.id !== 'string') {
+            throw new Error(`Strategy "${PRESETS[mk]?.label || mk}" returned an invalid result item structure.`);
+          }
+          // Strict boolean hit normalization (immune to !!"false" === true coercion bug)
+          if (typeof r.hit === 'boolean') {
+            // Valid boolean
+          } else if (r.hit === 1 || r.hit === '1' || r.hit === 'true') {
+            r.hit = true;
+          } else if (r.hit === 0 || r.hit === '0' || r.hit === 'false') {
+            r.hit = false;
+          } else {
+            throw new Error(`Strategy "${PRESETS[mk]?.label || mk}" returned invalid hit value for question ID "${r.id}".`);
+          }
+
+          if (r.rank !== null && r.rank !== undefined) {
+            const parsedRank = Number(r.rank);
+            r.rank = isNaN(parsedRank) || parsedRank <= 0 ? null : Math.floor(parsedRank);
+          } else {
+            r.rank = null;
+          }
+          resultIds.push(r.id);
+        }
         const uniqueIds = new Set(resultIds);
         if (uniqueIds.size !== resultIds.length) {
           throw new Error(`Strategy "${PRESETS[mk]?.label || mk}" returned duplicate question IDs.`);
@@ -883,7 +964,6 @@ function EvalApp() {
 
       setResults(data);
       setView('results');
-      setTimeout(function() { window.scrollTo({ top: 0, behavior: 'smooth' }); }, 80);
 
     } catch(e) {
       if (e.name === 'AbortError') {
@@ -892,27 +972,24 @@ function EvalApp() {
         alert('Evaluation Integrity Error: ' + e.message);
       }
     } finally {
-      setIsRunning(false);
       if (abortControllerRef.current === controller) {
         abortControllerRef.current = null;
+        setIsRunning(false);
       }
     }
   };
 
   const goToForm = function() {
     setView('form');
-    setTimeout(function() { window.scrollTo({ top: 0, behavior: 'smooth' }); }, 50);
   };
 
   const goToResults = function() {
     setView('results');
-    setTimeout(function() { window.scrollTo({ top: 0, behavior: 'smooth' }); }, 50);
   };
 
   const handleClear = function() {
     setResults(null);
     setView('form');
-    setTimeout(function() { window.scrollTo({ top: 0, behavior: 'smooth' }); }, 50);
   };
 
   return (

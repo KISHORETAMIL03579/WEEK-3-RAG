@@ -1,6 +1,6 @@
 #!/usr/bin/env python3
 """
-sample_traces.py — seeded random sample of trace_ids for W5 Task Set C.
+sample_trace.py — seeded random sample of trace_ids for W5 Task Set C.
 
 Requirement#2: "Draw a RANDOM sample of 20 traces with a seeded selection
 you paste in the write-up." This script IS that seeded selection: run it,
@@ -10,9 +10,9 @@ traces.jsonl always reproduces the same 20 ids, which is what "provable"
 means here — anyone can rerun this and check you didn't cherry-pick.
 
 Usage:
-    python sample_traces.py --n 20 --seed 42
-    python sample_traces.py --n 10 --seed 7 --out sample_bonus.json   # for the bonus 10-more-from-demo-set draw
-    python sample_traces.py --replay-pick --seed 42                  # seeded pick of ONE trace_id for the replay-evidence requirement
+    python sample_trace.py --n 20 --seed 42
+    python sample_trace.py --n 10 --seed 7 --out sample_bonus.json   # for the bonus 10-more-from-demo-set draw
+    python sample_trace.py --replay-pick --seed 42                  # seeded pick of ONE trace_id for the replay-evidence requirement
 """
 import argparse
 import json
@@ -34,6 +34,10 @@ def main():
                      help="Instead of an n-sample, seed-pick ONE trace_id for the replay-evidence requirement")
     args = ap.parse_args()
 
+    if not args.replay_pick and args.n <= 0:
+        print(f"Error: Sample size --n must be greater than 0, got {args.n}.", file=sys.stderr)
+        sys.exit(1)
+
     store = TraceStore(args.log_path)
     total = len(store.all_ids())
 
@@ -46,7 +50,7 @@ def main():
         print(f"Seed: {args.seed}")
         print(f"Replay trace_id: {picked}")
         if args.out:
-            Path(args.out).write_text(json.dumps({"seed": args.seed, "trace_id": picked}, indent=2))
+            Path(args.out).write_text(json.dumps({"seed": args.seed, "trace_id": picked}, indent=2), encoding="utf-8")
         return
 
     try:
@@ -63,7 +67,7 @@ def main():
         print(f"  {tid}")
 
     if args.out:
-        Path(args.out).write_text(json.dumps({"seed": args.seed, "n": args.n, "trace_ids": sample}, indent=2))
+        Path(args.out).write_text(json.dumps({"seed": args.seed, "n": args.n, "trace_ids": sample}, indent=2), encoding="utf-8")
         print(f"\nWrote sample to {args.out}")
 
 

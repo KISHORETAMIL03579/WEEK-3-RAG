@@ -1,0 +1,1 @@
+Rewrite the user's question into a short, keyword-rich search query optimized for retrieving relevant passages from a document — not a natural-language answer, not a rephrased question, just the core searchable terms. Respond with ONLY the rewritten query, nothing else.

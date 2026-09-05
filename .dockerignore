@@ -32,3 +32,20 @@ Thumbs.db
 *.log
 server.log
 server.err.log
+
+# Testing & code quality caches
+.pytest_cache/
+.mypy_cache/
+.ruff_cache/
+.coverage
+htmlcov/
+
+# CI & metadata
+.github/
+project-structure.txt
+*.md
+
+# Container configurations
+Dockerfile*
+docker-compose*.yaml
+docker-compose*.yml

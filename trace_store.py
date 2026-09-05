@@ -12,16 +12,18 @@ replayable"). This module fixes that:
     to a trace file (JSONL — one call = one line, easy to `wc -l`, sample,
     and grep).
   * Each record carries every field requirement #1 asks for: prompt_version,
-    retrieved chunk_ids + scores, model + generation params, and the raw
-    (pre-postprocessing) model output — plus the final answer, timing, and
-    whether the context-validation gate passed.
-  * PII redaction runs BEFORE the record is built, not after — see redact().
-    Nothing unredacted ever reaches json.dumps().
+    prompt_hash, retrieved chunk_ids + scores, model + generation params, and
+    the raw (pre-postprocessing) model output — plus the final answer, timing,
+    and whether the context-validation gate passed.
+  * Defensive PII Redaction: TraceStore.log() strictly enforces best-effort deep regex
+    redaction on all fields before serialization to sanitize employee PII
+    before writing to traces.jsonl.
+  * Privacy-Preserving Replay: Replay operates as privacy-preserving replay,
+    re-executing the model call using the durable prompt template version artifact,
+    recorded generation parameters, and the persisted redacted context snapshot.
+    It does not claim bit-for-bit exact reproduction of unredacted raw PII.
   * sample() gives a seeded, provable random sample of trace_ids — pass the
     same seed to reproduce the same 20 rows.
-  * Replay reconstructs the exact context + prompt used for a trace_id and
-    re-runs the LLM call, so the original and replayed output can be shown
-    side by side (see replay_trace() in app.py, which uses this store).
 """
 
 from __future__ import annotations
@@ -86,39 +88,54 @@ def redact_deep(value):
 
 
 # ─────────────────────────────────────────────────────────────────────────────
-#  Prompt version registry
+#  Durable Prompt version registry
 # ─────────────────────────────────────────────────────────────────────────────
 #
 # Every system prompt sent to the LLM must be traceable to an exact version
-# string, so that (a) a trace records which prompt produced an answer and
-# (b) replay can look the exact text back up even if app.py's live prompt
-# has since changed. NEVER mutate an existing entry's text — bump the
-# version key instead, the way you would a migration.
+# string and stored durably on disk, so that (a) a trace records which prompt
+# produced an answer and (b) replay can look the exact text back up even across
+# process restarts. NEVER mutate an existing entry's text — bump the version
+# key instead, the way you would a migration.
 
 QA_PROMPT_VERSION = "qa-answer-v1"
 RERANK_PROMPT_VERSION = "rerank-v1"
 REWRITE_PROMPT_VERSION = "rewrite-v1"
 
 PROMPT_REGISTRY: dict[str, str] = {}
+PROMPTS_DIR = Path(__file__).parent / "prompts"
 
 
 def register_prompt(version: str, text: str) -> str:
-    """Register (or confirm) a prompt version's exact text. Returns the
-    text unchanged so callers can do `system = register_prompt(V, "...")`
-    inline at the definition site — one source of truth for both the live
-    call and future replay lookups."""
-    if version in PROMPT_REGISTRY and PROMPT_REGISTRY[version] != text:
-        raise ValueError(
-            f"Prompt version {version!r} already registered with different "
-            f"text. Bump the version string instead of editing it in place "
-            f"— replaying an old trace must use the prompt that produced it."
-        )
+    """Register (or confirm) a prompt version's exact text durably on disk.
+    Returns the text unchanged so callers can do `system = register_prompt(V, "...")`
+    inline at the definition site."""
+    PROMPTS_DIR.mkdir(parents=True, exist_ok=True)
+    prompt_file = PROMPTS_DIR / f"{version}.txt"
+    if prompt_file.exists():
+        stored_text = prompt_file.read_text(encoding="utf-8")
+        if stored_text != text:
+            raise ValueError(
+                f"Prompt version {version!r} already registered on disk with different "
+                f"text. Bump the version string instead of editing it in place "
+                f"— replaying an old trace must use the prompt that produced it."
+            )
+    else:
+        prompt_file.write_text(text, encoding="utf-8")
+
     PROMPT_REGISTRY[version] = text
     return text
 
 
 def get_prompt(version: str) -> str | None:
-    return PROMPT_REGISTRY.get(version)
+    """Retrieve prompt text by version from in-memory cache or durable disk artifact."""
+    if version in PROMPT_REGISTRY:
+        return PROMPT_REGISTRY[version]
+    prompt_file = PROMPTS_DIR / f"{version}.txt"
+    if prompt_file.exists():
+        text = prompt_file.read_text(encoding="utf-8")
+        PROMPT_REGISTRY[version] = text
+        return text
+    return None
 
 
 # ─────────────────────────────────────────────────────────────────────────────
@@ -126,7 +143,8 @@ def get_prompt(version: str) -> str | None:
 # ─────────────────────────────────────────────────────────────────────────────
 
 class TraceStore:
-    """Append-only JSONL trace log with lookup and seeded sampling."""
+    """Append-only JSONL trace log with defensive PII redaction, lookup,
+    and seeded sampling."""
 
     def __init__(self, path: str | Path):
         self.path = Path(path)
@@ -136,13 +154,20 @@ class TraceStore:
         self._lock = threading.Lock()
 
     def log(self, record: dict) -> str:
-        """Append one trace record. Assigns trace_id/timestamp if missing.
-        Returns the trace_id. Caller is responsible for having already
-        redacted any user-controlled text in `record` — this method does
-        NOT redact, so nothing bypasses redact()/redact_deep() by mistake."""
-        record = dict(record)
+        """Append one trace record. Applies best-effort defensive deep regex redaction
+        before persistence (regex coverage is not a complete PII detection guarantee).
+        Assigns trace_id, timestamp, and cryptographic prompt_hash if missing."""
+        # Enforce defensive deep redaction across all record fields
+        record = redact_deep(dict(record))
         record.setdefault("trace_id", str(uuid.uuid4()))
         record.setdefault("timestamp", datetime.now(timezone.utc).isoformat())
+
+        if "prompt_version" in record and "prompt_hash" not in record:
+            p_text = get_prompt(record["prompt_version"])
+            if p_text:
+                import hashlib
+                record["prompt_hash"] = "sha256:" + hashlib.sha256(p_text.encode("utf-8")).hexdigest()
+
         line = json.dumps(record, ensure_ascii=False)
         with self._lock:
             with self.path.open("a", encoding="utf-8") as f:
@@ -150,25 +175,30 @@ class TraceStore:
         return record["trace_id"]
 
     def all(self) -> list[dict]:
+        """Read all valid trace records from the JSONL log, logging warnings for any corrupted lines."""
         if not self.path.exists():
             return []
         out = []
         with self.path.open("r", encoding="utf-8") as f:
-            for line in f:
+            for line_no, line in enumerate(f, 1):
                 line = line.strip()
                 if not line:
                     continue
                 try:
                     out.append(json.loads(line))
-                except json.JSONDecodeError:
-                    continue
+                except json.JSONDecodeError as err:
+                    import logging
+                    logging.getLogger("trace_store").warning(
+                        "Skipping corrupted trace line %d in %s: %s (Error: %s)",
+                        line_no, self.path, line[:60], err
+                    )
         return out
 
     def all_ids(self) -> list[str]:
         return [r["trace_id"] for r in self.all() if "trace_id" in r]
 
     def get(self, trace_id: str) -> dict | None:
-        # Last-write-wins in case a trace_id somehow appears twice.
+        """Lookup a trace by trace_id (last-write-wins)."""
         match = None
         for r in self.all():
             if r.get("trace_id") == trace_id:
@@ -178,7 +208,9 @@ class TraceStore:
     def sample(self, n: int, seed: int) -> list[str]:
         """Seeded random sample of n trace_ids, sorted for a stable,
         pasteable write-up. Raises if fewer than n traces exist."""
-        ids = self.all_ids()
+        if n <= 0:
+            raise ValueError(f"Sample size n must be greater than 0, got {n}.")
+        ids = sorted(self.all_ids())
         if len(ids) < n:
             raise ValueError(
                 f"Only {len(ids)} traces logged so far — need at least {n} "
@@ -195,3 +227,7 @@ class TraceStore:
             return None
         rng = random.Random(seed)
         return rng.choice(sorted(ids))
+
+
+# Default instance for the module
+TRACES = TraceStore(Path(__file__).parent / "traces" / "traces.jsonl")

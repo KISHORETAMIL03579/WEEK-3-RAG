@@ -1,6 +1,19 @@
-﻿{
+{
   "git.autorefresh": true,
-  "git.autofetch": false,
+  "git.autofetch": true,
+  "git.autofetchPeriod": 180,
   "git.confirmSync": false,
-  "git.enableSmartCommit": true
+  "git.enableSmartCommit": true,
+  "git.decorations.enabled": true,
+  "git.showProgress": true,
+  "git.autoRepositoryDetection": true,
+  "files.watcherExclude": {
+    "**/.git/objects/**": true,
+    "**/.git/subtree-cache/**": true,
+    "**/.git/logs/**": true,
+    "**/node_modules/**": true,
+    "**/__pycache__/**": true,
+    "**/.pytest_cache/**": true
+  }
 }
+

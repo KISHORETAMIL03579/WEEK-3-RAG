@@ -9,16 +9,20 @@ import pickle
 import base64
 import tempfile
 import hashlib
+import hmac
 import logging
 import secrets
 import ipaddress
 import socket
+import threading
 import urllib.request
 import urllib.parse
 import urllib.error
 import html.parser
+from datetime import datetime, timezone
 from pathlib import Path
 from collections import Counter
+from filelock import FileLock
 
 try:
     import docx  # type: ignore
@@ -34,7 +38,7 @@ from werkzeug.utils import secure_filename
 
 from trace_store import (
     TraceStore, redact, redact_deep, register_prompt, get_prompt,
-    QA_PROMPT_VERSION,
+    QA_PROMPT_VERSION, RERANK_PROMPT_VERSION, REWRITE_PROMPT_VERSION,
 )
 
 try:
@@ -95,6 +99,11 @@ def setup_logger():
 logger = setup_logger()
 
 
+class RetrievalBackendError(RuntimeError):
+    """Raised when the vector database backend fails during retrieval."""
+    pass
+
+
 class RAGTracer:
     """Provides formatted step-by-step trace logging for document ingestion and retrieval pipelines."""
 
@@ -112,23 +121,21 @@ class RAGTracer:
 
 app = Flask(__name__)
 _env_secret = os.environ.get("SECRET_KEY")
+_env_mode = os.environ.get("FLASK_ENV", os.environ.get("ENV", "")).lower()
+
 if _env_secret:
     app.secret_key = _env_secret
+elif _env_mode == "production":
+    raise RuntimeError(
+        "CRITICAL: SECRET_KEY environment variable is mandatory in production mode. "
+        "Running with an ephemeral per-process key will break sessions across worker restarts."
+    )
 else:
-    # No hardcoded fallback — a shared, source-controlled secret key means
-    # every deployment that forgets to set SECRET_KEY signs session
-    # cookies with the same key, letting anyone forge another user's
-    # session. A random per-process key at least means cookies from one
-    # run can't be forged by someone who read this file; the real fix in
-    # any actual production deployment is still to set SECRET_KEY
-    # explicitly so sessions survive a restart.
     app.secret_key = secrets.token_hex(32)
     logger.warning(
-        "SECRET_KEY not set — using a random per-process key. Sessions will "
-        "NOT survive a server restart, and running multiple instances "
-        "(e.g. gunicorn --workers N) will break sessions since each "
-        "process gets a different key. Set SECRET_KEY explicitly for any "
-        "real deployment."
+        "SECRET_KEY not set — using a random per-process key for development. Sessions will "
+        "NOT survive a server restart, and running multiple workers (e.g. gunicorn) "
+        "will break sessions. Set SECRET_KEY explicitly for production deployments."
     )
 app.config["MAX_CONTENT_LENGTH"] = 50 * 1024 * 1024  # 50 MB per request
 
@@ -163,13 +170,196 @@ HASH_BY_DOC: dict[str, dict[str, tuple[str, str]]] = {}
 SESSION_FILES: dict[str, dict[str, dict]] = {}
 CHUNK_COUNTS: dict[str, dict[str, int]] = {}
 
+# ─────────────────────────────────────────────────────────────────────────────
+#  Durable Orphaned Document Registry (Operational Reconciliation)
+# ─────────────────────────────────────────────────────────────────────────────
+# When vector store rollback fails during upload or cancellation, the document
+# is durably logged to orphans.jsonl so the failure is preserved across process
+# restarts and observable across multiple worker processes.
+ORPHAN_LOG_PATH = Path(os.environ.get("ORPHAN_LOG_PATH", str(UPLOAD_FOLDER / "orphans.jsonl")))
+_ORPHAN_LOCK = threading.Lock()
+ORPHANED_DOCS: dict[str, list[dict]] = {}  # In-memory index: sid -> list of orphan records
+ADMIN_API_KEY = os.environ.get("ADMIN_API_KEY", "").strip()
+
+
+def _is_admin_request(req) -> bool:
+    """Validate administrative authorization via ADMIN_API_KEY (Bearer token or X-Admin-Key)."""
+    if not ADMIN_API_KEY:
+        return False
+    auth_header = req.headers.get("Authorization", "")
+    token = ""
+    if auth_header.startswith("Bearer "):
+        token = auth_header[7:].strip()
+    admin_header = req.headers.get("X-Admin-Key", "").strip()
+    candidate = token or admin_header
+    if not candidate:
+        return False
+    return hmac.compare_digest(candidate, ADMIN_API_KEY)
+
+
+def _get_orphan_lock(path: Path | None = None) -> FileLock:
+    """Acquire a cross-process file lock for the orphan log."""
+    target = path or ORPHAN_LOG_PATH
+    lock_path = str(target) + ".lock"
+    return FileLock(lock_path, timeout=10)
+
+
+def _record_orphaned_doc(sid: str, doc_id: str, filename: str, error: str, stored_path: Path | str | None = None) -> dict:
+    """Durably record an orphaned document in orphans.jsonl and in-memory registry.
+    If durable file persistence fails, emit CRITICAL operational failure and flag
+    reconciliation_persistence_failed=True."""
+    record = {
+        "session_id": sid,
+        "doc_id": doc_id,
+        "filename": filename,
+        "error": str(error),
+        "stored_path": str(stored_path) if stored_path else None,
+        "timestamp": datetime.now(timezone.utc).isoformat(),
+        "status": "orphaned",
+    }
+    with _ORPHAN_LOCK:
+        try:
+            ORPHAN_LOG_PATH.parent.mkdir(parents=True, exist_ok=True)
+            with _get_orphan_lock():
+                with ORPHAN_LOG_PATH.open("a", encoding="utf-8") as f:
+                    f.write(json.dumps(record, ensure_ascii=False) + "\n")
+                    f.flush()
+                    if hasattr(os, "fsync"):
+                        try:
+                            os.fsync(f.fileno())
+                        except OSError as fsync_err:
+                            raise OSError(f"Orphan log fsync failed: {fsync_err}") from fsync_err
+        except Exception as exc:
+            record["reconciliation_persistence_failed"] = True
+            logger.critical(
+                "❌ CRITICAL OPERATIONAL FAILURE: Failed to write orphan reconciliation record to %s "
+                "for doc %s (session %s): %s. Durable reconciliation tracking failed!",
+                ORPHAN_LOG_PATH, doc_id, sid, exc, exc_info=True,
+            )
+
+        # Update in-memory registry
+        ORPHANED_DOCS.setdefault(sid, []).append(record)
+    return record
+
+
+def _resolve_orphaned_doc(sid: str, doc_id: str) -> bool:
+    """Mark an orphan record as resolved when successful cleanup occurs,
+    appending the resolution event durably so restarts do not resurrect it.
+    Durable resolution is the authoritative state transition: the orphan
+    is only removed from in-memory cache after durable persistence succeeds."""
+    with _ORPHAN_LOCK:
+        in_memory_match = any(o.get("doc_id") == doc_id for o in ORPHANED_DOCS.get(sid, []))
+        if not in_memory_match:
+            durable_records = _read_durable_orphans()
+            if not any(o.get("doc_id") == doc_id for o in durable_records.get(sid, [])):
+                return False
+
+        record = {
+            "session_id": sid,
+            "doc_id": doc_id,
+            "status": "resolved",
+            "timestamp": datetime.now(timezone.utc).isoformat(),
+        }
+
+        # Step 1: Durably append resolution record first
+        try:
+            ORPHAN_LOG_PATH.parent.mkdir(parents=True, exist_ok=True)
+            with _get_orphan_lock():
+                with ORPHAN_LOG_PATH.open("a", encoding="utf-8") as f:
+                    f.write(json.dumps(record, ensure_ascii=False) + "\n")
+                    f.flush()
+                    if hasattr(os, "fsync"):
+                        try:
+                            os.fsync(f.fileno())
+                        except OSError as fsync_err:
+                            raise OSError(f"Orphan log fsync failed during resolution: {fsync_err}") from fsync_err
+        except Exception as exc:
+            logger.critical(
+                "❌ CRITICAL OPERATIONAL FAILURE: Failed to write orphan resolution to %s for doc %s (session %s): %s. "
+                "Orphan remains active in memory so reconciliation is not falsely dropped!",
+                ORPHAN_LOG_PATH, doc_id, sid, exc, exc_info=True,
+            )
+            return False
+
+        # Step 2: ONLY mutate in-memory cache after durable persistence succeeds
+        if sid in ORPHANED_DOCS:
+            ORPHANED_DOCS[sid] = [o for o in ORPHANED_DOCS[sid] if o.get("doc_id") != doc_id]
+
+        return True
+
+
+def _read_durable_orphans(path: Path | None = None) -> dict[str, list[dict]]:
+    """Read and validate all durable orphan log records from disk,
+    replaying additions and resolutions to produce the current unresolved orphan state.
+    This guarantees cross-worker visibility by reading directly from shared durable storage."""
+    log_path = path or ORPHAN_LOG_PATH
+    if not log_path.exists():
+        return {}
+
+    orphans_by_sid: dict[str, list[dict]] = {}
+    try:
+        with _get_orphan_lock(log_path):
+            with log_path.open("r", encoding="utf-8") as f:
+                for line_no, line in enumerate(f, 1):
+                    line = line.strip()
+                    if not line:
+                        continue
+                    try:
+                        record = json.loads(line)
+                    except json.JSONDecodeError as err:
+                        logger.warning("Corrupted orphan log line %d in %s: %s", line_no, log_path, err)
+                        continue
+
+                    if not isinstance(record, dict):
+                        logger.warning("Malformed orphan record (not an object) on line %d in %s", line_no, log_path)
+                        continue
+
+                    sid = record.get("session_id")
+                    doc_id = record.get("doc_id")
+                    status = record.get("status")
+
+                    # Strict schema validation: non-empty session_id, doc_id, and recognized status
+                    if not isinstance(sid, str) or not sid.strip() or not isinstance(doc_id, str) or not doc_id.strip():
+                        logger.warning(
+                            "Quarantining malformed orphan record on line %d in %s "
+                            "(missing or invalid session_id/doc_id): %s",
+                            line_no, log_path, record,
+                        )
+                        continue
+
+                    if status == "resolved":
+                        if sid in orphans_by_sid:
+                            orphans_by_sid[sid] = [o for o in orphans_by_sid[sid] if o.get("doc_id") != doc_id]
+                    elif status == "orphaned":
+                        orphans_by_sid.setdefault(sid, []).append(record)
+                    else:
+                        logger.warning(
+                            "Quarantining orphan record on line %d in %s with unknown status '%s': %s",
+                            line_no, log_path, status, record,
+                        )
+                        continue
+    except Exception as exc:
+        logger.error("Failed to read durable orphan records from %s: %s", log_path, exc, exc_info=True)
+
+    return orphans_by_sid
+
+
+def _load_orphaned_docs() -> None:
+    """Load durable orphan records from disk into the in-memory cache on startup."""
+    with _ORPHAN_LOCK:
+        ORPHANED_DOCS.clear()
+        durable = _read_durable_orphans()
+        for sid, records in durable.items():
+            ORPHANED_DOCS[sid] = list(records)
+
+
 # Maps a client-generated upload_id -> the time it was cancelled. /upload
 # checks this (see below) so a mid-flight cancel can (a) stop processing
 # any remaining files in a multi-file batch, and (b) roll back whatever
 # was already added to the store during THIS call before the response
-# goes out — since a single embedding call can take real wall-clock time,
-# this is the honest, achievable version of "cancel": not always an
-# instant interrupt, but a guaranteed "nothing stays indexed" outcome.
+# goes out. Attempt to stop/rollback this upload's work. Backend deletion can fail,
+# so incomplete cleanup is explicitly reported and reconciliation metadata
+# is retained when possible.
 CANCELLED_UPLOADS: dict[str, float] = {}
 CANCELLED_UPLOAD_TTL = 10 * 60  # forget stale cancel signals after 10 minutes
 
@@ -350,18 +540,15 @@ _simple_tokenizer = re.compile(r"[\w]+")
 
 def _xai_chat_call(system: str, user: str,
                    temperature: float = 0,
-                   max_tokens: int | None = None) -> str:
+                   max_tokens: int | None = None,
+                   model: str | None = None) -> str:
     """Call xAI's OpenAI-compatible /v1/chat/completions endpoint, with
     automatic exponential backoff retry on HTTP 429/500/503.
-
-    Replaces the old Gemini generateContent-based chat call. Kept the same
-    signature (system, user, temperature, max_tokens) -> str as the old
-    _gemini_chat_call so every call site (generate_answer, rerank_with_llm,
-    rewrite_query) needed only a name change, not a rewrite.
     """
     url = f"{XAI_URL}/chat/completions"
+    target_model = model or XAI_MODEL
     payload: dict = {
-        "model": XAI_MODEL,
+        "model": target_model,
         "messages": [
             {"role": "system", "content": system},
             {"role": "user", "content": user},
@@ -393,7 +580,7 @@ def _xai_chat_call(system: str, user: str,
                 logger.warning("⚠️ xAI response has no choices (raw: %s)", data)
                 return ""
             result_text = (choices[0].get("message", {}).get("content") or "").strip()
-            logger.info("🤖 xAI (Grok) LLM call succeeded in %.2fs (model: %s)", elapsed, XAI_MODEL)
+            logger.info("🤖 xAI (Grok) LLM call succeeded in %.2fs (model: %s)", elapsed, target_model)
             return result_text
         except urllib.error.HTTPError as exc:
             if exc.code in (429, 500, 503) and attempt < max_retries:
@@ -420,20 +607,16 @@ def _xai_chat_call(system: str, user: str,
 
 def _ollama_chat_call(system: str, user: str,
                       temperature: float = 0,
-                      max_tokens: int | None = None) -> str:
-    """Call a locally-running Ollama chat model via its native /api/chat
-    endpoint. No API key, no rate limit, no per-token cost — but a
-    locally-runnable model is meaningfully weaker at grounded
-    citation-following than a frontier cloud model; expect looser
-    instruction adherence. Same (system, user, temperature, max_tokens)
-    -> str signature as _xai_chat_call so callers don't need to care
-    which backend is actually running."""
+                      max_tokens: int | None = None,
+                      model: str | None = None) -> str:
+    """Call a locally-running Ollama chat model via its native /api/chat endpoint."""
     url = f"{OLLAMA_URL}/api/chat"
+    target_model = model or OLLAMA_CHAT_MODEL
     options: dict = {"temperature": temperature}
     if max_tokens is not None:
         options["num_predict"] = max_tokens
     payload = {
-        "model": OLLAMA_CHAT_MODEL,
+        "model": target_model,
         "messages": [
             {"role": "system", "content": system},
             {"role": "user", "content": user},
@@ -453,12 +636,12 @@ def _ollama_chat_call(system: str, user: str,
             data = json.loads(resp.read().decode("utf-8"))
         elapsed = time.time() - t0
         result_text = (data.get("message", {}).get("content") or "").strip()
-        logger.info("🤖 Ollama (%s) LLM call succeeded in %.2fs", OLLAMA_CHAT_MODEL, elapsed)
+        logger.info("🤖 Ollama (%s) LLM call succeeded in %.2fs", target_model, elapsed)
         return result_text
     except urllib.error.URLError as exc:
         logger.error(
             "❌ Could not reach Ollama at %s — is `ollama serve` running and "
-            "`%s` pulled? (%s)", OLLAMA_URL, OLLAMA_CHAT_MODEL, exc,
+            "`%s` pulled? (%s)", OLLAMA_URL, target_model, exc,
         )
         raise
     except Exception as exc:
@@ -468,15 +651,13 @@ def _ollama_chat_call(system: str, user: str,
 
 def _chat_call(system: str, user: str,
                temperature: float = 0,
-               max_tokens: int | None = None) -> str:
+               max_tokens: int | None = None,
+               model: str | None = None) -> str:
     """Single entry point for every chat/generation call in this file —
-    routes to xAI or a local Ollama model per CHAT_BACKEND. generate_answer,
-    rerank_with_llm, rewrite_query, and the /replay endpoint all go through
-    this instead of calling _xai_chat_call/_ollama_chat_call directly, so
-    CHAT_BACKEND is the only place that decision gets made."""
+    routes to xAI or a local Ollama model per CHAT_BACKEND."""
     if CHAT_BACKEND == "ollama":
-        return _ollama_chat_call(system, user, temperature=temperature, max_tokens=max_tokens)
-    return _xai_chat_call(system, user, temperature=temperature, max_tokens=max_tokens)
+        return _ollama_chat_call(system, user, temperature=temperature, max_tokens=max_tokens, model=model)
+    return _xai_chat_call(system, user, temperature=temperature, max_tokens=max_tokens, model=model)
 
 
 def _chat_configured() -> bool:
@@ -733,22 +914,31 @@ def _manifest_path(sid: str) -> Path:
     return UPLOAD_FOLDER / f"{sid}.manifest.json"
 
 
+_MANIFEST_MTIMES: dict[str, float] = {}
+
+
 def _save_session_manifest(sid: str) -> None:
-    """Persist the doc_id → file mapping so it survives a server restart."""
+    """Persist the doc_id -> file mapping so it survives a server restart and syncs across workers."""
     files = SESSION_FILES.get(sid)
+    mpath = _manifest_path(sid)
     if files:
-        _manifest_path(sid).write_text(json.dumps({
+        tmp_path = mpath.with_suffix(".tmp")
+        tmp_path.write_text(json.dumps({
             doc_id: {"path": str(info["path"]), "name": info["name"]}
             for doc_id, info in files.items()
         }), encoding="utf-8")
+        tmp_path.replace(mpath)
+        try:
+            _MANIFEST_MTIMES[sid] = mpath.stat().st_mtime
+        except OSError:
+            pass
     else:
-        _manifest_path(sid).unlink(missing_ok=True)
+        mpath.unlink(missing_ok=True)
+        _MANIFEST_MTIMES.pop(sid, None)
 
 
 def _load_session_manifest(sid: str) -> None:
     """Restore the file mapping for a session from disk."""
-    if sid in SESSION_FILES:
-        return
     manifest = _manifest_path(sid)
     if not manifest.exists():
         return
@@ -762,7 +952,7 @@ def _load_session_manifest(sid: str) -> None:
         p = Path(meta.get("path", ""))
         if p.exists():
             files[doc_id] = {"path": p, "name": meta.get("name", p.name)}
-    if files:
+    if files or sid in SESSION_FILES:
         SESSION_FILES[sid] = files
 
 
@@ -787,13 +977,14 @@ def _sweep_orphan_uploads() -> None:
         for meta in data.values():
             referenced.add(str(Path(meta.get("path", "")).resolve()))
     for f in UPLOAD_FOLDER.iterdir():
-        if f.name.endswith(".manifest.json"):
+        if f.name.endswith(".manifest.json") or f.name.endswith(".jsonl") or f.name.endswith(".lock"):
             continue
         if str(f.resolve()) not in referenced:
             f.unlink(missing_ok=True)
 
 
 _sweep_orphan_uploads()
+_load_orphaned_docs()
 
 
 def _make_store(sid: str):
@@ -845,12 +1036,35 @@ def _get_store(sid: str) -> VectorStore:
         _evict_session_store(oldest)
         _cleanup_session_files(oldest)
     SESSION_ACCESS[sid] = now
-    _load_session_manifest(sid)
+    manifest = _manifest_path(sid)
+    current_mtime = None
+    if manifest.exists():
+        try:
+            current_mtime = manifest.stat().st_mtime
+        except OSError:
+            pass
 
     store = VECTOR_STORE.get(sid)
     if store is None:
+        _load_session_manifest(sid)
         store = _make_store(sid)
         VECTOR_STORE[sid] = store
+        if current_mtime is not None:
+            _MANIFEST_MTIMES[sid] = current_mtime
+    else:
+        last_mtime = _MANIFEST_MTIMES.get(sid)
+        if current_mtime is not None and (last_mtime is None or current_mtime > last_mtime):
+            _load_session_manifest(sid)
+            try:
+                store.load()
+            except Exception as e:
+                logger.warning("Failed to reload store mirror during worker sync for %s: %s", sid, e)
+            _MANIFEST_MTIMES[sid] = current_mtime
+        elif current_mtime is None and last_mtime is not None:
+            SESSION_FILES.pop(sid, None)
+            _MANIFEST_MTIMES.pop(sid, None)
+            store.chunks, store.vectors = [], []
+            store._tfidf_index_cache = None
     return store
 
 
@@ -1101,6 +1315,10 @@ class _TextExtractor(html.parser.HTMLParser):
         return text.strip()
 
 
+MAX_URL_FETCH_BYTES = 10 * 1024 * 1024  # 10 MB maximum web page download limit
+URL_FETCH_TIMEOUT = 15  # 15 seconds per fetch hop
+
+
 def _is_public_ip(ip_str: str) -> bool:
     try:
         ip = ipaddress.ip_address(ip_str)
@@ -1115,15 +1333,7 @@ def _is_public_ip(ip_str: str) -> bool:
 def _validate_url_is_public(url: str) -> None:
     """
     Raise ValueError if `url` resolves to a private/loopback/link-local/
-    reserved address.
-
-    Why: without this, /load-url is a classic SSRF (server-side request
-    forgery) vector — someone points it at http://169.254.169.254/ (a
-    cloud metadata endpoint), http://localhost:6379 (an internal Redis),
-    or any other service only the SERVER can reach, and the fetched
-    content gets indexed and can be echoed back in answers. Scheme
-    validation alone (http/https only) does nothing to stop this, since
-    the hostname itself is the problem, not the protocol.
+    reserved address or unauthorized internal port.
     """
     parsed = urllib.parse.urlparse(url)
     if parsed.scheme not in ("http", "https"):
@@ -1131,10 +1341,23 @@ def _validate_url_is_public(url: str) -> None:
     hostname = parsed.hostname
     if not hostname:
         raise ValueError("URL has no hostname")
+
+    h_lower = hostname.lower()
+    if (h_lower in ("localhost", "0.0.0.0", "127.0.0.1", "::1", "169.254.169.254")
+            or h_lower.endswith(".local") or h_lower.endswith(".internal")):
+        raise ValueError(f"URL hostname '{hostname}' resolves to a non-public/internal address — refusing to fetch")
+
+    if parsed.port and parsed.port not in (80, 443, 8080, 8443):
+        raise ValueError(f"Port {parsed.port} is not allowed for web document ingestion")
+
     try:
         infos = socket.getaddrinfo(hostname, None)
     except socket.gaierror as exc:
         raise ValueError(f"Could not resolve hostname '{hostname}': {exc}") from exc
+
+    if not infos:
+        raise ValueError(f"Could not resolve hostname '{hostname}' to an IP address")
+
     for family, _, _, _, sockaddr in infos:
         ip_str = sockaddr[0]
         if not _is_public_ip(ip_str):
@@ -1153,15 +1376,8 @@ class _NoAutoRedirect(urllib.request.HTTPRedirectHandler):
 
 def fetch_web_page(url: str, max_redirects: int = 5) -> tuple[str, str]:
     """
-    Fetch a URL and return (title, cleaned text).
-
-    Redirects are followed manually, one hop at a time, re-running
-    _validate_url_is_public() on every hop — not just the URL the user
-    typed. Trusting urllib's built-in automatic redirect handling would
-    mean the SSRF check only ever covers the first URL; a malicious or
-    compromised site could return `301 -> http://169.254.169.254/` and
-    the server would have already made that internal request before any
-    validation saw it.
+    Fetch a URL and return (title, cleaned text) with SSRF checks on every redirect hop,
+    response size limiting, and strict connection timeouts.
     """
     opener = urllib.request.build_opener(_NoAutoRedirect)
     current = url
@@ -1174,8 +1390,11 @@ def fetch_web_page(url: str, max_redirects: int = 5) -> tuple[str, str]:
             headers={"User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 AskMyDocs/1.0"},
         )
         try:
-            with opener.open(req, timeout=30) as resp:
-                raw = resp.read().decode("utf-8", errors="ignore")
+            with opener.open(req, timeout=URL_FETCH_TIMEOUT) as resp:
+                raw_bytes = resp.read(MAX_URL_FETCH_BYTES + 1)
+                if len(raw_bytes) > MAX_URL_FETCH_BYTES:
+                    raise ValueError(f"Page exceeded {MAX_URL_FETCH_BYTES // (1024 * 1024)} MB size limit")
+                raw = raw_bytes.decode("utf-8", errors="ignore")
             break
         except urllib.error.HTTPError as e:
             if e.code in (301, 302, 303, 307, 308):
@@ -1944,28 +2163,15 @@ def validate_context(results: list[dict], min_score: float, query: str = None,
     return True
 
 
-def _is_dont_know(answer: str) -> bool:
+def _is_dont_know(answer: str | None) -> bool:
     """
     Detects a genuine refusal, not just the incidental presence of a
     refusal-like phrase somewhere in a real answer.
-
-    Why this can't be a plain substring search: the system prompt asks
-    the model to reply with EXACTLY "I don't know." when it can't
-    answer — but a real, substantive, correctly-cited answer to a broad
-    question (e.g. one spanning two sections of a document) can easily
-    include a hedging clause like "the manual does not contain a single
-    consolidated list, but section 2.2 states..." A naive `marker in
-    answer` check flags that whole answer as "not found" and the
-    frontend discards it entirely, even though the model did answer.
-
-    So: check for an exact (or near-exact, allowing trivial punctuation)
-    match to the instructed refusal first. As a fallback, catch short
-    responses that are still basically just a refusal in slightly
-    different words — but require the response to actually BE short, so
-    a hedge embedded in a longer, real answer is never caught by this.
     """
+    if not answer or not answer.strip():
+        return True
     a = answer.lower().strip()
-    if a.rstrip(".") in ("i don't know", "i do not know"):
+    if a.rstrip(".").strip() in ("i don't know", "i do not know"):
         return True
     word_count = len(a.split())
     return word_count <= 12 and any(m in a for m in _DONT_KNOW_MARKERS)
@@ -2014,16 +2220,7 @@ def rerank_with_llm(query: str, results: list[dict]) -> tuple[list[dict], float 
 
     candidates = results[:RERANK_TOP_N]
     numbered = "\n\n".join(f"[{i}] {c['text'][:600]}" for i, c in enumerate(candidates))
-    system = (
-        "You score search results for relevance to a question. Given a "
-        "question and numbered candidate excerpts, respond with ONLY a "
-        "JSON array of objects, one per candidate, each with \"index\" "
-        "and \"score\" (0-10, where 10 means the excerpt directly and "
-        "fully answers the question, 0 means completely unrelated — "
-        "judge genuine relevance, not just shared words). Order the "
-        "array from highest score to lowest. No other text — just the "
-        "JSON array, e.g. [{\"index\":2,\"score\":9},{\"index\":0,\"score\":3}]."
-    )
+    system = RERANK_SYSTEM_PROMPT
     user = f"Question: {query}\n\nCandidates:\n{numbered}"
     try:
         raw = _chat_call(system, user, temperature=0, max_tokens=300)
@@ -2044,6 +2241,39 @@ def rerank_with_llm(query: str, results: list[dict]) -> tuple[list[dict], float 
 
 QUERY_REWRITE_ENABLED = os.environ.get("QUERY_REWRITE_ENABLED", "false").lower() == "true"
 
+RERANK_SYSTEM_PROMPT = register_prompt(RERANK_PROMPT_VERSION, (
+    "You score search results for relevance to a question. Given a "
+    "question and numbered candidate excerpts, respond with ONLY a "
+    "JSON array of objects, one per candidate, each with \"index\" "
+    "and \"score\" (0-10, where 10 means the excerpt directly and "
+    "fully answers the question, 0 means completely unrelated — "
+    "judge genuine relevance, not just shared words). Order the "
+    "array from highest score to lowest. No other text — just the "
+    "JSON array, e.g. [{\"index\":2,\"score\":9},{\"index\":0,\"score\":3}]."
+))
+
+REWRITE_SYSTEM_PROMPT = register_prompt(REWRITE_PROMPT_VERSION, (
+    "Rewrite the user's question into a short, keyword-rich search "
+    "query optimized for retrieving relevant passages from a "
+    "document — not a natural-language answer, not a rephrased "
+    "question, just the core searchable terms. Respond with ONLY "
+    "the rewritten query, nothing else."
+))
+
+QA_SYSTEM_PROMPT = register_prompt(QA_PROMPT_VERSION, (
+    "You are a grounded question-answering assistant. Answer using ONLY the "
+    "document excerpts provided. Cite every fact with its source number like "
+    "[1] or [2]. If the excerpts do not contain enough information to answer "
+    "the question, reply exactly with: \"I don't know.\" Do not use outside "
+    "knowledge. Match your answer's length to what the question actually "
+    "needs — a short, direct sentence or two for a simple factual question, "
+    "but a longer, complete answer (including every item, if the source "
+    "material itself lists several, such as a numbered or lettered list) "
+    "for a question that calls for it. Never omit relevant details from the "
+    "excerpts just to keep the answer short; completeness for the specific "
+    "question asked matters more than brevity."
+))
+
 
 def rewrite_query(query: str) -> str:
     """
@@ -2061,13 +2291,7 @@ def rewrite_query(query: str) -> str:
     """
     if not query.strip() or not _chat_configured():
         return query
-    system = (
-        "Rewrite the user's question into a short, keyword-rich search "
-        "query optimized for retrieving relevant passages from a "
-        "document — not a natural-language answer, not a rephrased "
-        "question, just the core searchable terms. Respond with ONLY "
-        "the rewritten query, nothing else."
-    )
+    system = REWRITE_SYSTEM_PROMPT
     try:
         rewritten = _chat_call(system, query, temperature=0, max_tokens=60).strip('"')
         return rewritten if rewritten else query
@@ -2079,19 +2303,7 @@ def rewrite_query(query: str) -> str:
 
 def generate_answer(query: str, results: list[dict], temperature: float = 0.0) -> str:
     """Ask the LLM to produce a grounded answer with [N] source citations."""
-    system = register_prompt(QA_PROMPT_VERSION, (
-        "You are a grounded question-answering assistant. Answer using ONLY the "
-        "document excerpts provided. Cite every fact with its source number like "
-        "[1] or [2]. If the excerpts do not contain enough information to answer "
-        "the question, reply exactly with: \"I don't know.\" Do not use outside "
-        "knowledge. Match your answer's length to what the question actually "
-        "needs — a short, direct sentence or two for a simple factual question, "
-        "but a longer, complete answer (including every item, if the source "
-        "material itself lists several, such as a numbered or lettered list) "
-        "for a question that calls for it. Never omit relevant details from the "
-        "excerpts just to keep the answer short; completeness for the specific "
-        "question asked matters more than brevity."
-    ))
+    system = QA_SYSTEM_PROMPT
     user = build_qa_user_prompt(query, results)
 
     try:
@@ -2201,6 +2413,7 @@ def upload():
             safe_name = f"{safe_name}.{ext}"
         filepath = UPLOAD_FOLDER / f"{uuid.uuid4()}_{safe_name}"
 
+        dedupe_key = None
         try:
             f.save(filepath)
             with open(filepath, "rb") as fh:
@@ -2268,7 +2481,7 @@ def upload():
             })
         except Exception as exc:
             filepath.unlink(missing_ok=True)
-            if "dedupe_key" in locals():
+            if dedupe_key is not None:
                 hashes.discard(dedupe_key)
             logger.error("❌ Exception during processing '%s': %s", original_name, exc, exc_info=True)
             results.append({"filename": original_name, "error": f"Failed to index: {exc}"})
@@ -2292,32 +2505,39 @@ def upload():
             hashes.discard(item["hash"])
             logger.warning("🚫 Upload cancelled by client for upload_id %s", upload_id)
             continue
+
+        added_to_store = False
+        stored_path = None
         try:
             embedding_degraded = False
-            if embedding_ok:
+            if VECTOR_BACKEND == "qdrant":
+                if not embedding_ok:
+                    raise ValueError(
+                        "Qdrant vector backend requires embeddings. "
+                        "Configure an embedding backend (e.g. GEMINI_API_KEY or OLLAMA) first."
+                    )
                 try:
                     vectors = embed_texts([c["text"] for c in item["chunks"]])
                 except Exception as embed_exc:
-                    # EMBED_BACKEND being *configured* (embedding_ok=True)
-                    # doesn't mean the embedding call will actually succeed
-                    # — e.g. EMBED_BACKEND=ollama with no local `ollama
-                    # serve` running. Previously this fell all the way
-                    # through to the outer except below and failed the
-                    # WHOLE document with no indexing at all. Degrade
-                    # gracefully instead: index this document without
-                    # vectors (BM25/TF-IDF keyword search still works for
-                    # it) and surface the degradation to the caller rather
-                    # than silently losing the upload.
-                    logger.warning(
-                        "⚠️ Embedding failed for '%s', indexing without vectors "
-                        "(keyword search only for this document): %s",
-                        item["filename"], embed_exc,
-                    )
-                    vectors = []
-                    embedding_degraded = True
+                    raise ValueError(f"Embedding generation failed on Qdrant backend: {embed_exc}") from embed_exc
             else:
-                vectors = []
+                # Memory/TF-IDF backend: can degrade gracefully if embedding fails
+                if embedding_ok:
+                    try:
+                        vectors = embed_texts([c["text"] for c in item["chunks"]])
+                    except Exception as embed_exc:
+                        logger.warning(
+                            "⚠️ Embedding failed for '%s', indexing without vectors "
+                            "(keyword search only for this document): %s",
+                            item["filename"], embed_exc,
+                        )
+                        vectors = []
+                        embedding_degraded = True
+                else:
+                    vectors = []
+
             store.add(item["chunks"], vectors)
+            added_to_store = True
 
             stored_path = UPLOAD_FOLDER / f"{sid}__{item['doc_id']}.{item['ext']}"
             item["filepath"].replace(stored_path)
@@ -2350,36 +2570,117 @@ def upload():
                 "Total Session Chunks": len(store.chunks),
             })
             logger.info("✅ Indexed '%s' (%d chunks, vectors: %s, total store: %d chunks)",
-                        item["filename"], len(item["chunks"]), "yes" if embedding_ok else "no", len(store.chunks))
+                        item["filename"], len(item["chunks"]), "yes" if bool(vectors) else "no", len(store.chunks))
         except Exception as exc:
+            # Transaction rollback for this document
+            cleanup_complete = True
+            cleanup_error = None
+            orphan_rec = None
+            if added_to_store:
+                try:
+                    store.remove_doc(item["doc_id"])
+                    _resolve_orphaned_doc(sid, item["doc_id"])
+                except Exception as rb_exc:
+                    cleanup_complete = False
+                    cleanup_error = f"Vector store rollback failed: {rb_exc}"
+                    logger.error(
+                        "❌ CRITICAL: Failed to rollback vector store for doc %s ('%s'): %s. Vector may be orphaned.",
+                        item["doc_id"], item["filename"], rb_exc, exc_info=True,
+                    )
+                    orphan_rec = _record_orphaned_doc(
+                        sid=sid,
+                        doc_id=item["doc_id"],
+                        filename=item["filename"],
+                        error=str(rb_exc),
+                        stored_path=stored_path or item["filepath"],
+                    )
+            if stored_path and stored_path.exists():
+                stored_path.unlink(missing_ok=True)
             item["filepath"].unlink(missing_ok=True)
             hashes.discard(item["hash"])
+            SESSION_FILES.get(sid, {}).pop(item["doc_id"], None)
+            HASH_BY_DOC.get(sid, {}).pop(item["doc_id"], None)
+            try:
+                _save_session_manifest(sid)
+            except Exception:
+                pass
             logger.error("❌ Failed to index '%s': %s", item["filename"], exc, exc_info=True)
-            results.append({"filename": item["filename"],
-                            "error": f"Failed to index: {exc}"})
+            doc_res = {
+                "filename": item["filename"],
+                "error": f"Failed to index: {exc}",
+                "cleanup_complete": cleanup_complete,
+            }
+            if not cleanup_complete:
+                doc_res["cleanup_error"] = cleanup_error
+                doc_res["doc_id"] = item["doc_id"]
+                if orphan_rec and orphan_rec.get("reconciliation_persistence_failed"):
+                    doc_res["reconciliation_persistence_failed"] = True
+            results.append(doc_res)
 
     # Final check: even if cancellation only arrived after every file had
-    # already finished committing, honor it anyway — roll back everything
-    # this call just added rather than leave it silently indexed. This is
-    # the guaranteed part of "cancel": maybe not always an instant stop,
-    # but always a clean "nothing stays indexed" outcome.
+    # already finished committing, honor it anyway. Attempt to stop/rollback
+    # this upload's work. Backend deletion can fail, so incomplete cleanup
+    # is explicitly reported and reconciliation metadata is retained when possible.
     if upload_id and upload_id in CANCELLED_UPLOADS:
         was_cancelled = True
     if was_cancelled:
         logger.warning("🚫 Rolling back %d committed doc(s) due to upload cancellation", len(committed_doc_ids))
+        failed_rollbacks = []
         for doc_id in committed_doc_ids:
-            store.remove_doc(doc_id)
-            info = SESSION_FILES.get(sid, {}).pop(doc_id, None)
-            if info:
-                info["path"].unlink(missing_ok=True)
-            doc_hash = HASH_BY_DOC.get(sid, {}).pop(doc_id, None)
-            if doc_hash is not None:
-                hashes.discard(doc_hash)
+            rollback_ok = False
+            try:
+                store.remove_doc(doc_id)
+                rollback_ok = True
+                _resolve_orphaned_doc(sid, doc_id)
+            except Exception as rb_err:
+                logger.error("❌ Failed to remove doc %s from store during cancellation: %s", doc_id, rb_err, exc_info=True)
+                file_info = SESSION_FILES.get(sid, {}).get(doc_id)
+                orphan_rec = _record_orphaned_doc(
+                    sid=sid,
+                    doc_id=doc_id,
+                    filename=file_info.get("name") if file_info else "unknown",
+                    error=str(rb_err),
+                    stored_path=file_info.get("path") if file_info else None,
+                )
+                failed_rollbacks.append({
+                    "doc_id": doc_id,
+                    "error": str(rb_err),
+                    "reconciliation_persistence_failed": bool(orphan_rec.get("reconciliation_persistence_failed")),
+                })
+
+            if rollback_ok:
+                info = SESSION_FILES.get(sid, {}).pop(doc_id, None)
+                if info:
+                    info["path"].unlink(missing_ok=True)
+                doc_hash = HASH_BY_DOC.get(sid, {}).pop(doc_id, None)
+                if doc_hash is not None:
+                    hashes.discard(doc_hash)
+            else:
+                # Retain metadata in SESSION_FILES flagged as orphan so reconciliation is possible
+                if sid in SESSION_FILES and doc_id in SESSION_FILES[sid]:
+                    SESSION_FILES[sid][doc_id]["orphan"] = True
+                    SESSION_FILES[sid][doc_id]["rollback_error"] = str(failed_rollbacks[-1]["error"])
+
         _save_session_manifest(sid)
         CANCELLED_UPLOADS.pop(upload_id, None)
-        return jsonify({"ok": False, "cancelled": True,
-                        "error": "Upload cancelled — nothing was indexed.",
-                        "documents": []})
+
+        if failed_rollbacks:
+            return jsonify({
+                "ok": False,
+                "cancelled": True,
+                "cleanup_complete": False,
+                "error": f"Upload cancelled but cleanup was incomplete: failed to remove {len(failed_rollbacks)} document(s) from vector store.",
+                "failed_cleanup": failed_rollbacks,
+                "documents": [],
+            }), 200
+        else:
+            return jsonify({
+                "ok": False,
+                "cancelled": True,
+                "cleanup_complete": True,
+                "error": "Upload cancelled — nothing was indexed.",
+                "documents": [],
+            }), 200
 
     return jsonify({"ok": True, "documents": results, "total_chunks": len(store.chunks),
                     "chunk_comparison": CHUNK_COUNTS.get(sid, {})})
@@ -2421,14 +2722,25 @@ def load_url():
         return jsonify({"error": "No chunks produced from this page."}), 400
 
     store = _get_store(sid)
-    if embedding_ok:
+    if VECTOR_BACKEND == "qdrant":
+        if not embedding_ok:
+            return jsonify({
+                "error": "Qdrant vector backend requires embeddings. Configure an embedding backend first."
+            }), 503
         try:
             vectors = embed_texts([c["text"] for c in new_chunks])
             store.add(new_chunks, vectors)
         except Exception as exc:
-            return jsonify({"error": f"Embedding failed: {exc}"}), 500
+            return jsonify({"error": f"Embedding/indexing failed on Qdrant backend: {exc}"}), 503
     else:
-        store.add(new_chunks, [])
+        if embedding_ok:
+            try:
+                vectors = embed_texts([c["text"] for c in new_chunks])
+                store.add(new_chunks, vectors)
+            except Exception as exc:
+                return jsonify({"error": f"Embedding failed: {exc}"}), 500
+        else:
+            store.add(new_chunks, [])
 
     CHUNK_COUNTS.setdefault(sid, {})
     for mode in ("structured", "128", "256", "512"):
@@ -2726,6 +3038,12 @@ def ask():
                 "top_k": top_k,
                 "temperature": temperature,
             })
+        except RetrievalBackendError as exc:
+            logger.error("❌ Vector database retrieval failed in /ask: %s", exc, exc_info=True)
+            return jsonify({
+                "error": f"Vector database retrieval failed: {exc}",
+                "status": 503,
+            }), 503
         except urllib.error.HTTPError as exc:
             reason = {
                 400: "Bad request — check your API key format and model name.",
@@ -2791,22 +3109,31 @@ def ask():
 
 @app.route("/traces", methods=["GET"])
 def list_traces():
-    """List logged trace_ids — the raw material for the seeded random
-    sample requirement#2 asks for. Use sample_traces.py for the actual
-    seeded draw; this endpoint is just for eyeballing what's there."""
-    ids = TRACES.all_ids()
-    return jsonify({"count": len(ids), "trace_ids": ids})
+    """List logged trace_ids for the current session."""
+    current_sid = session.get("session_id")
+    if not current_sid:
+        return jsonify({"count": 0, "trace_ids": []})
+    expected_hash = hashlib.sha256(current_sid.encode()).hexdigest()[:16]
+    session_traces = [r["trace_id"] for r in TRACES.all() if r.get("session_id_hash") == expected_hash and "trace_id" in r]
+    return jsonify({"count": len(session_traces), "trace_ids": session_traces})
 
 
-@app.route("/replay/<trace_id>", methods=["GET"])
+@app.route("/replay/<trace_id>", methods=["POST"])
 def replay_trace(trace_id):
-    """Replay requirement#1: reconstruct a trace's exact context + prompt
-    from the trace record ALONE (not from the live vector store, which may
-    have changed or expired) and re-run the LLM call, so original vs
-    replayed output can be shown side by side."""
+    """Replay requirement#1: privacy-preserving replay reconstructing the
+    generation from the durable prompt template version artifact, recorded model/temperature,
+    and persisted redacted context snapshot."""
+    current_sid = session.get("session_id")
+    if not current_sid:
+        return jsonify({"error": "No active session"}), 401
+
     record = TRACES.get(trace_id)
     if not record:
         return jsonify({"error": f"No trace found for trace_id={trace_id}"}), 404
+
+    expected_hash = hashlib.sha256(current_sid.encode()).hexdigest()[:16]
+    if record.get("session_id_hash") != expected_hash:
+        return jsonify({"error": "Unauthorized: trace belongs to another session"}), 403
 
     missing = []
     for field in ("prompt_version", "model", "retrieved", "raw_output"):
@@ -2821,9 +3148,7 @@ def replay_trace(trace_id):
                 "This trace has no LLM prompt_version (either the TF-IDF "
                 "offline path answered it, or the context-validation gate "
                 "rejected it before any LLM call was made — both produce "
-                "deterministic, template-based output that reconstructing "
-                "the retrieved chunks alone will reproduce exactly, with no "
-                "LLM re-call needed)."
+                "deterministic, template-based output with no LLM call)."
             ),
             "original": {
                 "answer": record.get("answer"),
@@ -2833,20 +3158,22 @@ def replay_trace(trace_id):
         })
 
     prompt_text = get_prompt(record["prompt_version"])
-    reconstructed_note = None
     if prompt_text is None:
-        # The exact prompt text for this version was never registered in
-        # this process (e.g. replaying against a fresh process that hasn't
-        # served an /ask call yet, or the prompt version was retired).
-        # Fall back to the CURRENT qa prompt and say so explicitly, per
-        # requirement#1 ("note it, and say what you could not reconstruct").
-        prompt_text = get_prompt(QA_PROMPT_VERSION)
-        reconstructed_note = (
-            f"prompt_version {record['prompt_version']!r} text was not found in "
-            f"this process's registry — fell back to the current {QA_PROMPT_VERSION} "
-            f"text. If the prompt has changed since this trace, the replay is NOT "
-            f"a true replay of what ran originally."
-        )
+        # If exact prompt artifact is missing, abort replay immediately without invoking LLM
+        return jsonify({
+            "trace_id": trace_id,
+            "replayable": False,
+            "reason": f"Durable prompt artifact for prompt_version {record['prompt_version']!r} is missing from registry. Exact prompt version required to replay.",
+            "original": {
+                "question": record.get("question"),
+                "model": record.get("model"),
+                "prompt_version": record.get("prompt_version"),
+                "raw_output": record.get("raw_output"),
+            },
+            "replayed": None,
+            "outputs_match_exactly": None,
+            "fields_missing_from_trace": missing,
+        }), 400
 
     results_for_prompt = [
         {
@@ -2860,7 +3187,11 @@ def replay_trace(trace_id):
     user_prompt = build_qa_user_prompt(record["question"], results_for_prompt)
 
     try:
-        replayed_raw = _chat_call(prompt_text, user_prompt, temperature=record.get("temperature") or 0)
+        replayed_raw = _chat_call(
+            prompt_text, user_prompt,
+            temperature=record.get("temperature") or 0.0,
+            model=record.get("model"),
+        )
         replay_error = None
     except Exception as exc:
         replayed_raw = None
@@ -2869,6 +3200,7 @@ def replay_trace(trace_id):
     return jsonify({
         "trace_id": trace_id,
         "replayable": True,
+        "replay_type": "privacy_preserving",
         "original": {
             "question": record.get("question"),
             "model": record.get("model"),
@@ -2883,7 +3215,6 @@ def replay_trace(trace_id):
         },
         "outputs_match_exactly": (replayed_raw == record.get("raw_output")) if replayed_raw is not None else None,
         "fields_missing_from_trace": missing,
-        "reconstruction_note": reconstructed_note,
     })
 
 
@@ -2900,6 +3231,11 @@ def clear():
         store = _get_store(sid)
         store.clear()
         backend_error = getattr(store, "last_backend_error", None)
+        if not backend_error:
+            orphans = list(ORPHANED_DOCS.get(sid, []))
+            for o in orphans:
+                if o.get("doc_id"):
+                    _resolve_orphaned_doc(sid, o["doc_id"])
         VECTOR_STORE.pop(sid, None)
         SESSION_ACCESS.pop(sid, None)
         HASH_STORE.pop(sid, None)
@@ -2931,6 +3267,9 @@ def remove_doc():
     store = _get_store(sid)
     if any(c["doc_id"] == doc_id for c in store.chunks):
         removed_chunks = store.remove_doc(doc_id)
+        backend_error = getattr(store, "last_backend_error", None)
+        if not backend_error:
+            _resolve_orphaned_doc(sid, doc_id)
 
     files = SESSION_FILES.get(sid, {})
     info = files.pop(doc_id, None)
@@ -3245,16 +3584,7 @@ def eval_run():
 
 @app.route("/healthz", methods=["GET"])
 def healthz():
-    """
-    Liveness/readiness endpoint for deployment monitoring (load balancers,
-    Docker/Kubernetes healthchecks, uptime pings). Deliberately does NOT
-    touch session state — it should return 200 even for a caller with no
-    cookies at all, which is exactly what a healthcheck request looks
-    like. Reports whether the embeddings/LLM path is configured, not
-    whether it's currently reachable — an actual Gemini API call on every
-    healthcheck would be slow and cost money for something checked every
-    few seconds.
-    """
+    """Liveness endpoint for deployment monitoring."""
     return jsonify({
         "status": "ok",
         "embeddings_configured": _embeddings_configured(),
@@ -3265,6 +3595,28 @@ def healthz():
         "vector_backend": VECTOR_BACKEND,
         "active_sessions": len(SESSION_ACCESS),
     })
+
+
+@app.route("/readyz", methods=["GET"])
+def readyz():
+    """Readiness endpoint: verifies external dependencies are reachable without expensive LLM inference."""
+    checks = {"app": True}
+    status_code = 200
+
+    if VECTOR_BACKEND == "qdrant":
+        try:
+            from qdrant_store import _client
+            _client().get_collections()
+            checks["qdrant"] = True
+        except Exception as exc:
+            logger.warning("Readiness check: Qdrant unreachable: %s", exc)
+            checks["qdrant"] = False
+            status_code = 503
+
+    return jsonify({
+        "ready": status_code == 200,
+        "checks": checks,
+    }), status_code
 
 
 @app.route("/status", methods=["GET"])
@@ -3292,6 +3644,56 @@ def status():
         "methods": sorted({c["method"] for c in chunks}),
         "mode": (RETRIEVAL_MODE if _embeddings_configured() else "tfidf-only"),
         "vector_backend": VECTOR_BACKEND,
+    })
+
+
+@app.route("/orphans", methods=["GET"])
+def list_orphans():
+    """Operational reconciliation endpoint: returns currently unresolved orphaned documents.
+    Enforces authorization:
+      - Admin (via ADMIN_API_KEY in Bearer token or X-Admin-Key header): can view system-wide
+        orphans or filter by ?session_id=..., with full operational metadata including stored_path.
+      - Normal user (via active session): can view only their own session's orphans, with stored_path
+        redacted for privacy.
+      - Unauthenticated caller without valid session or admin credentials: rejected with 401 Unauthorized."""
+    is_admin = _is_admin_request(request)
+    sid = session.get("session_id")
+
+    if not is_admin and not sid:
+        return jsonify({
+            "error": "Unauthorized: active session or admin credentials required."
+        }), 401
+
+    durable_orphans = _read_durable_orphans()
+
+    if is_admin:
+        target_sid = request.args.get("session_id")
+        if target_sid:
+            raw_records = list(durable_orphans.get(target_sid, []))
+        else:
+            raw_records = [item for items in durable_orphans.values() for item in items]
+        return jsonify({
+            "count": len(raw_records),
+            "admin": True,
+            "orphans": raw_records,
+        })
+
+    # Normal session: strictly isolated to caller's session, stored_path and internal error details redacted
+    records = list(durable_orphans.get(sid, []))
+    safe_records = [
+        {
+            "doc_id": r.get("doc_id"),
+            "filename": r.get("filename"),
+            "error": "Vector store cleanup failed",
+            "timestamp": r.get("timestamp"),
+            "status": r.get("status", "orphaned"),
+        }
+        for r in records
+    ]
+    return jsonify({
+        "count": len(safe_records),
+        "admin": False,
+        "orphans": safe_records,
     })
 
 

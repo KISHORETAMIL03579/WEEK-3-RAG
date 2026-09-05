@@ -67,6 +67,9 @@ class _QdrantSingleton:
     client: QdrantClient | None = None  # one shared client per process, across all sessions
 
 
+RetrievalBackendError = _app.RetrievalBackendError
+
+
 class QdrantVectorStore:
     """Same public interface as app.VectorStore: load, save, add, query,
     query_scores, get_tfidf_index, clear, remove_doc, filtered_by_method,
@@ -102,13 +105,7 @@ class QdrantVectorStore:
         # Ensure payload indexes exist regardless of whether the collection
         # was just created or already existed — Qdrant requires an explicit
         # index on any field you filter by (remove_doc()'s doc_id filter,
-        # filtered_by_method()'s method filter), otherwise those calls fail
-        # with a 400 ("Index required but not found ... Create an index for
-        # this key or use a different filter"). Running this on every add()
-        # call, not just fresh collections, retroactively patches any
-        # collection created before this fix — no manual clear needed.
-        # Safe to call repeatedly: re-indexing an already-indexed field is
-        # a no-op, not an error.
+        # filtered_by_method()'s method filter).
         for field_name in ("doc_id", "method"):
             try:
                 client.create_payload_index(
@@ -116,8 +113,13 @@ class QdrantVectorStore:
                     field_name=field_name,
                     field_schema="keyword",
                 )
-            except Exception:
-                pass  # already indexed, or the real filter call below will surface any genuine problem
+            except Exception as exc:
+                err_msg = str(exc).lower()
+                if "already exists" in err_msg or "already indexed" in err_msg:
+                    _app.logger.debug("Payload index on %s already exists in %s", field_name, self.collection)
+                else:
+                    _app.logger.warning("Failed to create Qdrant payload index on %s (%s): %s",
+                                        field_name, self.collection, exc)
 
     def _qdrant_filter(self):
         if not self.method_filter:
@@ -137,30 +139,30 @@ class QdrantVectorStore:
     # ── Persistence ──────────────────────────────────────────────────────
 
     def load(self) -> None:
-        """Rehydrate the local chunk/vector mirror from Qdrant (e.g. after
-        a process restart — Qdrant already persisted the vectors; this
-        just repopulates the in-memory metadata mirror)."""
+        """Rehydrate the local chunk/vector mirror from Qdrant with controlled
+        exception handling wrapping the full scroll pagination sequence."""
         try:
             if not self._collection_exists():
                 return
-        except Exception:
-            _app.logger.warning("Qdrant not reachable at %s during load() — "
-                               "starting this session empty.", _app.QDRANT_URL, exc_info=True)
-            return
-        chunks, vectors = [], []
-        offset = None
-        while True:
-            points, offset = _client().scroll(
-                collection_name=self.collection, with_payload=True, with_vectors=True,
-                limit=QDRANT_SCROLL_LIMIT, offset=offset,
-            )
-            for p in points:
-                chunks.append(p.payload)
-                vectors.append(p.vector)
-            if offset is None:
-                break
-        self.chunks, self.vectors = chunks, vectors
-        self._tfidf_index_cache = None
+            chunks, vectors = [], []
+            offset = None
+            while True:
+                points, offset = _client().scroll(
+                    collection_name=self.collection, with_payload=True, with_vectors=True,
+                    limit=QDRANT_SCROLL_LIMIT, offset=offset,
+                )
+                for p in points:
+                    chunks.append(p.payload)
+                    vectors.append(p.vector)
+                if offset is None:
+                    break
+            self.chunks, self.vectors = chunks, vectors
+            self._tfidf_index_cache = None
+        except Exception as exc:
+            self.last_backend_error = f"Qdrant load failed: {exc}"
+            _app.logger.error("Qdrant load failed for collection %s: %s",
+                              self.collection, exc, exc_info=True)
+            raise RetrievalBackendError(f"Failed to load collection from Qdrant: {exc}") from exc
 
     def save(self) -> None:
         pass  # Qdrant persists on every upsert; nothing to flush locally
@@ -168,19 +170,34 @@ class QdrantVectorStore:
     # ── Mutation ─────────────────────────────────────────────────────────
 
     def add(self, chunks: list[dict], vectors: list[list[float]]) -> None:
-        self.chunks.extend(chunks)
-        self.vectors.extend(vectors)
-        self._tfidf_index_cache = None
+        if not chunks:
+            return
         if not vectors:
-            return  # TF-IDF-only mode: nothing to index into Qdrant
+            raise ValueError(
+                "QdrantVectorStore requires non-empty embedding vectors for all chunks. "
+                "Vectorless / TF-IDF-only inserts cannot be durably persisted in Qdrant."
+            )
+        if len(chunks) != len(vectors):
+            raise ValueError(
+                f"Chunk/vector length mismatch: {len(chunks)} chunks vs {len(vectors)} vectors"
+            )
+
         self._ensure_collection(dim=len(vectors[0]))
         points = [
             qmodels.PointStruct(id=self._point_id(c["id"]), vector=v, payload=c)
             for c, v in zip(chunks, vectors)
         ]
+        # Write to Qdrant FIRST: if upsert fails, local mirror is not left desynchronized
         _client().upsert(collection_name=self.collection, points=points)
 
+        # Confirm write in local mirror
+        self.chunks.extend(chunks)
+        self.vectors.extend(vectors)
+        self._tfidf_index_cache = None
+
     def remove_doc(self, doc_id: str) -> int:
+        """Consistency-first deletion: deletes from Qdrant first. If backend
+        deletion fails, raises RetrievalBackendError and preserves local mirror."""
         before = len(self.chunks)
         self.last_backend_error = None
         try:
@@ -193,9 +210,10 @@ class QdrantVectorStore:
                 )
         except Exception as exc:
             self.last_backend_error = f"Qdrant delete failed: {exc}"
-            _app.logger.warning("Qdrant delete-by-doc_id failed for %s — local mirror still "
-                               "updated, but the collection may retain stale points.",
-                               doc_id, exc_info=True)
+            _app.logger.error("Qdrant delete-by-doc_id failed for %s: %s", doc_id, exc, exc_info=True)
+            raise RetrievalBackendError(f"Failed to delete document from Qdrant: {exc}") from exc
+
+        # Only mutate local mirror after backend confirmation
         kept = [(c, v) for c, v in zip(self.chunks, self.vectors) if c["doc_id"] != doc_id]
         self.chunks = [c for c, _ in kept]
         self.vectors = [v for _, v in kept]
@@ -205,14 +223,18 @@ class QdrantVectorStore:
         return removed
 
     def clear(self) -> None:
+        """Consistency-first clear: drops collection from Qdrant first.
+        If backend drop fails, raises RetrievalBackendError and preserves local mirror."""
         self.last_backend_error = None
         try:
             if self._collection_exists():
                 _client().delete_collection(self.collection)
         except Exception as exc:
             self.last_backend_error = f"Qdrant delete_collection failed: {exc}"
-            _app.logger.warning("Qdrant delete_collection failed for %s during clear().",
-                               self.collection, exc_info=True)
+            _app.logger.error("Qdrant delete_collection failed for %s: %s", self.collection, exc, exc_info=True)
+            raise RetrievalBackendError(f"Failed to clear Qdrant collection: {exc}") from exc
+
+        # Only clear local mirror after backend confirmation
         self.chunks, self.vectors = [], []
         self._tfidf_index_cache = None
 
@@ -231,28 +253,22 @@ class QdrantVectorStore:
         try:
             if not self._collection_exists():
                 return []
-            # query_points() replaces the removed search() method (qdrant-
-            # client >=1.10ish deprecated it, and it's gone entirely as of
-            # 1.19 — confirmed directly via AttributeError in production).
-            # Note the two API differences: the vector parameter is named
-            # `query`, not `query_vector`, and the actual hit list is on
-            # the response's `.points` attribute, not returned directly.
             response = _client().query_points(
                 collection_name=self.collection, query=vector,
                 query_filter=self._qdrant_filter(),
                 limit=top_k, score_threshold=min_score,
             )
             hits = response.points
-        except Exception:
-            _app.logger.warning("Qdrant search failed — returning no results for this query.",
-                               exc_info=True)
-            return []
+        except Exception as exc:
+            self.last_backend_error = f"Qdrant query failed: {exc}"
+            _app.logger.error("Qdrant retrieval query failed for collection %s: %s",
+                              self.collection, exc, exc_info=True)
+            raise RetrievalBackendError(f"Vector retrieval failed: {exc}") from exc
         return [{**h.payload, "score": h.score} for h in hits]
 
     def query_scores(self, vector: list[float]) -> list[float]:
-        """Approximates the in-memory backend's "score against every
-        chunk" by scoring only the top ANN candidates (see module
-        docstring) and defaulting everything else to 0.0."""
+        """Scores top ANN candidates from Qdrant, propagating backend errors
+        if the vector database fails rather than silently returning all zeros."""
         try:
             if not self._collection_exists():
                 return [0.0] * len(self.chunks)
@@ -262,21 +278,15 @@ class QdrantVectorStore:
                 limit=_app.QDRANT_CANDIDATE_POOL,
             )
             hits = response.points
-        except Exception:
-            _app.logger.warning("Qdrant search failed during hybrid scoring — "
-                               "treating all candidates as score 0.0 for this query.",
-                               exc_info=True)
-            hits = []
+        except Exception as exc:
+            self.last_backend_error = f"Qdrant query_scores failed: {exc}"
+            _app.logger.error("Qdrant query_scores failed for collection %s: %s",
+                              self.collection, exc, exc_info=True)
+            raise RetrievalBackendError(f"Vector hybrid scoring failed: {exc}") from exc
         score_by_id = {h.payload["id"]: h.score for h in hits}
         return [score_by_id.get(c["id"], 0.0) for c in self.chunks]
 
     def filtered_by_method(self, method: str) -> "QdrantVectorStore":
-        """Unlike the in-memory backend, this pushes the filter down into
-        Qdrant itself (see _qdrant_filter()) rather than slicing lists in
-        Python. The local .chunks/.vectors mirror is narrowed too, purely
-        so callers that inspect them directly (e.g. the TF-IDF fallback,
-        or a plain `if not store.chunks` check) see a consistent view
-        regardless of which backend is active."""
         view = QdrantVectorStore(self.sid, method_filter=method)
         has_vectors = len(self.vectors) == len(self.chunks)
         matched = [i for i, c in enumerate(self.chunks) if c.get("method") == method]

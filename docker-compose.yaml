@@ -1,4 +1,10 @@
 # Self-hosted Qdrant & Ask My Docs RAG Server
+# Deployment note:
+#   This Docker Compose configuration is designed for single-host deployments.
+#   Persistent data (uploads, traces, vectors) uses local host mounts.
+#   For multi-node / clustered production, shared network storage and a centralized
+#   database are required.
+#
 # Usage:
 #   docker compose up --build
 #
@@ -8,23 +14,37 @@
 
 services:
   qdrant:
-    image: qdrant/qdrant:latest
+    image: qdrant/qdrant:v1.13.4
     container_name: ask_my_docs_qdrant
+    restart: unless-stopped
+    stop_grace_period: 30s
+    # Bind to 127.0.0.1 to prevent exposing vector database directly to the public network.
+    # The application connects via internal DNS: http://qdrant:6333
     ports:
-      - "6333:6333"
+      - "127.0.0.1:6333:6333"
     volumes:
       - qdrant_data:/qdrant/storage
     healthcheck:
-      test: ["CMD", "curl", "-f", "http://localhost:6333/readyz"]
+      # qdrant/qdrant:v1.13.4 minimal base does not ship with curl; test readiness via native bash socket probe
+      test: ["CMD-SHELL", "bash -c 'exec 3<>/dev/tcp/127.0.0.1/6333 && echo -e \"GET /readyz HTTP/1.1\\r\\nHost: 127.0.0.1\\r\\nConnection: close\\r\\n\\r\\n\" >&3 && cat <&3 | grep -q \"200 OK\"' || exit 1"]
       interval: 5s
       timeout: 3s
       retries: 10
+    deploy:
+      resources:
+        limits:
+          cpus: "2"
+          memory: 4G
 
   app:
     build: .
     container_name: ask_my_docs_app
+    restart: unless-stopped
+    stop_grace_period: 30s
+    # Bind to 127.0.0.1 to prevent unauthenticated direct exposure on public network interfaces.
+    # For internet-facing deployment, place an Nginx / Cloudflare / Caddy reverse proxy or LB in front.
     ports:
-      - "5000:5000"
+      - "127.0.0.1:5000:5000"
     environment:
       VECTOR_BACKEND: ${VECTOR_BACKEND:-qdrant}
       QDRANT_URL: ${QDRANT_URL:-http://qdrant:6333}
@@ -63,7 +83,8 @@ services:
       RERANK_MIN_RELEVANCE: ${RERANK_MIN_RELEVANCE:-5}
       QUERY_REWRITE_ENABLED: ${QUERY_REWRITE_ENABLED:-false}
       TRACE_LOG_PATH: ${TRACE_LOG_PATH:-traces/traces.jsonl}
-      SECRET_KEY: ${SECRET_KEY:-}
+      SECRET_KEY: ${SECRET_KEY:?SECRET_KEY must be set in .env to preserve session continuity}
+      ADMIN_API_KEY: ${ADMIN_API_KEY:-}
       LOG_LEVEL: ${LOG_LEVEL:-INFO}
       PORT: 5000
       HOST: 0.0.0.0
@@ -81,6 +102,11 @@ services:
       interval: 10s
       timeout: 5s
       retries: 5
+    deploy:
+      resources:
+        limits:
+          cpus: "2"
+          memory: 4G
     volumes:
       - ./uploads:/app/uploads
       - ./vectorstore:/app/vectorstore

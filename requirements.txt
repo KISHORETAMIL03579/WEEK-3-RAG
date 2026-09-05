@@ -3,8 +3,9 @@ werkzeug>=3.1.8
 pymupdf>=1.27.2
 python-docx>=1.1.2
 waitress>=3.0.2
+gunicorn==26.2.0
+filelock>=3.13.0
 
-# Optional — only needed if VECTOR_BACKEND=qdrant. The app runs fine
-# without this installed as long as VECTOR_BACKEND stays "memory" (the
-# default); qdrant_store.py is only imported when qdrant mode is selected.
+# Optional — only needed when VECTOR_BACKEND=qdrant.
+# The app can run with VECTOR_BACKEND=memory without Qdrant.
 qdrant-client>=1.19.0

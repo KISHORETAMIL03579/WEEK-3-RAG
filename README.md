@@ -28,7 +28,7 @@ ollama pull llava              # vision OCR (skip if you never upload images)
 ollama pull llama3.1           # chat / answer generation
 ollama serve                   # if not already running as a background service
 ```
-To use Google Gemini and/or xAI Grok instead for any of the three pieces, see ﻿§7 Configuration — each backend (`EMBED_BACKEND`, `VISION_BACKEND`, `CHAT_BACKEND`) is set independently.
+To use Google Gemini and/or xAI Grok instead for any of the three pieces, see §7 Configuration — each backend (`EMBED_BACKEND`, `VISION_BACKEND`, `CHAT_BACKEND`) is set independently.
 
 ### 3. VS Code Interpreter Selection
 ```text
@@ -52,19 +52,19 @@ Open **http://localhost:5000** in your browser. The startup banner tells you whi
 ---
 
 ## 📖 Table of Contents
-1. ﻿System Workflows & How It Works
-2. ﻿Universal File Extraction & Vision OCR
-3. ﻿Retrieval & RAG System Architecture
-4. ﻿Deep Dive: Evaluation Suite & Metrics (`/eval`)
-5. ﻿Backend API Endpoints Architecture
-   - ﻿5a. Trace Logging & Replay
-   - ﻿5b. Document Viewer, Open Links & Highlighting
-6. ﻿Codebase Function & File Mapping
-7. ﻿Configuration & Environment Variables (`.env`)
-8. ﻿Docker & Docker-Compose Deployment
-9. ﻿GHCR Container Deployment
-10. ﻿Testing & Verification
-11. ﻿Troubleshooting & FAQ
+1. System Workflows & How It Works
+2. Universal File Extraction & Vision OCR
+3. Retrieval & RAG System Architecture
+4. Deep Dive: Evaluation Suite & Metrics (`/eval`)
+5. Backend API Endpoints Architecture
+   - 5a. Trace Logging & Replay
+   - 5b. Document Viewer, Open Links & Highlighting
+6. Codebase Function & File Mapping
+7. Configuration & Environment Variables (`.env`)
+8. Docker & Docker-Compose Deployment
+9. GHCR Container Deployment
+10. Testing & Verification
+11. Troubleshooting & FAQ
 
 ---
 
@@ -190,6 +190,7 @@ Open **http://localhost:5000** in your browser. The startup banner tells you whi
 | HTTP Method | Route | Description |
 | :--- | :--- | :--- |
 | `POST` | `/upload` | Universal file upload & vector indexing endpoint |
+| `POST` | `/upload-cancel` | Cancels in-flight upload, safely removes extracted file, and unindexes doc from vector store |
 | `POST` | `/load-url` | Web page fetch & HTML text extraction endpoint |
 | `POST` | `/ask` | Hybrid retrieval & grounded QA endpoint; writes a trace record per call |
 | `GET` | `/status` | Returns session indexed document counts, backend info (`embeddings_backend`, `chat_backend`, `vector_backend`, `retrieval_mode`) |
@@ -200,9 +201,11 @@ Open **http://localhost:5000** in your browser. The startup banner tells you whi
 | `GET` | `/file/<doc_id>` | Renders the document viewer page |
 | `GET` | `/file/<doc_id>/raw` | Streams the raw file bytes (used by the PDF `<embed>`) |
 | `GET` | `/file/<doc_id>/pages` | Returns extracted per-page text (used by the non-PDF text viewer) |
-| `GET` | `/healthz` | System liveness & health check (`embeddings_configured`, `chat_configured`, `retrieval_mode`, `vector_backend`) |
+| `GET` | `/healthz` | System liveness & configuration health check (`embeddings_configured`, `chat_configured`, `retrieval_mode`, `vector_backend`) |
+| `GET` | `/readyz` | System readiness check; validates live connectivity to Qdrant vector backend |
+| `GET` | `/orphans` | Lists unindexed / cleanup-failed orphaned documents (requires active session or `X-Admin-Key` header) |
 | `GET` | `/traces` | Lists all logged trace_ids |
-| `GET` | `/replay/<trace_id>` | Replays a trace from the trace record alone; returns original vs. replayed raw output |
+| `POST` | `/replay/<trace_id>` | Replays a trace from the trace record alone; returns original vs. replayed raw output (session-scoped or requires `X-Admin-Key`) |
 
 ---
 
@@ -212,8 +215,12 @@ Every `/ask` call writes one durable, redacted JSON line to `traces/traces.jsonl
 
 **Workflow for the Task Set C write-up:**
 1. Run the app and ask it a realistic mix of real HR questions (not just demo questions) so `traces/traces.jsonl` accumulates real traffic.
-2. `python sample_traces.py --n 20 --seed <your_seed>` — prints (and can save) the seeded 20 trace_ids. Paste the seed and the list into `notes.md`.
-3. `python sample_traces.py --replay-pick --seed <your_seed>` to seed-pick one trace_id, then `curl http://localhost:5000/replay/<trace_id>` to get the original-vs-replayed raw output side by side. Paste both into `notes.md`, along with `fields_missing_from_trace` / `reconstruction_note` if either is non-null.
+2. `python sample_trace.py --n 20 --seed <your_seed>` — prints (and can save) the seeded 20 trace_ids. Paste the seed and the list into `notes.md`.
+3. `python sample_trace.py --replay-pick --seed <your_seed>` to seed-pick one trace_id, then replay via `POST`:
+   ```bash
+   curl -X POST http://localhost:5000/replay/<trace_id>
+   ```
+   *(Note: `/replay/<trace_id>` is session-scoped. Provide your session cookie or include the `-H "X-Admin-Key: <key>"` header if replaying cross-session).* Paste both original and replayed outputs into `notes.md`, along with `fields_missing_from_trace` / `reconstruction_note` if either is non-null.
 4. Read all 20 traces by hand (`grep trace_id traces/traces.jsonl` or open the file directly) and write one observation sentence each in `notes.md` — no fixes, no categorizing yet.
 5. Cluster into 4–7 named modes in `taxonomy.md`, write the dated prediction, commit it, and paste the commit hash.
 
@@ -248,7 +255,7 @@ Clicking **Open ↗** on any source card navigates to `/file/<doc_id>?page=N&hl=
 | **Context Validation Gate** | `app.py` | `validate_context()` |
 | **LLM Reranker & Rewriter** | `app.py` | `rerank_with_llm()`, `rewrite_query()` |
 | **Evaluation Suite & Matrix** | `app.py`, `eval_retrieval.py` | `/eval/run`, `_run_eval_preset()`, `recall_at_k()` |
-| **Trace Logging & Replay** | `trace_store.py`, `app.py` | `TraceStore`, `redact()`, `/replay/<trace_id>`, `sample_traces.py` (CLI) |
+| **Trace Logging & Replay** | `trace_store.py`, `app.py` | `TraceStore`, `redact()`, `/replay/<trace_id>`, `sample_trace.py` (CLI) |
 | **Main React Application** | `static/js/app.js` | React Chat UI, `SourceItem` grounded-source cards, Dropzone, Staged File List |
 | **Evaluation React UI** | `static/js/eval.js` | React Evaluation Matrix & Inspection Drawer |
 | **Document Viewer React UI** | `static/js/view.js`, `templates/view.html` | React Embedded Document Viewer, page-jump + highlight logic |
@@ -318,7 +325,8 @@ Copy `.env.example` to `.env` and fill in what you need — see the file itself 
 | `TRACE_LOG_PATH` | `traces/traces.jsonl` | Durable `/ask` trace log path (see §5a) |
 | `DEFAULT_CHUNK_MODE` | `structured` | Default chunking strategy |
 | `DEFAULT_CHUNK_SIZE` | `512` | Default fixed chunk size (words) |
-| `SECRET_KEY` | *(random per-process if unset)* | Signs session cookies — set explicitly for real deployments |
+| `SECRET_KEY` | *(random per-process if unset)* | Signs session cookies — **mandatory in production** to preserve session continuity across worker restarts |
+| `ADMIN_API_KEY` | *(empty)* | Optional administrative token for inspecting cross-session `/orphans` and replaying traces via `X-Admin-Key` header |
 | `LOG_LEVEL` | `INFO` | `DEBUG` / `INFO` / `WARNING` / `ERROR` |
 | `PORT` / `HOST` | `5000` / `127.0.0.1` | Set `HOST=0.0.0.0` when running inside Docker |
 | `APP_DEBUG` | `false` | Flask debug mode — never enable outside local dev |
@@ -332,8 +340,25 @@ Copy `.env.example` to `.env` and fill in what you need — see the file itself 
 docker compose up --build
 ```
 This starts:
-- **`qdrant`**: `qdrant/qdrant:latest`, exposed on `6333`, with a health check gating the app's startup.
-- **`app`**: built from the included `Dockerfile` (Python 3.11-slim base), exposed on `5000`, reading all the environment variables from §7 with sane defaults baked in (fully-local Ollama backends by default — point `OLLAMA_URL` at `http://host.docker.internal:11434` if Ollama runs on your host machine rather than another container, since `localhost` inside the container refers to the container itself).
+- **`qdrant`**: `qdrant/qdrant:v1.13.4`, bound to `127.0.0.1:6333` on the host to prevent direct network exposure. Readiness is validated via a native bash socket probe on `/readyz` (`qdrant:v1.13.4` has no `curl`), protected by `stop_grace_period: 30s` and bounded by resource limits (`cpus: "2"`, `memory: 4G`).
+- **`app`**: built from the included `Dockerfile` (Python 3.11-slim base, non-root `appuser`), served via **Gunicorn** (`--workers 2 --timeout 120 app:app`), loopback-bound to `127.0.0.1:5000:5000` on the host to prevent unauthenticated public exposure. Resource limits (`cpus: "2"`, `memory: 4G`) and `stop_grace_period: 30s` protect against runaway OCR/embedding workloads and ensure clean request drainage on shutdown.
+
+### Production Network & Reverse Proxy Architecture
+In production deployments, the application should never be exposed directly to the public internet without a reverse proxy or cloud load balancer:
+```text
+Internet / Clients
+       │
+       ▼
+Reverse Proxy / LB (Nginx / Caddy / Cloudflare / AWS ALB)
+       │
+       ▼ [127.0.0.1:5000 / Internal Docker Network]
+Gunicorn WSGI Server (2 workers, 120s timeout)
+       │
+       ▼
+Flask Application (Ask My Docs)
+  ├── Qdrant Vector Store (127.0.0.1:6333 / http://qdrant:6333)
+  └── Model Backends (Host Ollama via host.docker.internal / Cloud APIs)
+```
 
 To point at **Qdrant Cloud** instead of the bundled container, set in your `.env` before running compose:
 ```bash
@@ -342,7 +367,15 @@ QDRANT_URL=https://xxxx.aws.cloud.qdrant.io:6333
 QDRANT_API_KEY=<your cluster key>
 ```
 
-The `app` container's health check hits `/healthz` directly — a fast way to confirm the container actually came up healthy: `docker compose ps`.
+The `app` container's health check hits `/healthz` directly via Python standard library — a fast way to confirm the container came up healthy: `docker compose ps`.
+
+> **Production Secrets Enforcement:**
+> `docker-compose.yaml` enforces `${SECRET_KEY:?SECRET_KEY must be set in .env to preserve session continuity}`. Startup will fail fast with a descriptive error if `SECRET_KEY` is omitted, preventing inadvertent deployment with ephemeral per-process session cookies.
+
+> **Deployment Architecture Note (Single-Host vs Clustered):**
+> The bundled Docker Compose configuration is hardened for a **single-host deployment** (`restart: unless-stopped`, non-root container user `appuser`, isolated loopback bindings, durable host volume mounts for `./uploads`, `./vectorstore`, and `./traces`, and `filelock` for cross-worker serialized writes).
+> For multi-node or horizontally scaled deployments across multiple container instances, shared network storage (e.g., NFS, AWS EFS) or object storage (S3/GCS) is required for `./uploads` and `./traces` because trace persistence, document retrieval, and `orphans.jsonl` conflict-resolution rely on host filesystem durability and atomic file locking (`filelock`).
+> Note on Markdown (`*.md`): `.dockerignore` excludes repository markdown docs to keep image layers lean. Any user markdown documents intended for indexing should be uploaded through the UI or placed directly into the volume-mounted `./uploads/` directory.
 
 ---
 
@@ -364,15 +397,31 @@ Requires `packages: write` permission on the workflow's `GITHUB_TOKEN` (already 
 
 ## 10. Testing & Verification
 
-There is currently no automated pytest/unittest suite committed to this repo. What's actually available to verify behavior:
+The repository includes a comprehensive automated test suite alongside interactive benchmark and diagnostic tools:
 
+### Automated Test Suite (`unittest`)
+Run the regression test suite covering retrieval logic, Qdrant transactional consistency, rollback on failure, trace redaction, prompt versioning, session isolation, orphan persistence, and replay security:
+```bash
+python -m unittest test_eval_metrics.py -v
+```
+All 47 unit and integration tests run offline without external API keys or live Ollama/Qdrant servers (using in-memory mocks and controlled error injection).
+
+Key areas verified by the suite:
+- **Evaluation & Retrieval Metrics**: Context relevance, answer relevance, groundedness, MRR, Hit-Rate@K, and diagnostic categorizations.
+- **Qdrant Transactional Consistency**: Rollback on insertion failure, atomic add/remove/clear operations, deterministic point IDs, and payload indexing.
+- **Multi-Worker & Multi-Process State Synchronization**: Atomic manifest persistence and filesystem-mtime change detection guaranteeing cache coherence and manifest synchronization across multiple Gunicorn worker processes.
+- **Durable Orphan Tracking**: Persistence and resolution tracking in `orphans.jsonl`, cross-process locking (`filelock`), and crash-recovery state preservation.
+- **Session & Replay Security**: Session isolation for `/orphans` and `/replay/<trace_id>`, admin authentication via `X-Admin-Key`, and sensitive path redaction.
+- **Trace Auditing**: Deep redaction (`redact_deep()`), prompt version pinning and SHA-256 hash validation, and deterministic trace sampling (`sample_trace.py`).
+
+### Interactive & Diagnostic Tools
 - **`eval_retrieval.py`** — CLI tool computing `Hit-Rate@K`, `MRR`, and failure categorization directly against your indexed documents:
   ```bash
   python eval_retrieval.py
   ```
-- **The `/eval` UI** (see §4) — the more complete way to benchmark retrieval presets against a real Q/A set, with the side-by-side diagnostic drawer.
-- **`/healthz`** — quick liveness + config check (`embeddings_configured`, `chat_configured`, `retrieval_mode`, `vector_backend`).
-- **Flask's test client** — for exercising `/upload` → `/ask` → `/file/<id>` end-to-end without a browser or live model backend (monkeypatch `_embeddings_configured`/`_chat_configured` to force the offline TF-IDF path for a zero-dependency smoke test).
+- **The `/eval` UI** (see §4) — Web-based evaluation matrix to benchmark retrieval presets against realistic HR question sets with side-by-side diagnostic drawers.
+- **`/healthz` & `/readyz`** — Liveness check (`/healthz`) and readiness check (`/readyz` verifies vector store connectivity).
+- **Flask Test Client** — For automated end-to-end testing of document ingestion, hybrid search, and viewer routes in offline mode.
 
 ---
 
