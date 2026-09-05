@@ -51,7 +51,7 @@ services:
       QDRANT_API_KEY: ${QDRANT_API_KEY:-}
       # Embeddings backend — "ollama" (default, no key) or "gemini"
       EMBED_BACKEND: ${EMBED_BACKEND:-ollama}
-      OLLAMA_URL: ${OLLAMA_URL:-http://host.docker.internal:11434}
+      OLLAMA_URL: ${DOCKER_OLLAMA_URL:-http://host.docker.internal:11434}
       OLLAMA_EMBED_MODEL: ${OLLAMA_EMBED_MODEL:-nomic-embed-text}
       GEMINI_API_KEY: ${GEMINI_API_KEY:-}
       EMBED_MODEL: ${EMBED_MODEL:-gemini-embedding-001}
