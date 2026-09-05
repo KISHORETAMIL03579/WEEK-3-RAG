@@ -102,9 +102,22 @@ function KeyTakeaways({ modes, k }) {
     return a;
   }, rows[0]);
 
+  // Build lookup maps by question ID for robust strategy comparison
+  const modeMaps = {};
+  modeKeys.forEach(function(mk) {
+    modeMaps[mk] = new Map(
+      (modes[mk]?.results || []).map(function(r) {
+        return [r.id, r];
+      })
+    );
+  });
+
   const firstResults = (modes[modeKeys[0]] && modes[modeKeys[0]].results) ? modes[modeKeys[0]].results : [];
-  const hardQ = firstResults.filter(function(_, qi) {
-    return modeKeys.every(function(mk) { return !(modes[mk].results[qi] && modes[mk].results[qi].hit); });
+  const hardQ = firstResults.filter(function(q) {
+    return modeKeys.every(function(mk) {
+      const match = modeMaps[mk] ? modeMaps[mk].get(q.id) : null;
+      return !(match && match.hit);
+    });
   });
 
   // SR-05: Explicitly identify baseline and selected final stage
@@ -403,7 +416,7 @@ function FormView({ questions, setQuestions, topK, setTopK, strategyFilter, setS
 
         <div style={{ display: 'grid', gridTemplateColumns: 'repeat(auto-fit, minmax(220px, 1fr))', gap: '16px', marginBottom: '18px' }}>
           <div>
-            <label style={{ display: 'block', fontSize: '0.75rem', color: 'var(--text-muted)', marginBottom: '6px' }}>
+            <label htmlFor="top-k-stepper-input" style={{ display: 'block', fontSize: '0.75rem', color: 'var(--text-muted)', marginBottom: '6px' }}>
               Top-k
             </label>
             <div style={{
@@ -439,6 +452,7 @@ function FormView({ questions, setQuestions, topK, setTopK, strategyFilter, setS
                 −
               </button>
               <input
+                id="top-k-stepper-input"
                 type="number"
                 min="1"
                 max="20"
@@ -456,9 +470,13 @@ function FormView({ questions, setQuestions, topK, setTopK, strategyFilter, setS
                   }
                 }}
                 onBlur={function() {
-                  if (!topK || parseInt(topK, 10) < 1) {
-                    setTopK(1);
+                  const trimmed = String(topK).trim();
+                  if (!/^\d+$/.test(trimmed)) {
+                    setTopK(8);
+                    return;
                   }
+                  const val = Number(trimmed);
+                  setTopK(Math.max(1, Math.min(20, val)));
                 }}
                 style={{
                   flex: 1,
@@ -792,8 +810,14 @@ function EvalApp() {
       return;
     }
 
+    const rawTopK = String(topK).trim();
+    if (!/^\d+$/.test(rawTopK)) {
+      alert('Top-K must be a whole number between 1 and 20.');
+      return;
+    }
+    const kVal = Math.max(1, Math.min(20, Number(rawTopK)));
+
     setIsRunning(true);
-    const kVal = Math.max(1, Math.min(20, parseInt(topK, 10) || 3));
 
     const controller = new AbortController();
     abortControllerRef.current = controller;
@@ -850,6 +874,11 @@ function EvalApp() {
             throw new Error(`Strategy "${PRESETS[mk]?.label || mk}" did not return a result for question ID "${qId}".`);
           }
         }
+        for (const resultId of resultIds) {
+          if (!submittedIds.has(resultId)) {
+            throw new Error(`Strategy "${PRESETS[mk]?.label || mk}" returned unexpected question ID "${resultId}".`);
+          }
+        }
       }
 
       setResults(data);
@@ -864,7 +893,9 @@ function EvalApp() {
       }
     } finally {
       setIsRunning(false);
-      abortControllerRef.current = null;
+      if (abortControllerRef.current === controller) {
+        abortControllerRef.current = null;
+      }
     }
   };
 

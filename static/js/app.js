@@ -718,7 +718,7 @@ function ChatArea({ messages, onSend, isThinking, filesCount, selectedFilesCount
                 ) : (
                   <div className="onboarding-step-radio"></div>
                 )}
-                <span>2. Choose a chunking strategy</span>
+                <span>2. Configure chunking strategy</span>
               </div>
 
               <div className={`onboarding-step ${isStep3Done ? 'completed' : isStep3Active ? 'active' : ''}`}>

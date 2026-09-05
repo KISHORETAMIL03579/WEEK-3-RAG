@@ -1,5 +1,10 @@
 const { useState, useEffect, useRef, useCallback } = React;
 
+/* ── Safe Regex Escaping Helper ─────────────────────────────── */
+function escapeRegex(str) {
+  return (str || '').replace(/[.*+?^${}()|[\]\\]/g, '\\$&');
+}
+
 function DocViewerApp() {
   const [docId, setDocId] = useState('');
   const [filename, setFilename] = useState(window.DOC_FILENAME || '');
@@ -28,29 +33,38 @@ function DocViewerApp() {
       return;
     }
 
+    const controller = new AbortController();
+
     async function fetchPages() {
       try {
         const safeId = encodeURIComponent(String(id));
-        const res = await fetch(`/file/${safeId}/pages`);
-        const data = await res.json();
-        if (!res.ok || !data.pages) {
-          setError(data.error || 'Could not load document.');
-        } else {
-          setPages(data.pages);
-          setFilename(data.filename || id);
-          setExt(data.ext || 'pdf');
-          if (initialPage > 0 && initialPage <= data.pages.length) {
-            setCurPage(initialPage);
-          }
+        const res = await fetch(`/file/${safeId}/pages`, { signal: controller.signal });
+        const data = await res.json().catch(() => ({}));
+        if (!res.ok) {
+          throw new Error(data.error || data.message || `Request failed with status ${res.status}`);
+        }
+        if (!Array.isArray(data.pages)) {
+          throw new Error('Invalid document response format.');
+        }
+        setPages(data.pages);
+        setFilename(data.filename || id);
+        setExt(data.ext || 'pdf');
+        if (initialPage > 0 && initialPage <= data.pages.length) {
+          setCurPage(initialPage);
         }
       } catch (err) {
-        setError('Error fetching document: ' + err.message);
+        if (err.name === 'AbortError') return;
+        setError(err.message || 'Could not load document.');
       } finally {
-        setLoading(false);
+        if (!controller.signal.aborted) {
+          setLoading(false);
+        }
       }
     }
 
     fetchPages();
+
+    return () => controller.abort();
   }, []);
 
   const handleBack = useCallback(() => {
@@ -72,14 +86,17 @@ function DocViewerApp() {
 
   const handleSearch = (e) => {
     e.preventDefault();
-    if (!searchQuery.trim() || pages.length === 0) return;
+    const trimmed = searchQuery.trim();
+    if (!trimmed || pages.length === 0) return;
 
     let matchCount = 0;
     let firstPageMatch = -1;
+    const escaped = escapeRegex(trimmed);
+    const re = new RegExp(escaped, 'ig');
 
     pages.forEach((p, idx) => {
-      const re = new RegExp(searchQuery.replace(/[.*+?^${}()|[\]\\]/g, '\\$&'), 'ig');
-      const matches = p.text.match(re);
+      const pageText = typeof p?.text === 'string' ? p.text : '';
+      const matches = pageText.match(re);
       if (matches) {
         matchCount += matches.length;
         if (firstPageMatch === -1) firstPageMatch = idx + 1;
@@ -89,23 +106,25 @@ function DocViewerApp() {
     setSearchCount(`${matchCount} match${matchCount === 1 ? '' : 'es'} found`);
     if (firstPageMatch !== -1) {
       setCurPage(firstPageMatch);
-      setHighlightQuery(searchQuery);
+      setHighlightQuery(trimmed);
     }
   };
 
   const highlightText = (text, query) => {
-    if (!query) return text;
+    const safeText = typeof text === 'string' ? text : '';
+    if (!safeText) return safeText;
+    if (!query) return safeText;
     const trimmed = query.trim();
-    if (!trimmed) return text;
-    const escaped = trimmed.replace(/[.*+?^${}()|[\]\\]/g, '\\$&');
+    if (!trimmed) return safeText;
+    const escaped = escapeRegex(trimmed);
     const flexible = escaped.replace(/ +/g, '\\s+');
     let regex;
     try {
       regex = new RegExp(`(${flexible})`, 'gi');
     } catch {
-      return text;
+      return safeText;
     }
-    const parts = text.split(regex);
+    const parts = safeText.split(regex);
     return parts.map((part, i) =>
       i % 2 === 1 ? (
         <mark key={i} className="doc-highlight-mark">
@@ -175,7 +194,7 @@ function DocViewerApp() {
                 className="viewer-search-input"
                 aria-label="Search within document"
               />
-              {searchCount && <span className="viewer-search-count">{searchCount}</span>}
+              {searchCount && <span className="viewer-search-count" aria-live="polite">{searchCount}</span>}
             </form>
           )}
 
@@ -240,10 +259,7 @@ function DocViewerApp() {
               type="application/pdf"
               src={`/file/${encodeURIComponent(String(docId))}/raw#page=${curPage}`}
               className="viewer-pdf-embed"
-              style={{
-                width: `${100 / zoom}%`,
-                transform: `scale(${zoom})`
-              }}
+              style={{ '--viewer-zoom': zoom }}
             />
           </div>
         )}
@@ -251,9 +267,7 @@ function DocViewerApp() {
         {!loading && !error && !isPdf && currentPageData && (
           <div
             className="viewer-doc-page"
-            style={{
-              transform: `scale(${zoom})`
-            }}
+            style={{ '--viewer-zoom': zoom }}
           >
             <div className="viewer-doc-meta">
               <span>Section {currentPageData.num} of {pages.length}</span>
