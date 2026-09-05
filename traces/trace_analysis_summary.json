@@ -1,0 +1,1072 @@
+{
+  "total_traces": 56,
+  "total_questions": 20,
+  "comparison_data": [
+    {
+      "q_num": 1,
+      "question": "How frequently are employee performance appraisals conducted?",
+      "runs": [
+        {
+          "temp": 0.0,
+          "top_k": 4,
+          "trace_id": "d5a12bc9-0757-4fe0-abe6-59712c2dfe8c",
+          "chunk_count": 4,
+          "chunk_ids": [
+            "6265e267::c188",
+            "6265e267::c185",
+            "6265e267::c186",
+            "6265e267::c178"
+          ],
+          "answer": "I don't know. The provided documents do not specify the frequency of employee performance appraisals.",
+          "latency_ms": 9129.1,
+          "observation": "Baseline run with K=4, T=0.0. Retrieved 4 chunks."
+        },
+        {
+          "temp": 0.3,
+          "top_k": 5,
+          "trace_id": "277cf9d1-7381-4971-83ee-d61dd9db7d78",
+          "chunk_count": 5,
+          "chunk_ids": [
+            "0a9223db::c188",
+            "0a9223db::c185",
+            "0a9223db::c186",
+            "0a9223db::c178",
+            "0a9223db::c179"
+          ],
+          "answer": "Performance appraisals are conducted regularly [5]. The exact frequency is not specified in the provided excerpts, but it is implied that they are done at the end of the year [5].",
+          "latency_ms": 26778.1,
+          "observation": "K changed 4->5 (chunks: 4->5, +5 new); T changed 0.0->0.3; Answer rephrased/adapted"
+        },
+        {
+          "temp": 0.6,
+          "top_k": 10,
+          "trace_id": "495650a9-7859-4412-b700-3a32a36ca46c",
+          "chunk_count": 8,
+          "chunk_ids": [
+            "24b6a333::c188",
+            "24b6a333::c185",
+            "24b6a333::c186",
+            "24b6a333::c178",
+            "24b6a333::c179",
+            "24b6a333::c180",
+            "24b6a333::c190",
+            "24b6a333::c181"
+          ],
+          "answer": "According to section 6 of the HRPolicy.pdf (page 45), performance appraisals are conducted to ensure staff understand their job expectations, but it does not specify a frequency [2]. However, section 1 of the same document states that the appraisal process will be done \"regularly\" [5].",
+          "latency_ms": 71246.5,
+          "observation": "K changed 4->10 (chunks: 4->8, +8 new); T changed 0.0->0.6; Answer rephrased/adapted"
+        },
+        {
+          "temp": 0.7,
+          "top_k": 10,
+          "trace_id": "f47f17a8-fa24-4e71-b1a9-b6790258ec90",
+          "chunk_count": 8,
+          "chunk_ids": [
+            "6265e267::c188",
+            "6265e267::c185",
+            "6265e267::c186",
+            "6265e267::c178",
+            "6265e267::c179",
+            "6265e267::c180",
+            "6265e267::c190",
+            "6265e267::c181"
+          ],
+          "answer": "According to [2] and [6], performance appraisals are conducted regularly, but the exact frequency is not specified. However, [5] states that the appraisal process will be done \"regularly\", implying that it will be conducted at intervals that are consistent and predictable.",
+          "latency_ms": 28181.2,
+          "observation": "K changed 4->10 (chunks: 4->8, +4 new); T changed 0.0->0.7; Answer rephrased/adapted"
+        }
+      ],
+      "chunks_changed": true,
+      "answers_identical": false
+    },
+    {
+      "q_num": 2,
+      "question": "What is the policy regarding acceptance of gifts, hospitality, or entertainment from clients?",
+      "runs": [
+        {
+          "temp": 0.0,
+          "top_k": 4,
+          "trace_id": "39623159-a1a2-4cff-ba62-011d5e39e442",
+          "chunk_count": 4,
+          "chunk_ids": [
+            "6265e267::c28",
+            "6265e267::c19",
+            "6265e267::c21",
+            "6265e267::c29"
+          ],
+          "answer": "According to [2] HRPolicy.pdf (page 8), section: 2.2.2 Avoidance of Conflict of Interest Policy, GESCI's policy is that staff members should not accept gifts, benefits, or favours (including non-work related hospitality) connected with their employment from any external party, including partners and/or clients. This is to avoid any actual or potential conflict of interest and to maintain the highest standards of integrity and impartiality.",
+          "latency_ms": 20387.0,
+          "observation": "Baseline run with K=4, T=0.0. Retrieved 4 chunks."
+        },
+        {
+          "temp": 0.4,
+          "top_k": 8,
+          "trace_id": "379e2c7d-d8a7-48d4-ac21-8ba25dcce55c",
+          "chunk_count": 8,
+          "chunk_ids": [
+            "24b6a333::c28",
+            "24b6a333::c19",
+            "24b6a333::c21",
+            "24b6a333::c29",
+            "24b6a333::c22",
+            "24b6a333::c25",
+            "24b6a333::c71",
+            "24b6a333::c24"
+          ],
+          "answer": "According to [2] HRPolicy.pdf (page 8), section: 2.2.2 Avoidance of Conflict of Interest Policy, it is GESCI's policy that staff members do not accept gifts, benefits, or favours (including non-work related hospitality) connected with their employment from any external party, including partners and/or clients. This is to avoid any actual or potential conflict of interest and to ensure that their dealings with all external parties or organizations bear the closest possible scrutiny.  Additionally, [4] HRPolicy.pdf (page 10) states that GESCI staff members should not accept offers of hospitality which go beyond routine practices, except where acceptance of such an offer can be clearly shown to be in the interest of GESCI and has been approved by their Manager.  [1] HRPolicy.pdf (page 10) also provides guidelines for accepting hospitality, stating that all offers of hospitality from commercial interests which have or might have contractual relations with GESCI must be reported by the GESCI staff member to the CEO for direction.  It is worth noting that [5] HRPolicy.pdf (page 9) mentions that staff members may accept and retain gifts of modest value, but any gifts of more significant value should be refused or handed over to the Manager Finance and Administration.",
+          "latency_ms": 74632.0,
+          "observation": "K changed 4->8 (chunks: 4->8, +8 new); T changed 0.0->0.4; Answer rephrased/adapted"
+        },
+        {
+          "temp": 0.7,
+          "top_k": 10,
+          "trace_id": "6e27b455-b2c2-4ca5-bb0b-c930ddacb97c",
+          "chunk_count": 8,
+          "chunk_ids": [
+            "6265e267::c28",
+            "6265e267::c19",
+            "6265e267::c21",
+            "6265e267::c29",
+            "6265e267::c22",
+            "6265e267::c25",
+            "6265e267::c71",
+            "6265e267::c24"
+          ],
+          "answer": "According to the documents, the policy regarding acceptance of gifts, hospitality, or entertainment from clients is as follows:  * Gifts: Staff members must abide by the highest standards when receiving gifts from clients [3]. Gifts of modest value can be accepted and retained, but gifts of more significant value should be refused or handed over to the Manager Finance and Administration [5]. * Hospitality: Staff members should not accept offers of hospitality that go beyond routine practices, except where acceptance can be clearly shown to be in the interest of GESCI and has been approved by their Manager [4]. * Non-routine hospitality: Offers of non-routine hospitality, such as travelling abroad or holiday weekends, should always be referred to the CEO for direction [1]. * Commercial interests: Offers of hospitality from commercial interests that have or might have contractual relations with GESCI must be reported to the CEO for direction [1]. * Conflict of interest: Staff members are not allowed to accept gifts, benefits, or favours from external parties, including clients, as these may be interpreted as affecting their impartiality [2].  Overall, GESCI staff members are expected to maintain the highest standards of integrity and avoid any actions that could be seen as influencing their official functions or creating a conflict of interest.",
+          "latency_ms": 53010.0,
+          "observation": "K changed 4->10 (chunks: 4->8, +4 new); T changed 0.0->0.7; Answer rephrased/adapted"
+        }
+      ],
+      "chunks_changed": true,
+      "answers_identical": false
+    },
+    {
+      "q_num": 3,
+      "question": "Is compassionate leave granted upon the death of an immediate family member?",
+      "runs": [
+        {
+          "temp": 0.0,
+          "top_k": 4,
+          "trace_id": "a05fdc3f-2274-48f1-baa2-b03e17e037dd",
+          "chunk_count": 4,
+          "chunk_ids": [
+            "6265e267::c137",
+            "6265e267::c114",
+            "6265e267::c109",
+            "6265e267::c302"
+          ],
+          "answer": "No, compassionate leave is granted for the death or serious illness of a close member of the family, not an immediate family member. [1] defines close members of the family as including parents-in-law, which is not included in the definition of immediate family member in [2].",
+          "latency_ms": 13156.2,
+          "observation": "Baseline run with K=4, T=0.0. Retrieved 4 chunks."
+        },
+        {
+          "temp": 0.7,
+          "top_k": 4,
+          "trace_id": "77f5625f-815e-466b-9250-44b60d9a4e7a",
+          "chunk_count": 4,
+          "chunk_ids": [
+            "24b6a333::c137",
+            "24b6a333::c114",
+            "24b6a333::c109",
+            "24b6a333::c302"
+          ],
+          "answer": "No, compassionate leave is not granted upon the death of an immediate family member. According to [1], compassionate leave is granted upon the death or serious illness of a close member of the family, but this definition is different from an immediate family member.",
+          "latency_ms": 39013.4,
+          "observation": "T changed 0.0->0.7; Answer rephrased/adapted"
+        },
+        {
+          "temp": 0.3,
+          "top_k": 5,
+          "trace_id": "ec27744b-76a5-4aab-b808-ed9cf47afd5a",
+          "chunk_count": 5,
+          "chunk_ids": [
+            "0a9223db::c137",
+            "0a9223db::c114",
+            "0a9223db::c109",
+            "0a9223db::c302",
+            "0a9223db::c140"
+          ],
+          "answer": "No, compassionate leave is granted upon the death or serious illness of a close member of the family, not an immediate family member. According to [1], close members of the family include one legal spouse or domestic partner, children, parents, brothers and sisters, grand-parents and parents-in-law. [2] defines an immediate family member as one spouse or domestic partner, children or parents of the staff member, and provides a separate cash grant for their death.",
+          "latency_ms": 83035.0,
+          "observation": "K changed 4->5 (chunks: 4->5, +5 new); T changed 0.0->0.3; Answer rephrased/adapted"
+        },
+        {
+          "temp": 0.7,
+          "top_k": 10,
+          "trace_id": "98685cd9-39b8-49f1-bdbc-a39a77ccc902",
+          "chunk_count": 10,
+          "chunk_ids": [
+            "6265e267::c137",
+            "6265e267::c114",
+            "6265e267::c109",
+            "6265e267::c302",
+            "6265e267::c140",
+            "6265e267::c294",
+            "6265e267::c292",
+            "6265e267::c295",
+            "6265e267::c151",
+            "6265e267::c138"
+          ],
+          "answer": "No, compassionate leave is granted upon the death or serious illness of a close member of the family, as defined in [1], which includes only one legal spouse or domestic partner, children, parents, brothers and sisters, grand-parents and parents-in-law. [2] specifically mentions a cash grant equivalent to one thousand dollars to the staff member per event to a maximum of two events in any one year, upon the death of an immediate family member, which includes only one spouse or domestic partner, children or parents of the staff member.",
+          "latency_ms": 36726.1,
+          "observation": "K changed 4->10 (chunks: 4->10, +6 new); T changed 0.0->0.7; Answer rephrased/adapted"
+        }
+      ],
+      "chunks_changed": true,
+      "answers_identical": false
+    },
+    {
+      "q_num": 4,
+      "question": "What is the mandatory retirement age for permanent staff?",
+      "runs": [
+        {
+          "temp": 0.0,
+          "top_k": 4,
+          "trace_id": "64d8a643-69d6-4afb-9f2b-58f62ed4cef8",
+          "chunk_count": 2,
+          "chunk_ids": [
+            "6265e267::c302",
+            "6265e267::c72"
+          ],
+          "answer": "I don't know.",
+          "latency_ms": 6638.3,
+          "observation": "Baseline run with K=4, T=0.0. Retrieved 2 chunks."
+        },
+        {
+          "temp": 0.5,
+          "top_k": 9,
+          "trace_id": "e8dd8884-aeeb-40e5-ae15-51acc407db8e",
+          "chunk_count": 2,
+          "chunk_ids": [
+            "24b6a333::c302",
+            "24b6a333::c72"
+          ],
+          "answer": "I don't know.",
+          "latency_ms": 47001.6,
+          "observation": "K changed 4->9 (chunks: 2->2, +2 new); T changed 0.0->0.5; Answer content identical"
+        },
+        {
+          "temp": 0.7,
+          "top_k": 10,
+          "trace_id": "34a545d6-51d3-46c8-854f-9edf7f91ad5a",
+          "chunk_count": 2,
+          "chunk_ids": [
+            "6265e267::c302",
+            "6265e267::c72"
+          ],
+          "answer": "I don't know.",
+          "latency_ms": 7869.3,
+          "observation": "K changed 4->10 (chunks: 2->2, +0 new); T changed 0.0->0.7; Answer content identical"
+        }
+      ],
+      "chunks_changed": true,
+      "answers_identical": true
+    },
+    {
+      "q_num": 5,
+      "question": "What is the probation period length for new recruits?",
+      "runs": [
+        {
+          "temp": 0.0,
+          "top_k": 4,
+          "trace_id": "7f03ac6c-c991-458a-972a-b1822472f0f6",
+          "chunk_count": 4,
+          "chunk_ids": [
+            "6265e267::c75",
+            "6265e267::c74",
+            "6265e267::c76",
+            "6265e267::c277"
+          ],
+          "answer": "The probation period will be six months for all staff contracts exceeding 12 months. [1]",
+          "latency_ms": 33068.4,
+          "observation": "Baseline run with K=4, T=0.0. Retrieved 4 chunks."
+        },
+        {
+          "temp": 0.7,
+          "top_k": 10,
+          "trace_id": "51e1eed1-c25c-43b8-913d-9b4b5ba965b1",
+          "chunk_count": 4,
+          "chunk_ids": [
+            "6265e267::c75",
+            "6265e267::c74",
+            "6265e267::c76",
+            "6265e267::c277"
+          ],
+          "answer": "The probation period is six months for all staff contracts exceeding 12 months [1].",
+          "latency_ms": 67869.0,
+          "observation": "K changed 4->10 (chunks: 4->4, +0 new); T changed 0.0->0.7; Answer rephrased/adapted"
+        }
+      ],
+      "chunks_changed": false,
+      "answers_identical": false
+    },
+    {
+      "q_num": 6,
+      "question": "What is the formal procedure for reporting workplace bullying or harassment?",
+      "runs": [
+        {
+          "temp": 0.0,
+          "top_k": 4,
+          "trace_id": "c71b8fb1-7b8f-4e6b-817f-23c63546364b",
+          "chunk_count": 4,
+          "chunk_ids": [
+            "6265e267::c32",
+            "6265e267::c234",
+            "6265e267::c235",
+            "6265e267::c273"
+          ],
+          "answer": "According to section 2.2.3 of the HR Policy (page 11), staff members are encouraged to report incidents of workplace bullying or harassment to their immediate Manager, a Senior Manager, or the CEO. If the complaint is against the CEO, it may be made to the Board. The Manager or Senior Manager should then report the incident to the Manager: Finance and Operations and/or the CEO, so that an investigation can be commenced where appropriate.",
+          "latency_ms": 18837.5,
+          "observation": "Baseline run with K=4, T=0.0. Retrieved 4 chunks."
+        },
+        {
+          "temp": 0.3,
+          "top_k": 5,
+          "trace_id": "137a9ac0-7e81-4c47-b42d-f78f7161b296",
+          "chunk_count": 5,
+          "chunk_ids": [
+            "0a9223db::c32",
+            "0a9223db::c234",
+            "0a9223db::c235",
+            "0a9223db::c273",
+            "0a9223db::c249"
+          ],
+          "answer": "According to section 2.2.3 of the HR Policy (document [1]), any employee who believes that conduct in violation of the sexual harassment policy may be occurring or may have occurred is urged and expected to report the relevant facts immediately to their Managers, to the senior management or the CEO or the Board (as the case may be).   Additionally, section 9.1 of the HR Policy (document [2]) states that complaints of alleged violations of established policies and practices, including workplace bullying or harassment, should be addressed through the grievance procedure.  The formal procedure for reporting workplace bullying or harassment is outlined in section 9.1.1 of the HR Policy (document [3]), which states that staff members are encouraged to begin the grievance procedure by discussing the problem orally with their immediate Manager. The Manager should make a reasonable effort to resolve the issue expeditiously and in any event within 30 days of the issue being reported.  It's also worth noting that section 9.6 of the HR Policy (document [4]) states that a person who has reported suspected misconduct shall not be subject to any detrimental treatment as a result of reporting the misconduct, and that any complaint of retaliation will be investigated and considered gross misconduct.",
+          "latency_ms": 75510.7,
+          "observation": "K changed 4->5 (chunks: 4->5, +5 new); T changed 0.0->0.3; Answer rephrased/adapted"
+        },
+        {
+          "temp": 0.8,
+          "top_k": 5,
+          "trace_id": "775a02bc-f326-4297-b2ea-817bdb6a979b",
+          "chunk_count": 5,
+          "chunk_ids": [
+            "24b6a333::c32",
+            "24b6a333::c234",
+            "24b6a333::c235",
+            "24b6a333::c273",
+            "24b6a333::c249"
+          ],
+          "answer": "According to [1] HRPolicy.pdf (page 11), section 2.2.3, any employee who believes that conduct in violation of the sexual harassment policy may be occurring or may have occurred is urged and expected to report the relevant facts immediately to their Managers, to the senior management, or the CEO. If the complaint is against the CEO, it may be made to the Board. GESCI\u2019s policy prohibits creating an intimidating, hostile, or offensive work environment, which includes verbal or physical harassment.  Additionally, if an employee observes or receives a complaint of conduct that would violate this policy, they must immediately report the incident to the Manager: Finance and Operations and/or the CEO.",
+          "latency_ms": 53328.8,
+          "observation": "K changed 4->5 (chunks: 4->5, +5 new); T changed 0.0->0.8; Answer rephrased/adapted"
+        },
+        {
+          "temp": 0.7,
+          "top_k": 10,
+          "trace_id": "959d8dd4-2375-450f-aceb-13ea1aa87e58",
+          "chunk_count": 7,
+          "chunk_ids": [
+            "6265e267::c32",
+            "6265e267::c234",
+            "6265e267::c235",
+            "6265e267::c273",
+            "6265e267::c249",
+            "6265e267::c270",
+            "6265e267::c212"
+          ],
+          "answer": "According to [1] HRPolicy.pdf (page 11), section: 2.2.3 Sexual Harassment Policy, all personnel in a supervisory role at GESCI who either observe conduct that appears to violate this policy or receive a complaint of conduct that would violate this policy, must immediately report the incident to the Manager: Finance and Operations and/or to the CEO, so that an investigation can be commenced where appropriate.",
+          "latency_ms": 39965.7,
+          "observation": "K changed 4->10 (chunks: 4->7, +3 new); T changed 0.0->0.7; Answer rephrased/adapted"
+        }
+      ],
+      "chunks_changed": true,
+      "answers_identical": false
+    },
+    {
+      "q_num": 7,
+      "question": "What standards are expected regarding office dress code and grooming?",
+      "runs": [
+        {
+          "temp": 0.0,
+          "top_k": 4,
+          "trace_id": "9d868423-12f1-4413-a601-6afcebffbaec",
+          "chunk_count": 4,
+          "chunk_ids": [
+            "6265e267::c265",
+            "6265e267::c225",
+            "6265e267::c219",
+            "6265e267::c233"
+          ],
+          "answer": "I don't know.",
+          "latency_ms": 6946.3,
+          "observation": "Baseline run with K=4, T=0.0. Retrieved 4 chunks."
+        },
+        {
+          "temp": 0.3,
+          "top_k": 5,
+          "trace_id": "6b698ef4-363c-4d6b-9d57-a22e4a4c3b20",
+          "chunk_count": 5,
+          "chunk_ids": [
+            "0a9223db::c265",
+            "0a9223db::c225",
+            "0a9223db::c219",
+            "0a9223db::c233",
+            "0a9223db::c17"
+          ],
+          "answer": "I don't know.",
+          "latency_ms": 55379.3,
+          "observation": "K changed 4->5 (chunks: 4->5, +5 new); T changed 0.0->0.3; Answer content identical"
+        },
+        {
+          "temp": 0.2,
+          "top_k": 8,
+          "trace_id": "a6e689b1-5b39-41d5-8a29-9f942c782da3",
+          "chunk_count": 5,
+          "chunk_ids": [
+            "24b6a333::c265",
+            "24b6a333::c225",
+            "24b6a333::c219",
+            "24b6a333::c233",
+            "24b6a333::c17"
+          ],
+          "answer": "I don't know.",
+          "latency_ms": 57142.5,
+          "observation": "K changed 4->8 (chunks: 4->5, +5 new); T changed 0.0->0.2; Answer content identical"
+        },
+        {
+          "temp": 0.7,
+          "top_k": 10,
+          "trace_id": "de36a753-52f1-464a-bf76-95bb3e77af91",
+          "chunk_count": 5,
+          "chunk_ids": [
+            "6265e267::c265",
+            "6265e267::c225",
+            "6265e267::c219",
+            "6265e267::c233",
+            "6265e267::c17"
+          ],
+          "answer": "I don't know.",
+          "latency_ms": 8451.1,
+          "observation": "K changed 4->10 (chunks: 4->5, +1 new); T changed 0.0->0.7; Answer content identical"
+        }
+      ],
+      "chunks_changed": true,
+      "answers_identical": true
+    },
+    {
+      "q_num": 8,
+      "question": "How many days of annual leave can an employee carry over to the following year?",
+      "runs": [
+        {
+          "temp": 0.0,
+          "top_k": 4,
+          "trace_id": "43f768c1-04aa-4f66-85f2-8d19837d3e3e",
+          "chunk_count": 4,
+          "chunk_ids": [
+            "6265e267::c133",
+            "6265e267::c122",
+            "6265e267::c124",
+            "6265e267::c303"
+          ],
+          "answer": "According to [1], staff members can carry forward up to 5 days of their annual leave entitlement beyond December 31, with the consent of the CEO. Any approved days carried forward must be taken by 30th June the following year.",
+          "latency_ms": 34471.2,
+          "observation": "Baseline run with K=4, T=0.0. Retrieved 4 chunks."
+        },
+        {
+          "temp": 0.7,
+          "top_k": 10,
+          "trace_id": "428c7f43-b13a-4226-974d-f0743f524fa0",
+          "chunk_count": 8,
+          "chunk_ids": [
+            "6265e267::c133",
+            "6265e267::c122",
+            "6265e267::c124",
+            "6265e267::c303",
+            "6265e267::c127",
+            "6265e267::c140",
+            "6265e267::c129",
+            "6265e267::c132"
+          ],
+          "answer": "Staff members shall not, except with the consent of the CEO, carry forward more than 5 days out of their annual leave entitlement beyond December 31. [1]",
+          "latency_ms": 65759.8,
+          "observation": "K changed 4->10 (chunks: 4->8, +4 new); T changed 0.0->0.7; Answer rephrased/adapted"
+        }
+      ],
+      "chunks_changed": true,
+      "answers_identical": false
+    },
+    {
+      "q_num": 9,
+      "question": "Are employees eligible for financial support or study leave for further education?",
+      "runs": [
+        {
+          "temp": 0.0,
+          "top_k": 4,
+          "trace_id": "60234d77-3c7e-4a03-88be-e1b5bc0127ae",
+          "chunk_count": 4,
+          "chunk_ids": [
+            "6265e267::c149",
+            "6265e267::c150",
+            "6265e267::c94",
+            "6265e267::c151"
+          ],
+          "answer": "According to [1], GESCI will encourage staff to pursue private studies and will grant study leave with or without pay depending on the case. Additionally, staff who intend to undertake private studies or those sponsored by GESCI will discuss ways in which they can be supported.",
+          "latency_ms": 12133.1,
+          "observation": "Baseline run with K=4, T=0.0. Retrieved 4 chunks."
+        },
+        {
+          "temp": 0.3,
+          "top_k": 5,
+          "trace_id": "260b919b-658e-4050-ac5f-78cf3c8edb63",
+          "chunk_count": 4,
+          "chunk_ids": [
+            "0a9223db::c149",
+            "0a9223db::c150",
+            "0a9223db::c94",
+            "0a9223db::c151"
+          ],
+          "answer": "According to section 5.3.4 of the HRPolicy.pdf, GESCI recognizes the need for staff to develop their skills and will encourage staff to pursue private studies. Staff who intend to undertake private studies or those sponsored by GESCI will discuss ways in which they can be supported. [1]  Additionally, section 5.3.4 states that GESCI will grant study leave with or without pay depending on the case. [1]  Therefore, employees are eligible for study leave for further education, and may also be eligible for financial support or study leave with pay, depending on the case.",
+          "latency_ms": 41383.6,
+          "observation": "K changed 4->5 (chunks: 4->4, +4 new); T changed 0.0->0.3; Answer rephrased/adapted"
+        },
+        {
+          "temp": 0.3,
+          "top_k": 6,
+          "trace_id": "e05639d8-407c-48ea-9f75-a3a4f13173aa",
+          "chunk_count": 4,
+          "chunk_ids": [
+            "24b6a333::c149",
+            "24b6a333::c150",
+            "24b6a333::c94",
+            "24b6a333::c151"
+          ],
+          "answer": "According to [1], GESCI will encourage staff to pursue private studies and will grant study leave with or without pay depending on the case. Additionally, staff who intend to undertake private studies or those sponsored by GESCI will discuss ways in which they can be supported.",
+          "latency_ms": 41200.5,
+          "observation": "K changed 4->6 (chunks: 4->4, +4 new); T changed 0.0->0.3; Answer content identical"
+        },
+        {
+          "temp": 0.7,
+          "top_k": 10,
+          "trace_id": "38103a99-567e-46ab-afc4-76c4e677307a",
+          "chunk_count": 4,
+          "chunk_ids": [
+            "6265e267::c149",
+            "6265e267::c150",
+            "6265e267::c94",
+            "6265e267::c151"
+          ],
+          "answer": "According to [1], GESCI will encourage staff to pursue private studies and will grant study leave with or without pay depending on the case. Additionally, staff who intend to undertake private studies or those sponsored by GESCI will discuss ways in which they can be supported.",
+          "latency_ms": 11587.4,
+          "observation": "K changed 4->10 (chunks: 4->4, +0 new); T changed 0.0->0.7; Answer content identical"
+        }
+      ],
+      "chunks_changed": true,
+      "answers_identical": false
+    },
+    {
+      "q_num": 10,
+      "question": "What are the core responsibilities of the Human Resources Manager?",
+      "runs": [
+        {
+          "temp": 0.0,
+          "top_k": 4,
+          "trace_id": "94bddd3a-27b2-40ea-8afd-ca6ad73f0f08",
+          "chunk_count": 4,
+          "chunk_ids": [
+            "6265e267::c9",
+            "6265e267::c10",
+            "6265e267::c11",
+            "6265e267::c5"
+          ],
+          "answer": "The core responsibilities of the Human Resources Manager include:  * initiating and developing appropriate human resource policies, procedures, and practices [3] * implementing and monitoring human resource policies and procedures as contained in the Manual [3] * facilitating the recruitment and hiring of staff [3] * assisting in the establishment of an organization structure with clearly defined and documented roles and accountabilities (job descriptions including performance targets) [3] * providing fair and equitable compensation based on job demand and regular appraisal of an individual\u2019s performance [3] * advising management on all human resource matters including proper utilization of available human resource [3] * facilitating the achievement of a working environment which encourages staff development, motivation, and enhances the personal dignity of staff members [3] * co-ordinating the preparation of annual leave programme [3] * advising Management on matters relating to discipline and the procedures to be followed in handling disciplinary cases [3] * being the custodian of the Manual and initiating regular reviews of the same [3]",
+          "latency_ms": 31693.3,
+          "observation": "Baseline run with K=4, T=0.0. Retrieved 4 chunks."
+        },
+        {
+          "temp": 0.3,
+          "top_k": 5,
+          "trace_id": "3c66b78f-9691-4765-8b57-b5348ad84f82",
+          "chunk_count": 5,
+          "chunk_ids": [
+            "0a9223db::c9",
+            "0a9223db::c10",
+            "0a9223db::c11",
+            "0a9223db::c5",
+            "0a9223db::c6"
+          ],
+          "answer": "The Human Resources Manager's core responsibilities include initiating and developing human resource policies, procedures, and practices [3]; implementing and monitoring human resource policies and procedures [3]; facilitating the recruitment and hiring of staff [3]; assisting in the establishment of an organization structure [3]; providing fair and equitable compensation [3]; advising management on all human resource matters [3]; facilitating a working environment that encourages staff development and motivation [3]; co-ordinating the preparation of annual leave programme [3]; and advising Management on matters relating to discipline [3].",
+          "latency_ms": 75658.5,
+          "observation": "K changed 4->5 (chunks: 4->5, +5 new); T changed 0.0->0.3; Answer rephrased/adapted"
+        },
+        {
+          "temp": 0.4,
+          "top_k": 7,
+          "trace_id": "87302b7c-b9d6-4c89-bd4e-d4fbead7ed9e",
+          "chunk_count": 7,
+          "chunk_ids": [
+            "24b6a333::c9",
+            "24b6a333::c10",
+            "24b6a333::c11",
+            "24b6a333::c5",
+            "24b6a333::c6",
+            "24b6a333::c187",
+            "24b6a333::c45"
+          ],
+          "answer": "The Human Resources Manager's core responsibilities include: initiating and developing human resource policies, procedures, and practices; implementing and monitoring human resource policies and procedures; facilitating the recruitment and hiring of staff; assisting in the establishment of an organization structure; providing fair and equitable compensation; advising management on human resource matters; facilitating a working environment that encourages staff development and motivation; coordinating the preparation of annual leave programs; and advising management on matters relating to discipline. [3]",
+          "latency_ms": 48085.5,
+          "observation": "K changed 4->7 (chunks: 4->7, +7 new); T changed 0.0->0.4; Answer rephrased/adapted"
+        },
+        {
+          "temp": 0.7,
+          "top_k": 10,
+          "trace_id": "575135b4-12e6-47ba-a626-cd7fd0f30038",
+          "chunk_count": 10,
+          "chunk_ids": [
+            "6265e267::c9",
+            "6265e267::c10",
+            "6265e267::c11",
+            "6265e267::c5",
+            "6265e267::c6",
+            "6265e267::c187",
+            "6265e267::c45",
+            "6265e267::c0",
+            "6265e267::c74",
+            "6265e267::c2"
+          ],
+          "answer": "The core responsibilities of the Human Resources Manager include:  * initiating and developing human resource policies, procedures, and practices [3] * implementing and monitoring human resource policies and procedures as contained in the Manual [3] * facilitating the recruitment and hiring of staff [3] * providing fair and equitable compensation based on job demand and regular appraisal of an individual\u2019s performance [3] * advising management on all human resource matters [3] * facilitating the achievement of a working environment which encourages staff development, motivation, and enhances the personal dignity of staff members [3] * co-ordinating the preparation of annual leave programme [3] * advising Management on matters relating to discipline and the procedures to be followed in handling disciplinary cases [3] * being the custodian of the Manual and initiating regular reviews of the same [3]",
+          "latency_ms": 46366.0,
+          "observation": "K changed 4->10 (chunks: 4->10, +6 new); T changed 0.0->0.7; Answer rephrased/adapted"
+        }
+      ],
+      "chunks_changed": true,
+      "answers_identical": false
+    },
+    {
+      "q_num": 11,
+      "question": "Under what circumstances is an employee entitled to paid sick leave?",
+      "runs": [
+        {
+          "temp": 0.0,
+          "top_k": 4,
+          "trace_id": "66f5c2a9-720c-4a6a-8180-3203ffca66cc",
+          "chunk_count": 4,
+          "chunk_ids": [
+            "6265e267::c139",
+            "6265e267::c140",
+            "6265e267::c138",
+            "6265e267::c147"
+          ],
+          "answer": "A staff member is entitled to paid sick leave at the rate of one day at full pay per month of completed service, subject to a minimum of 7 days at full pay, as stated in [1]. Additionally, a staff member is entitled to paid sick leave when incapacitated for the performance of their duties by illness or injury, as stated in [3].",
+          "latency_ms": 54777.3,
+          "observation": "Baseline run with K=4, T=0.0. Retrieved 4 chunks."
+        },
+        {
+          "temp": 0.7,
+          "top_k": 10,
+          "trace_id": "067c1ade-4abd-4a3a-84b3-04fe54d1f329",
+          "chunk_count": 9,
+          "chunk_ids": [
+            "6265e267::c139",
+            "6265e267::c140",
+            "6265e267::c138",
+            "6265e267::c147",
+            "6265e267::c141",
+            "6265e267::c152",
+            "6265e267::c146",
+            "6265e267::c151",
+            "6265e267::c290"
+          ],
+          "answer": "An employee is entitled to paid sick leave when they are incapacitated for the performance of their duties by illness or injury, and have completed at least two consecutive months of service [1]. They are entitled to two working days per month of completed service, with one day at full pay and one day at half pay [1].",
+          "latency_ms": 60139.4,
+          "observation": "K changed 4->10 (chunks: 4->9, +5 new); T changed 0.0->0.7; Answer rephrased/adapted"
+        }
+      ],
+      "chunks_changed": true,
+      "answers_identical": false
+    },
+    {
+      "q_num": 12,
+      "question": "Under what conditions can a staff member apply for an emergency salary advance?",
+      "runs": [
+        {
+          "temp": 0.0,
+          "top_k": 4,
+          "trace_id": "c87ef1b4-a959-420e-b866-5daab98220d0",
+          "chunk_count": 4,
+          "chunk_ids": [
+            "6265e267::c88",
+            "6265e267::c89",
+            "6265e267::c90",
+            "6265e267::c79"
+          ],
+          "answer": "According to [2], a staff member can apply for an emergency salary advance in the following conditions:   * In cases of serious illness;  * In legitimate emergencies.",
+          "latency_ms": 12291.2,
+          "observation": "Baseline run with K=4, T=0.0. Retrieved 4 chunks."
+        },
+        {
+          "temp": 0.3,
+          "top_k": 5,
+          "trace_id": "144d7e17-f78d-4685-a9af-e28a5366ea51",
+          "chunk_count": 5,
+          "chunk_ids": [
+            "0a9223db::c88",
+            "0a9223db::c89",
+            "0a9223db::c90",
+            "0a9223db::c79",
+            "0a9223db::c94"
+          ],
+          "answer": "According to [2], a staff member can apply for an emergency salary advance in the following conditions:   * In cases of serious illness;  * In legitimate emergencies;  * In exceptional and compelling circumstances, if supported by a detailed justification in writing, and approved by the CEO.",
+          "latency_ms": 50613.3,
+          "observation": "K changed 4->5 (chunks: 4->5, +5 new); T changed 0.0->0.3; Answer rephrased/adapted"
+        },
+        {
+          "temp": 0.5,
+          "top_k": 10,
+          "trace_id": "69d1d344-9897-456a-9bb0-7fe32d7f6587",
+          "chunk_count": 5,
+          "chunk_ids": [
+            "24b6a333::c88",
+            "24b6a333::c89",
+            "24b6a333::c90",
+            "24b6a333::c79",
+            "24b6a333::c94"
+          ],
+          "answer": "A staff member can apply for an emergency salary advance in the following conditions: [2]   - In cases of serious illness;  - In legitimate emergencies.",
+          "latency_ms": 9744.4,
+          "observation": "K changed 4->10 (chunks: 4->5, +5 new); T changed 0.0->0.5; Answer rephrased/adapted"
+        },
+        {
+          "temp": 0.7,
+          "top_k": 10,
+          "trace_id": "8cd01732-6446-41a0-b1fc-38969812cfa4",
+          "chunk_count": 5,
+          "chunk_ids": [
+            "6265e267::c88",
+            "6265e267::c89",
+            "6265e267::c90",
+            "6265e267::c79",
+            "6265e267::c94"
+          ],
+          "answer": "A staff member can apply for an emergency salary advance in the following cases:   - serious illness [2];  - legitimate emergencies [2];  - in exceptional and compelling circumstances, with a detailed justification in writing, as authorized by the CEO [2].",
+          "latency_ms": 14042.9,
+          "observation": "K changed 4->10 (chunks: 4->5, +1 new); T changed 0.0->0.7; Answer rephrased/adapted"
+        }
+      ],
+      "chunks_changed": true,
+      "answers_identical": false
+    },
+    {
+      "q_num": 13,
+      "question": "What is the maternity leave entitlement for female staff members?",
+      "runs": [
+        {
+          "temp": 0.0,
+          "top_k": 4,
+          "trace_id": "c30ee16f-7361-49fe-8a0f-b3ff58bae9a7",
+          "chunk_count": 4,
+          "chunk_ids": [
+            "6265e267::c146",
+            "6265e267::c147",
+            "6265e267::c122",
+            "6265e267::c136"
+          ],
+          "answer": "A female staff member shall be entitled to maternity leave for a total period of sixteen (16) weeks, with full pay for the entire duration of her absence [1].",
+          "latency_ms": 23908.5,
+          "observation": "Baseline run with K=4, T=0.0. Retrieved 4 chunks."
+        },
+        {
+          "temp": 0.7,
+          "top_k": 10,
+          "trace_id": "cbb62889-d266-45b8-8787-55481e48bf1b",
+          "chunk_count": 7,
+          "chunk_ids": [
+            "6265e267::c146",
+            "6265e267::c147",
+            "6265e267::c122",
+            "6265e267::c136",
+            "6265e267::c139",
+            "6265e267::c302",
+            "6265e267::c148"
+          ],
+          "answer": "A female staff member shall be entitled to maternity leave for a total period of sixteen (16) weeks [1]. The leave shall be divided into pre-delivery leave and post-delivery leave, with the staff member receiving full pay for the entire duration of her absence [1]. The pre-delivery leave shall commence six weeks prior to the anticipated date of birth, and the post-delivery leave shall extend for a period equivalent to the difference between sixteen weeks and the actual period of pre-delivery leave, subject to a minimum of ten weeks [1].",
+          "latency_ms": 37002.5,
+          "observation": "K changed 4->10 (chunks: 4->7, +3 new); T changed 0.0->0.7; Answer rephrased/adapted"
+        }
+      ],
+      "chunks_changed": true,
+      "answers_identical": false
+    },
+    {
+      "q_num": 14,
+      "question": "Does the policy grant paternity leave to male employees and for how long?",
+      "runs": [
+        {
+          "temp": 0.0,
+          "top_k": 4,
+          "trace_id": "30b526af-3e9c-420c-be2d-b77ddafab656",
+          "chunk_count": 4,
+          "chunk_ids": [
+            "6265e267::c148",
+            "6265e267::c111",
+            "6265e267::c302",
+            "6265e267::c149"
+          ],
+          "answer": "Yes, the policy grants paternity leave to male employees. According to [1], a staff member shall be entitled to paternity leave of two weeks with full pay.",
+          "latency_ms": 10697.6,
+          "observation": "Baseline run with K=4, T=0.0. Retrieved 4 chunks."
+        },
+        {
+          "temp": 0.7,
+          "top_k": 10,
+          "trace_id": "cfd0d330-2c61-4500-b197-aec7abc61d1f",
+          "chunk_count": 9,
+          "chunk_ids": [
+            "6265e267::c148",
+            "6265e267::c111",
+            "6265e267::c302",
+            "6265e267::c149",
+            "6265e267::c146",
+            "6265e267::c137",
+            "6265e267::c94",
+            "6265e267::c147",
+            "6265e267::c176"
+          ],
+          "answer": "Yes, the policy grants paternity leave to male employees. According to section 5.3.3 Parental Leave in HRPolicy.pdf (page 37), a staff member shall be entitled to paternity leave of two weeks with full pay. [1]",
+          "latency_ms": 33541.6,
+          "observation": "K changed 4->10 (chunks: 4->9, +5 new); T changed 0.0->0.7; Answer rephrased/adapted"
+        }
+      ],
+      "chunks_changed": true,
+      "answers_identical": false
+    },
+    {
+      "q_num": 15,
+      "question": "What are the rules and eligibility criteria for working from home?",
+      "runs": [
+        {
+          "temp": 0.0,
+          "top_k": 4,
+          "trace_id": "50dbc236-f1a7-4193-b5c5-6173c8982ec3",
+          "chunk_count": 4,
+          "chunk_ids": [
+            "6265e267::c226",
+            "6265e267::c152",
+            "6265e267::c30",
+            "6265e267::c258"
+          ],
+          "answer": "According to section 8.6 of the HRPolicy.pdf (page 57), staff members can work from home with GESCI's consent, and their home is considered a location of work subject to the OSHA. To work from home, staff members must be aware that authorized occupational safety and health officers can visit their home-based office, and GESCI reserves the right to inspect their home-working environment to ensure health and safety standards are met. [1]",
+          "latency_ms": 19063.9,
+          "observation": "Baseline run with K=4, T=0.0. Retrieved 4 chunks."
+        },
+        {
+          "temp": 0.7,
+          "top_k": 10,
+          "trace_id": "5ff9b35f-ebcb-4aca-a899-be285854a954",
+          "chunk_count": 4,
+          "chunk_ids": [
+            "6265e267::c226",
+            "6265e267::c152",
+            "6265e267::c30",
+            "6265e267::c258"
+          ],
+          "answer": "According to section 8.6 Working from Home in [1] HRPolicy.pdf (page 57), if a staff member works from home, their home is considered a location of work within the scope of the OSHA, and GESCI reserves the right to inspect the home-working environment if any health and safety issues arise.",
+          "latency_ms": 14301.1,
+          "observation": "K changed 4->10 (chunks: 4->4, +0 new); T changed 0.0->0.7; Answer rephrased/adapted"
+        }
+      ],
+      "chunks_changed": false,
+      "answers_identical": false
+    },
+    {
+      "q_num": 16,
+      "question": "What acts are classified as misdemeanors under the disciplinary policy?",
+      "runs": [
+        {
+          "temp": 0.0,
+          "top_k": 4,
+          "trace_id": "3c8bfabd-6e05-4ce6-a6ad-ec50cdb3f456",
+          "chunk_count": 4,
+          "chunk_ids": [
+            "6265e267::c266",
+            "6265e267::c215",
+            "6265e267::c293",
+            "6265e267::c237"
+          ],
+          "answer": "According to [1], the following acts are classified as misdemeanors under the disciplinary policy:  a) Late arrival or early departure from work without the approval of the supervisor b) Idling and wandering during working hours c) Avoiding work by malingering or feigning illness d) Failure to account for cash advances within the required period e) Failure to comply with any or all of GESCI\u2019s code of conduct.",
+          "latency_ms": 19866.5,
+          "observation": "Baseline run with K=4, T=0.0. Retrieved 4 chunks."
+        },
+        {
+          "temp": 0.7,
+          "top_k": 10,
+          "trace_id": "ded4abe6-18e7-4b6f-a273-7a122a166a74",
+          "chunk_count": 9,
+          "chunk_ids": [
+            "6265e267::c266",
+            "6265e267::c215",
+            "6265e267::c293",
+            "6265e267::c237",
+            "6265e267::c268",
+            "6265e267::c33",
+            "6265e267::c55",
+            "6265e267::c267",
+            "6265e267::c233"
+          ],
+          "answer": "The acts classified as misdemeanors under the disciplinary policy are listed as follows: [1]  a) Late arrival or early departure from work without the approval of the supervisor b) Idling and wandering during working hours c) Avoiding work by malingering or feigning illness d) Failure to account for cash advances within the required period e) Failure to comply with any or all of GESCI\u2019s code of conduct.",
+          "latency_ms": 43305.8,
+          "observation": "K changed 4->10 (chunks: 4->9, +5 new); T changed 0.0->0.7; Answer rephrased/adapted"
+        }
+      ],
+      "chunks_changed": true,
+      "answers_identical": false
+    },
+    {
+      "q_num": 17,
+      "question": "What disciplinary measures can management impose for employee misconduct?",
+      "runs": [
+        {
+          "temp": 0.0,
+          "top_k": 4,
+          "trace_id": "aa1a5444-0e95-4546-8605-e8381efe681a",
+          "chunk_count": 4,
+          "chunk_ids": [
+            "6265e267::c237",
+            "6265e267::c238",
+            "6265e267::c267",
+            "6265e267::c233"
+          ],
+          "answer": "According to section 9.2 of the HR Policy [1], disciplinary measures that may be imposed for employee misconduct include:  * Verbal or written warning * Deferment, for a specified period, of eligibility for salary increment or considerations for promotion * Suspension from duty without pay for a specified period * Reassignment to a lower remunerated role in GESCI * Removal of privileges or benefits, whether permanently or for a specified period of time [2].  These measures will be determined on a case-by-case basis, taking into account factors such as the seriousness of the matter, any extenuating circumstances, and the interests of GESCI [1].",
+          "latency_ms": 25029.9,
+          "observation": "Baseline run with K=4, T=0.0. Retrieved 4 chunks."
+        },
+        {
+          "temp": 0.7,
+          "top_k": 10,
+          "trace_id": "84a134d4-4bff-4493-879f-03190d503ed8",
+          "chunk_count": 7,
+          "chunk_ids": [
+            "6265e267::c237",
+            "6265e267::c238",
+            "6265e267::c267",
+            "6265e267::c233",
+            "6265e267::c269",
+            "6265e267::c273",
+            "6265e267::c259"
+          ],
+          "answer": "According to section 9.2 of the HRPolicy.pdf (pages 60-61), management can impose the following disciplinary measures for employee misconduct: Verbal or written warning; Deferment, for a specified period, of eligibility for salary increment or considerations for promotion; Suspension from duty without pay for a specified period; Reassignment to a lower remunerated role in GESCI; Removal of privileges or benefits, whether permanently or for a specified period of time. [2]",
+          "latency_ms": 29551.2,
+          "observation": "K changed 4->10 (chunks: 4->7, +3 new); T changed 0.0->0.7; Answer rephrased/adapted"
+        }
+      ],
+      "chunks_changed": true,
+      "answers_identical": false
+    },
+    {
+      "q_num": 18,
+      "question": "How much notice is required when a staff member resigns from their position?",
+      "runs": [
+        {
+          "temp": 0.0,
+          "top_k": 4,
+          "trace_id": "729dbf45-51cd-49cf-966d-192c7d543bb8",
+          "chunk_count": 4,
+          "chunk_ids": [
+            "6265e267::c277",
+            "6265e267::c78",
+            "6265e267::c289",
+            "6265e267::c291"
+          ],
+          "answer": "A staff member resigning must give GESCI four weeks written notice or one week written notice in the case of staff members on probation [1]. The CEO may accept resignation on shorter notice [1].",
+          "latency_ms": 15147.7,
+          "observation": "Baseline run with K=4, T=0.0. Retrieved 4 chunks."
+        },
+        {
+          "temp": 0.7,
+          "top_k": 10,
+          "trace_id": "2be90094-c11e-4d46-bd67-eeed510dd9f8",
+          "chunk_count": 7,
+          "chunk_ids": [
+            "6265e267::c277",
+            "6265e267::c78",
+            "6265e267::c289",
+            "6265e267::c291",
+            "6265e267::c135",
+            "6265e267::c286",
+            "6265e267::c302"
+          ],
+          "answer": "A staff member resigning must give GESCI four weeks written notice, or one week written notice in the case of staff members on probation. [1]",
+          "latency_ms": 24564.8,
+          "observation": "K changed 4->10 (chunks: 4->7, +3 new); T changed 0.0->0.7; Answer rephrased/adapted"
+        }
+      ],
+      "chunks_changed": true,
+      "answers_identical": false
+    },
+    {
+      "q_num": 19,
+      "question": "What are the standard daily working hours and lunch break provisions?",
+      "runs": [
+        {
+          "temp": 0.0,
+          "top_k": 4,
+          "trace_id": "1666a48b-f054-4263-adea-bf26e3e3283c",
+          "chunk_count": 3,
+          "chunk_ids": [
+            "6265e267::c119",
+            "6265e267::c120",
+            "6265e267::c121"
+          ],
+          "answer": "The standard daily working hours are 9.00 am to 5:30 pm, Monday to Friday [1]. Staff members are also required to take one hour for lunch [1].",
+          "latency_ms": 16681.7,
+          "observation": "Baseline run with K=4, T=0.0. Retrieved 3 chunks."
+        },
+        {
+          "temp": 0.7,
+          "top_k": 10,
+          "trace_id": "12371cb1-12e6-4a85-8cc9-813a09b5d0b7",
+          "chunk_count": 3,
+          "chunk_ids": [
+            "6265e267::c119",
+            "6265e267::c120",
+            "6265e267::c121"
+          ],
+          "answer": "The standard daily working hours are 9:00 am to 5:30 pm, with one hour for lunch. [1]",
+          "latency_ms": 12072.2,
+          "observation": "K changed 4->10 (chunks: 3->3, +0 new); T changed 0.0->0.7; Answer rephrased/adapted"
+        }
+      ],
+      "chunks_changed": false,
+      "answers_identical": false
+    },
+    {
+      "q_num": 20,
+      "question": "Who is eligible for overtime compensation and how is the rate determined?",
+      "runs": [
+        {
+          "temp": 0.0,
+          "top_k": 4,
+          "trace_id": "57b6a4af-1aec-40a9-af10-05ed074f73fc",
+          "chunk_count": 4,
+          "chunk_ids": [
+            "6265e267::c87",
+            "6265e267::c139",
+            "6265e267::c136",
+            "6265e267::c31"
+          ],
+          "answer": "I don't know.",
+          "latency_ms": 10837.8,
+          "observation": "Baseline run with K=4, T=0.0. Retrieved 4 chunks."
+        },
+        {
+          "temp": 0.7,
+          "top_k": 10,
+          "trace_id": "cf3e1b37-ee09-4a33-bb51-0bbc1b407102",
+          "chunk_count": 5,
+          "chunk_ids": [
+            "6265e267::c87",
+            "6265e267::c139",
+            "6265e267::c136",
+            "6265e267::c31",
+            "6265e267::c93"
+          ],
+          "answer": "I don't know. The provided documents do not mention overtime compensation or its eligibility and rate determination.",
+          "latency_ms": 15110.7,
+          "observation": "K changed 4->10 (chunks: 4->5, +1 new); T changed 0.0->0.7; Answer rephrased/adapted"
+        }
+      ],
+      "chunks_changed": true,
+      "answers_identical": false
+    }
+  ]
+}
