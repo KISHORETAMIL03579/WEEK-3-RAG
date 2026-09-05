@@ -1,22 +1,73 @@
 const { useState, useEffect, useRef, useCallback } = React;
 
+/* ── Temperature Helper Functions ──────────────────────────── */
+function getTempClass(t) {
+  if (t === 0) return 'zero';
+  if (t <= 0.3) return 'low';
+  if (t <= 0.7) return 'mid';
+  return 'high';
+}
+
+function getTempLabel(t) {
+  if (t === 0) return 'Deterministic';
+  if (t <= 0.3) return 'Grounded';
+  if (t <= 0.7) return 'Balanced';
+  return 'Hallucination Risk';
+}
+
+/* ── Unique ID Generator Helper ────────────────────────────── */
+function generateId(prefix = 'id') {
+  if (typeof crypto !== 'undefined' && typeof crypto.randomUUID === 'function') {
+    return `${prefix}-${crypto.randomUUID()}`;
+  }
+  return `${prefix}-${Date.now()}-${Math.random().toString(36).slice(2, 9)}`;
+}
+
+/* ── Markdown Parser & Sanitizer Helper (P1 Security Fix) ─── */
+function renderMarkdown(content) {
+  if (typeof window !== 'undefined' && window.marked && typeof window.marked.parse === 'function') {
+    const rawHtml = window.marked.parse(content || '');
+    if (typeof window.DOMPurify !== 'undefined' && typeof window.DOMPurify.sanitize === 'function') {
+      return { __html: window.DOMPurify.sanitize(rawHtml) };
+    }
+    // Fallback: If DOMPurify is not yet loaded, return plain text escaping
+    const textNode = document.createTextNode(content || '');
+    const div = document.createElement('div');
+    div.appendChild(textNode);
+    return { __html: div.innerHTML };
+  }
+  return null;
+}
+
+/* ── Phase 1: Centralized API Response Handler (P1 MUST FIX) ── */
+async function handleResponse(res) {
+  const data = await res.json().catch(() => ({}));
+  if (!res.ok) {
+    throw new Error(
+      data.error || data.message || `Request failed with status ${res.status}`
+    );
+  }
+  return data;
+}
+
 /* ── API Service Helpers ───────────────────────────────────── */
 const api = {
   async getStatus() {
     const res = await fetch('/status');
-    return res.json();
+    return handleResponse(res);
   },
   async uploadFiles(formData) {
     const res = await fetch('/upload', { method: 'POST', body: formData });
-    return res.json();
+    return handleResponse(res);
   },
-  async askQuestion(query, chunk_mode) {
+  async askQuestion(query, chunk_mode, top_k = 8, temperature = 0.0, signal) {
     const res = await fetch('/ask', {
       method: 'POST',
       headers: { 'Content-Type': 'application/json' },
-      body: JSON.stringify({ query, chunk_mode })
+      body: JSON.stringify({ query, chunk_mode, top_k, temperature }),
+      signal
     });
-    return res.json();
+    return handleResponse(res);
   },
   async loadUrl(url, chunk_mode) {
     const res = await fetch('/load-url', {
@@ -24,7 +75,7 @@ const api = {
       headers: { 'Content-Type': 'application/json' },
       body: JSON.stringify({ url, chunk_mode })
     });
-    return res.json();
+    return handleResponse(res);
   },
   async removeDoc(doc_id) {
     const res = await fetch('/remove', {
@@ -32,13 +83,40 @@ const api = {
       headers: { 'Content-Type': 'application/json' },
       body: JSON.stringify({ doc_id })
     });
-    return res.json();
+    return handleResponse(res);
   },
   async clearSession() {
     const res = await fetch('/clear', { method: 'POST' });
-    return res.json();
+    return handleResponse(res);
   }
 };
+
+/* ── Toast Notifications System ────────────────────────────── */
+function ToastContainer({ toasts, onDismiss }) {
+  if (!toasts || toasts.length === 0) return null;
+  return (
+    <div className="toast-container" role="region" aria-label="Notifications" aria-live="polite">
+      {toasts.map((t) => (
+        <div key={t.id} className={`toast-item toast-${t.type || 'info'}`}>
+          <div className="toast-content">
+            <span className="toast-icon">
+              {t.type === 'error' ? '⚠️' : t.type === 'success' ? '✅' : 'ℹ️'}
+            </span>
+            <span className="toast-message">{t.message}</span>
+          </div>
+          <button
+            type="button"
+            className="toast-close"
+            onClick={() => onDismiss(t.id)}
+            aria-label="Dismiss notification"
+          >
+            ✕
+          </button>
+        </div>
+      ))}
+    </div>
+  );
+}
 
 /* ── Source Card Component ─────────────────────────────────────
    Renders one grounded source: numbered badge, filename, page/section
@@ -53,16 +131,11 @@ function SourceItem({ src, index }) {
   const openHref = (() => {
     const params = new URLSearchParams();
     if (src.page) params.set('page', src.page);
-    // Highlighting on the viewer page does an exact-phrase match against
-    // that page's raw extracted text. The user's raw question ("work from
-    // home means?") almost never appears verbatim in the document, so it
-    // would never actually highlight anything — a short leading snippet
-    // of the retrieved chunk's OWN text is what was actually pulled from
-    // that page, so it's what's actually findable there.
     const snippet = (src.text || '').trim().slice(0, 100);
     if (snippet) params.set('hl', snippet);
     const qs = params.toString();
-    return `/file/${src.doc_id}${qs ? `?${qs}` : ''}`;
+    const safeDocId = encodeURIComponent(String(src.doc_id));
+    return `/file/${safeDocId}${qs ? `?${qs}` : ''}`;
   })();
 
   return (
@@ -75,7 +148,13 @@ function SourceItem({ src, index }) {
         <span className={`source-score ${scoreClass}`}>Score: {scorePct}%</span>
         <span className="source-item-spacer" />
         {src.openable && (
-          <a href={openHref} target="_blank" rel="noopener noreferrer" className="doc-open">
+          <a
+            href={openHref}
+            target="_blank"
+            rel="noopener noreferrer"
+            className="doc-open"
+            title="Open document in viewer"
+          >
             Open ↗
           </a>
         )}
@@ -84,6 +163,8 @@ function SourceItem({ src, index }) {
             type="button"
             className="view-content-toggle"
             onClick={() => setExpanded((v) => !v)}
+            aria-expanded={expanded}
+            aria-label={expanded ? `Hide excerpt for source ${index + 1}` : `View excerpt for source ${index + 1}`}
           >
             {expanded ? '▲ Hide' : '▼ View Content'}
           </button>
@@ -103,27 +184,49 @@ function SourceItem({ src, index }) {
 }
 
 /* ── Topbar Component ──────────────────────────────────────── */
-function Topbar({ backendMode, docsCount, retrievalMode }) {
+function Topbar({ backendMode, backendStatus, docsCount, retrievalMode, topK, temperature, sidebarOpen, onToggleSidebar }) {
+  const statusLabel =
+    backendStatus === 'healthy' ? 'Connected' : backendStatus === 'checking' ? 'Connecting...' : 'Disconnected';
+
   return (
     <header className="topbar">
       <div className="topbar-logo">
-        <div className="logo-icon">≡</div>
+        <button
+          type="button"
+          className={`logo-toggle-btn ${sidebarOpen ? 'active' : 'collapsed'}`}
+          onClick={onToggleSidebar}
+          title={sidebarOpen ? "Hide Sidebar (Collapse)" : "Show Sidebar (Open)"}
+          aria-label={sidebarOpen ? "Collapse sidebar navigation" : "Expand sidebar navigation"}
+        >
+          <span className="hamburger-line"></span>
+          <span className="hamburger-line"></span>
+          <span className="hamburger-line"></span>
+        </button>
         <span className="logo-name">Ask My Docs</span>
         <span className="logo-version">v1 · Python</span>
       </div>
 
-      <div style={{ flex: 1 }}></div>
+      <div className="topbar-spacer"></div>
 
       <a href="/eval" className="eval-btn">
         Evaluate ↗
       </a>
 
       <div className="topbar-stat">
-        <span className="status-dot"></span>
-        <span>Documents: {docsCount}</span>
-        <span className="topbar-mode">Retrieval: {retrievalMode || 'hybrid'}</span>
-        <span className="topbar-mode" style={{ background: 'var(--purple-dim)', color: 'var(--purple)' }}>
-          Backend: {backendMode || 'qdrant'}
+        <span
+          className={`status-dot status-${backendStatus}`}
+          title={`Backend status: ${statusLabel}`}
+          aria-label={`Backend status: ${statusLabel}`}
+        ></span>
+        <span>Docs: {docsCount}</span>
+        <span className="topbar-mode">K={topK} · T={temperature.toFixed(2)}</span>
+        {retrievalMode && (
+          <span className="topbar-mode topbar-mode-hybrid">
+            mode: {retrievalMode}
+          </span>
+        )}
+        <span className="topbar-mode topbar-mode-backend">
+          {backendMode || 'qdrant'}
         </span>
       </div>
     </header>
@@ -134,24 +237,38 @@ function Topbar({ backendMode, docsCount, retrievalMode }) {
 function Sidebar({
   strategy,
   setStrategy,
+  setStrategySelected,
+  topK,
+  setTopK,
+  temperature,
+  setTemperature,
   files,
   onUpload,
   onLoadUrl,
   onRemoveDoc,
   onClear,
   isUploading,
+  isThinking,
   selectedFiles,
-  setSelectedFiles
+  onAddSelectedFiles,
+  onRemoveSelectedFile,
+  onClearSelectedFiles
 }) {
   const [dragActive, setDragActive] = useState(false);
   const [urlInput, setUrlInput] = useState('');
   const [isLoadingUrl, setIsLoadingUrl] = useState(false);
   const [showCompare, setShowCompare] = useState(false);
+  const [topKInput, setTopKInput] = useState(String(topK));
   const fileInputRef = useRef(null);
+
+  useEffect(() => {
+    setTopKInput(String(topK));
+  }, [topK]);
 
   const handleDrag = (e) => {
     e.preventDefault();
     e.stopPropagation();
+    if (isThinking || isUploading) return;
     if (e.type === 'dragenter' || e.type === 'dragover') setDragActive(true);
     else if (e.type === 'dragleave') setDragActive(false);
   };
@@ -160,28 +277,65 @@ function Sidebar({
     e.preventDefault();
     e.stopPropagation();
     setDragActive(false);
-    if (e.dataTransfer.files && e.dataTransfer.files[0]) {
-      setSelectedFiles((prev) => [...prev, ...Array.from(e.dataTransfer.files)]);
+    if (isThinking || isUploading) return;
+    if (e.dataTransfer.files && e.dataTransfer.files.length > 0) {
+      onAddSelectedFiles(Array.from(e.dataTransfer.files));
     }
   };
 
-  const handleRemoveSelected = (indexToRemove) => {
-    setSelectedFiles((prev) => prev.filter((_, idx) => idx !== indexToRemove));
+  const handleFileInputChange = (e) => {
+    if (e.target.files && e.target.files.length > 0) {
+      onAddSelectedFiles(Array.from(e.target.files));
+      e.target.value = '';
+    }
   };
 
   const handleUrlSubmit = async (e) => {
     e.preventDefault();
-    if (!urlInput.trim()) return;
+    const targetUrl = urlInput.trim();
+    if (!targetUrl || isThinking || isLoadingUrl) return;
     setIsLoadingUrl(true);
     try {
-      await onLoadUrl(urlInput.trim());
+      await onLoadUrl(targetUrl);
       setUrlInput('');
     } finally {
       setIsLoadingUrl(false);
     }
   };
 
+  const handleTopKInputChange = (e) => {
+    const rawVal = e.target.value;
+    setTopKInput(rawVal);
+    if (/^\d+$/.test(rawVal)) {
+      const parsed = parseInt(rawVal, 10);
+      if (parsed >= 1 && parsed <= 20) {
+        setTopK(parsed);
+      }
+    }
+  };
+
+  const handleTopKInputBlur = () => {
+    const trimmed = topKInput.trim();
+    if (!/^\d+$/.test(trimmed)) {
+      setTopK(8);
+      setTopKInput('8');
+      return;
+    }
+    const parsed = parseInt(trimmed, 10);
+    if (parsed < 1) {
+      setTopK(1);
+      setTopKInput('1');
+    } else if (parsed > 20) {
+      setTopK(20);
+      setTopKInput('20');
+    } else {
+      setTopK(parsed);
+      setTopKInput(String(parsed));
+    }
+  };
+
   const isReadyToUpload = selectedFiles.length > 0;
+  const isBusy = isUploading || isThinking;
 
   return (
     <aside className="sidebar">
@@ -189,21 +343,31 @@ function Sidebar({
       <div className="sidebar-section">
         <div className="sidebar-label">UPLOAD DOCUMENTS</div>
         
-        <div
-          className={`dropzone ${dragActive ? 'active' : ''} ${isReadyToUpload ? 'file-ready' : ''}`}
+        <label
+          htmlFor="sidebar-file-input"
+          className={`dropzone ${dragActive ? 'active' : ''} ${isReadyToUpload ? 'file-ready' : ''} ${isBusy ? 'disabled' : ''}`}
+          tabIndex={isBusy ? -1 : 0}
+          aria-label="Upload documents dropzone. Click or press Enter to choose files."
           onDragEnter={handleDrag}
           onDragOver={handleDrag}
           onDragLeave={handleDrag}
           onDrop={handleDrop}
-          onClick={() => fileInputRef.current?.click()}
+          onKeyDown={(e) => {
+            if (!isBusy && (e.key === 'Enter' || e.key === ' ')) {
+              e.preventDefault();
+              fileInputRef.current?.click();
+            }
+          }}
         >
           <input
+            id="sidebar-file-input"
             ref={fileInputRef}
             type="file"
             multiple
+            disabled={isBusy}
             accept=".pdf,.txt,.md,.markdown,.docx,.doc,.csv,.tsv,.json,.yaml,.yml,.xml,.py,.js,.ts,.jsx,.tsx,.html,.css,.c,.cpp,.java,.go,.rs,.php,.sql,.sh,.png,.jpg,.jpeg,.webp,.bmp"
-            style={{ display: 'none' }}
-            onChange={(e) => e.target.files?.length && setSelectedFiles((prev) => [...prev, ...Array.from(e.target.files)])}
+            className="file-input-hidden"
+            onChange={handleFileInputChange}
           />
           <div className="dropzone-icon">📁</div>
           <div className="dropzone-title">
@@ -214,32 +378,40 @@ function Sidebar({
           <div className="dropzone-sub">
             {isReadyToUpload ? 'Click or drop more files to add' : 'PDF, Word, TXT, CSV, Code, or Images'}
           </div>
-        </div>
+        </label>
 
-        {/* Selected Queued Staged Files List with BOTH Open ↗ and ✕ Remove Buttons */}
+        {/* Selected Queued Staged Files List with Object URL Clean Lifecycle */}
         {isReadyToUpload && (
-          <div style={{ marginTop: '12px', display: 'flex', flexDirection: 'column', gap: '6px' }}>
-            <div style={{ fontSize: '0.72rem', color: 'var(--amber)', fontWeight: 700 }}>
+          <div className="staged-files-list">
+            <div className="staged-files-header">
               Files queued to index:
             </div>
-            {selectedFiles.map((f, idx) => (
-              <div key={idx} className="staged-file-item">
+            {selectedFiles.map((f) => (
+              <div key={f.id} className="staged-file-item">
                 <span className="doc-name" title={f.name}>📄 {f.name}</span>
-                <div style={{ display: 'flex', alignItems: 'center', gap: '6px' }}>
-                  <a
-                    href={URL.createObjectURL(f)}
-                    target="_blank"
-                    rel="noopener noreferrer"
-                    className="doc-open"
-                    title="Preview local staged file"
-                    onClick={(e) => e.stopPropagation()}
-                  >
-                    Open ↗
-                  </a>
+                <div className="staged-actions">
+                  {f.previewUrl && (
+                    <a
+                      href={f.previewUrl}
+                      target="_blank"
+                      rel="noopener noreferrer"
+                      className="doc-open"
+                      title="Preview local staged file"
+                      onClick={(e) => e.stopPropagation()}
+                    >
+                      Open ↗
+                    </a>
+                  )}
                   <button
+                    type="button"
                     className="doc-remove"
-                    onClick={(e) => { e.stopPropagation(); handleRemoveSelected(idx); }}
+                    disabled={isBusy}
+                    onClick={(e) => {
+                      e.stopPropagation();
+                      onRemoveSelectedFile(f.id);
+                    }}
                     title="Remove file from selection"
+                    aria-label={`Remove ${f.name} from selection`}
                   >
                     ✕
                   </button>
@@ -256,8 +428,13 @@ function Sidebar({
         
         <select
           value={strategy}
-          onChange={(e) => setStrategy(e.target.value)}
+          onChange={(e) => {
+            setStrategy(e.target.value);
+            if (setStrategySelected) setStrategySelected(true);
+          }}
           className="strategy-select"
+          disabled={isBusy}
+          aria-label="Select chunking strategy"
         >
           <option value="structured">Structured</option>
           <option value="128">128 Words</option>
@@ -265,12 +442,17 @@ function Sidebar({
           <option value="512">512 Words</option>
         </select>
 
-        <div className="compare-link" onClick={() => setShowCompare(!showCompare)}>
-          {showCompare ? '▴ Compare chunk sizes' : '▾ Compare chunk sizes'}
-        </div>
+        <button
+          type="button"
+          className="compare-link"
+          aria-expanded={showCompare}
+          onClick={() => setShowCompare((v) => !v)}
+        >
+          {showCompare ? '▴ Hide chunk details' : '▾ Compare chunk sizes'}
+        </button>
 
         {showCompare && (
-          <div style={{ background: 'var(--bg-raised)', padding: '8px 10px', borderRadius: 'var(--radius-sm)', marginTop: '6px', fontSize: '0.72rem', color: 'var(--text-secondary)' }}>
+          <div className="compare-details-box">
             <div>• <strong>Structured</strong>: Semantic headings & paragraphs</div>
             <div>• <strong>128 words</strong>: Fine-grained window</div>
             <div>• <strong>256 words</strong>: Medium balanced</div>
@@ -278,27 +460,119 @@ function Sidebar({
           </div>
         )}
 
-        <div style={{ display: 'flex', gap: '8px', marginTop: '12px' }}>
+        <div className="sidebar-btn-row">
           <button
-            onClick={() => isReadyToUpload && onUpload(selectedFiles)}
-            disabled={!isReadyToUpload || isUploading}
-            className={`btn-primary ${isReadyToUpload ? 'pulse' : ''}`}
-            style={{ flex: 2 }}
+            type="button"
+            onClick={() => isReadyToUpload && !isBusy && onUpload(selectedFiles)}
+            disabled={!isReadyToUpload || isBusy}
+            className={`btn-primary btn-upload-primary ${isReadyToUpload && !isBusy ? 'pulse' : ''}`}
           >
-            {isUploading ? 'Uploading...' : '↑ Upload & Index document'}
+            {isUploading ? 'Uploading...' : '↑ Upload & Index'}
           </button>
           <button
-            onClick={() => setSelectedFiles([])}
-            disabled={!isReadyToUpload}
-            className="btn-secondary"
-            style={{ flex: 1 }}
+            type="button"
+            onClick={onClearSelectedFiles}
+            disabled={!isReadyToUpload || isBusy}
+            className="btn-secondary btn-cancel-staged"
           >
             Cancel
           </button>
         </div>
       </div>
 
-      {/* 3. OR LOAD A WEB PAGE */}
+      {/* 3. RAG CONTROLS & GENERATION PARAMETERS */}
+      <div className="sidebar-section">
+        <div className="sidebar-label">RAG PARAMETERS & CONTROLS</div>
+
+        {/* Top-K Stepper */}
+        <div className="param-control-group">
+          <div className="param-header">
+            <span className="param-title">Retrieval Top-K</span>
+            <span className="param-badge">K = {topK}</span>
+          </div>
+          <div className="stepper-wrap">
+            <button
+              type="button"
+              className="stepper-btn"
+              disabled={topK <= 1 || isBusy}
+              onClick={() => setTopK((k) => Math.max(1, k - 1))}
+              title="Decrease Top-K"
+              aria-label="Decrease retrieval Top-K"
+            >
+              −
+            </button>
+            <input
+              type="number"
+              min="1"
+              max="20"
+              value={topKInput}
+              disabled={isBusy}
+              onChange={handleTopKInputChange}
+              onBlur={handleTopKInputBlur}
+              className="stepper-input"
+              aria-label="Retrieval Top-K value"
+            />
+            <button
+              type="button"
+              className="stepper-btn"
+              disabled={topK >= 20 || isBusy}
+              onClick={() => setTopK((k) => Math.min(20, k + 1))}
+              title="Increase Top-K"
+              aria-label="Increase retrieval Top-K"
+            >
+              +
+            </button>
+          </div>
+          <div className="quick-pills">
+            {[3, 5, 8, 12, 16].map((p) => (
+              <button
+                key={p}
+                type="button"
+                disabled={isBusy}
+                className={`quick-pill ${topK === p ? 'active' : ''}`}
+                onClick={() => setTopK(p)}
+                aria-label={`Set Top-K to ${p}`}
+              >
+                {p}
+              </button>
+            ))}
+          </div>
+          <div className="param-hint">Number of context candidates retrieved (Default: 8)</div>
+        </div>
+
+        {/* Temperature Slider */}
+        <div className="param-control-group param-group-spaced">
+          <div className="param-header">
+            <span className="param-title">Generation Temperature</span>
+            <span className={`temp-badge temp-${getTempClass(temperature)}`}>
+              {temperature.toFixed(2)} · {getTempLabel(temperature)}
+            </span>
+          </div>
+          <div className="slider-wrap">
+            <input
+              type="range"
+              min="0.0"
+              max="1.0"
+              step="0.05"
+              value={temperature}
+              disabled={isBusy}
+              onChange={(e) => setTemperature(parseFloat(e.target.value))}
+              className="temp-slider"
+              aria-label="Generation temperature slider"
+            />
+            <div className="slider-ticks">
+              <span>0.0 (Strict)</span>
+              <span>0.5 (Balanced)</span>
+              <span>1.0 (Creative/Test)</span>
+            </div>
+          </div>
+          <div className="param-hint">
+            Set 0.0 for strict factuality, or &gt;0.7 to evaluate hallucination risk.
+          </div>
+        </div>
+      </div>
+
+      {/* 4. OR LOAD A WEB PAGE */}
       <div className="sidebar-section">
         <div className="sidebar-label">OR LOAD A WEB PAGE</div>
         
@@ -307,13 +581,14 @@ function Sidebar({
             type="url"
             placeholder="https://example.com/article"
             value={urlInput}
+            disabled={isBusy || isLoadingUrl}
             onChange={(e) => setUrlInput(e.target.value)}
-            className="query-input-field"
-            style={{ width: '100%', background: 'var(--bg-raised)', border: '1px solid var(--border)', borderRadius: 'var(--radius-md)', padding: '10px 12px', fontSize: '0.8rem', color: '#fff' }}
+            className="url-input-field"
+            aria-label="Web article URL to fetch and index"
           />
           <button
             type="submit"
-            disabled={isLoadingUrl || !urlInput.trim()}
+            disabled={isBusy || isLoadingUrl || !urlInput.trim()}
             className="btn-green"
           >
             {isLoadingUrl ? 'Loading...' : '🌐 Fetch & Index'}
@@ -321,16 +596,16 @@ function Sidebar({
         </form>
       </div>
 
-      {/* 4. DOCUMENTS (Indexed files with full filename display, Open ↗ and ✕ Remove buttons) */}
-      <div className="sidebar-section" style={{ flex: 1 }}>
+      {/* 5. DOCUMENTS */}
+      <div className="sidebar-section sidebar-section-grow">
         <div className="sidebar-label">DOCUMENTS</div>
 
         {files.length === 0 ? (
-          <div style={{ fontSize: '0.78rem', color: 'var(--text-muted)', textAlign: 'center', padding: '16px 0' }}>
+          <div className="doc-empty-state">
             No documents loaded
           </div>
         ) : (
-          <div style={{ display: 'flex', flexDirection: 'column', gap: '6px' }}>
+          <div className="doc-list">
             {files.map((f) => {
               const displayName = f.filename || f.name || 'Untitled Document';
               return (
@@ -338,9 +613,9 @@ function Sidebar({
                   <span className="doc-name" title={displayName}>
                     📄 {displayName}
                   </span>
-                  <div style={{ display: 'flex', alignItems: 'center', gap: '6px' }}>
+                  <div className="doc-item-actions">
                     <a
-                      href={`/file/${f.doc_id}`}
+                      href={`/file/${encodeURIComponent(String(f.doc_id))}`}
                       target="_blank"
                       rel="noopener noreferrer"
                       className="doc-open"
@@ -349,9 +624,12 @@ function Sidebar({
                       Open ↗
                     </a>
                     <button
+                      type="button"
                       className="doc-remove"
+                      disabled={isBusy}
                       onClick={() => onRemoveDoc(f.doc_id)}
-                      title="Remove document from index"
+                      title={`Remove document ${displayName}`}
+                      aria-label={`Remove document ${displayName}`}
                     >
                       ✕
                     </button>
@@ -364,9 +642,10 @@ function Sidebar({
 
         {files.length > 0 && (
           <button
+            type="button"
             onClick={onClear}
-            className="btn-secondary"
-            style={{ width: '100%', marginTop: '16px', color: 'var(--red)', borderColor: 'var(--red-dim)' }}
+            disabled={isBusy}
+            className="btn-secondary btn-clear-danger"
           >
             🗑 Clear all documents
           </button>
@@ -377,7 +656,7 @@ function Sidebar({
 }
 
 /* ── Chat Container Component ────────────────────────────────── */
-function ChatArea({ messages, onSend, isThinking, filesCount, selectedFilesCount }) {
+function ChatArea({ messages, onSend, isThinking, filesCount, selectedFilesCount, strategy, strategySelected }) {
   const [input, setInput] = useState('');
   const bottomRef = useRef(null);
 
@@ -387,16 +666,30 @@ function ChatArea({ messages, onSend, isThinking, filesCount, selectedFilesCount
 
   const handleSubmit = (e) => {
     e.preventDefault();
-    if (!input.trim() || isThinking) return;
-    onSend(input.trim());
+    const query = input.trim();
+    if (!query || isThinking) return;
+    onSend(query);
     setInput('');
   };
 
-  const isStep1Done = selectedFilesCount > 0 || filesCount > 0;
-  const isStep2Done = selectedFilesCount > 0 || filesCount > 0;
-  const isStep3Done = filesCount > 0;
-  const isStep3Active = selectedFilesCount > 0 && filesCount === 0;
-  const isStep4Active = filesCount > 0;
+  /* ── Sequential Onboarding State Machine (P2 Enhanced) ─────── */
+  const hasIndexedDocs = filesCount > 0;
+  const hasStagedFiles = selectedFilesCount > 0;
+
+  // Step 1: Upload / select document
+  const isStep1Done = hasStagedFiles || hasIndexedDocs;
+  const isStep1Active = !hasStagedFiles && !hasIndexedDocs;
+
+  // Step 2: Choose chunking strategy
+  const isStep2Done = strategySelected || hasIndexedDocs;
+  const isStep2Active = hasStagedFiles && !strategySelected && !hasIndexedDocs;
+
+  // Step 3: Upload & Index
+  const isStep3Done = hasIndexedDocs;
+  const isStep3Active = hasStagedFiles && (strategySelected || strategy === 'structured') && !hasIndexedDocs;
+
+  // Step 4: Ask a question
+  const isStep4Active = hasIndexedDocs;
 
   return (
     <main className="chat-container">
@@ -410,7 +703,7 @@ function ChatArea({ messages, onSend, isThinking, filesCount, selectedFilesCount
             </p>
 
             <div className="onboarding-steps">
-              <div className={`onboarding-step ${isStep1Done ? 'completed' : 'active'}`}>
+              <div className={`onboarding-step ${isStep1Done ? 'completed' : isStep1Active ? 'active' : ''}`}>
                 {isStep1Done ? (
                   <div className="onboarding-step-check">✓</div>
                 ) : (
@@ -419,7 +712,7 @@ function ChatArea({ messages, onSend, isThinking, filesCount, selectedFilesCount
                 <span>1. Upload your document</span>
               </div>
 
-              <div className={`onboarding-step ${isStep2Done ? 'completed' : ''}`}>
+              <div className={`onboarding-step ${isStep2Done ? 'completed' : isStep2Active ? 'active' : ''}`}>
                 {isStep2Done ? (
                   <div className="onboarding-step-check">✓</div>
                 ) : (
@@ -444,16 +737,31 @@ function ChatArea({ messages, onSend, isThinking, filesCount, selectedFilesCount
             </div>
           </div>
         ) : (
-          messages.map((m, idx) => (
-            <div key={idx} className={`message-row ${m.role}`}>
-              <div className="message-bubble">
-                <div>{m.text}</div>
+          messages.map((m) => (
+            <div key={m.id} className={`message-row ${m.role}`}>
+              <div className={`message-bubble ${m.role === 'ai' ? 'message-ai-content' : ''}`}>
+                {m.role === 'ai' && typeof window !== 'undefined' && window.marked ? (
+                  <div dangerouslySetInnerHTML={renderMarkdown(m.text)} />
+                ) : (
+                  <div>{m.text}</div>
+                )}
                 {m.sources && m.sources.length > 0 && (
                   <div className="sources-card">
                     <div className="sources-header">📄 GROUNDED SOURCES ({m.sources.length})</div>
                     {m.sources.map((src, i) => (
-                      <SourceItem key={i} src={src} index={i} />
+                      <SourceItem
+                        key={`${src.doc_id || 'doc'}-${src.page || 'p'}-${i}`}
+                        src={src}
+                        index={i}
+                      />
                     ))}
+                  </div>
+                )}
+                {m.role === 'ai' && (
+                  <div className="message-meta-bar">
+                    <span className="meta-pill">🎯 Top-K: {m.topK != null ? m.topK : 8}</span>
+                    <span className="meta-pill">🌡️ Temp: {m.temperature != null ? Number(m.temperature).toFixed(2) : '0.00'}</span>
+                    {m.sources && <span className="meta-pill">📄 {m.sources.length} sources</span>}
                   </div>
                 )}
               </div>
@@ -463,7 +771,7 @@ function ChatArea({ messages, onSend, isThinking, filesCount, selectedFilesCount
 
         {isThinking && (
           <div className="message-row ai">
-            <div className="message-bubble" style={{ color: 'var(--text-muted)' }}>
+            <div className="message-bubble message-thinking">
               Generating grounded answer...
             </div>
           </div>
@@ -480,8 +788,14 @@ function ChatArea({ messages, onSend, isThinking, filesCount, selectedFilesCount
             value={input}
             onChange={(e) => setInput(e.target.value)}
             disabled={isThinking}
+            aria-label="Ask a question about your documents"
           />
-          <button type="submit" className="send-pill-btn" disabled={!input.trim() || isThinking}>
+          <button
+            type="submit"
+            className="send-pill-btn"
+            disabled={!input.trim() || isThinking}
+            aria-label="Send question"
+          >
             ➤
           </button>
         </form>
@@ -492,14 +806,98 @@ function ChatArea({ messages, onSend, isThinking, filesCount, selectedFilesCount
 
 /* ── Root App Component ──────────────────────────────────────── */
 function App() {
+  const [sidebarOpen, setSidebarOpen] = useState(() => (typeof window !== 'undefined' ? window.innerWidth > 700 : true));
   const [backendMode, setBackendMode] = useState('');
+  const [backendStatus, setBackendStatus] = useState('checking'); // 'checking' | 'healthy' | 'error'
   const [retrievalMode, setRetrievalMode] = useState('hybrid');
   const [files, setFiles] = useState([]);
   const [selectedFiles, setSelectedFiles] = useState([]);
   const [strategy, setStrategy] = useState('structured');
+  const [strategySelected, setStrategySelected] = useState(false);
+  const [topK, setTopK] = useState(8);
+  const [temperature, setTemperature] = useState(0.0);
   const [messages, setMessages] = useState([]);
   const [isUploading, setIsUploading] = useState(false);
   const [isThinking, setIsThinking] = useState(false);
+  const [toasts, setToasts] = useState([]);
+
+  const activeAbortControllerRef = useRef(null);
+  const toastTimersRef = useRef(new Map());
+  const selectedFilesRef = useRef(selectedFiles);
+
+  useEffect(() => {
+    selectedFilesRef.current = selectedFiles;
+  }, [selectedFiles]);
+
+  const dismissToast = useCallback((id) => {
+    if (toastTimersRef.current.has(id)) {
+      clearTimeout(toastTimersRef.current.get(id));
+      toastTimersRef.current.delete(id);
+    }
+    setToasts((prev) => prev.filter((t) => t.id !== id));
+  }, []);
+
+  const showToast = useCallback((message, type = 'info', duration = 5000) => {
+    const id = generateId('toast');
+    setToasts((prev) => [...prev, { id, message, type }]);
+    if (duration > 0) {
+      const timer = setTimeout(() => {
+        dismissToast(id);
+      }, duration);
+      toastTimersRef.current.set(id, timer);
+    }
+  }, [dismissToast]);
+
+  // Clean up all toast timers on component unmount
+  useEffect(() => {
+    return () => {
+      toastTimersRef.current.forEach((timer) => clearTimeout(timer));
+      toastTimersRef.current.clear();
+    };
+  }, []);
+
+  // Staged files lifecycle management with preview URLs
+  const handleAddSelectedFiles = useCallback((rawFiles) => {
+    const newItems = rawFiles.map((file) => ({
+      id: generateId('staged'),
+      file,
+      name: file.name,
+      previewUrl: typeof URL !== 'undefined' && typeof URL.createObjectURL === 'function' ? URL.createObjectURL(file) : null
+    }));
+    setSelectedFiles((prev) => [...prev, ...newItems]);
+  }, []);
+
+  const handleRemoveSelectedFile = useCallback((idToRemove) => {
+    setSelectedFiles((prev) => {
+      const target = prev.find((item) => item.id === idToRemove);
+      if (target && target.previewUrl && typeof URL !== 'undefined' && typeof URL.revokeObjectURL === 'function') {
+        URL.revokeObjectURL(target.previewUrl);
+      }
+      return prev.filter((item) => item.id !== idToRemove);
+    });
+  }, []);
+
+  const handleClearSelectedFiles = useCallback(() => {
+    setSelectedFiles((prev) => {
+      prev.forEach((item) => {
+        if (item.previewUrl && typeof URL !== 'undefined' && typeof URL.revokeObjectURL === 'function') {
+          URL.revokeObjectURL(item.previewUrl);
+        }
+      });
+      return [];
+    });
+  }, []);
+
+  // Cleanup all staged URLs strictly on component unmount
+  useEffect(() => {
+    return () => {
+      selectedFilesRef.current.forEach((item) => {
+        if (item.previewUrl && typeof URL !== 'undefined' && typeof URL.revokeObjectURL === 'function') {
+          URL.revokeObjectURL(item.previewUrl);
+        }
+      });
+    };
+  }, []);
 
   const fetchStatus = useCallback(async () => {
     try {
@@ -507,114 +905,200 @@ function App() {
       setFiles(status.documents || []);
       if (status.vector_backend) setBackendMode(status.vector_backend);
       if (status.mode) setRetrievalMode(status.mode);
+      setBackendStatus('healthy');
     } catch (err) {
       console.error("Failed to fetch status:", err);
+      setBackendStatus('error');
+      showToast('Could not connect to backend server: ' + err.message, 'error', 6000);
     }
-  }, []);
+  }, [showToast]);
 
   useEffect(() => {
     fetchStatus();
   }, [fetchStatus]);
 
-  const handleUpload = async (fileList) => {
+  // Synchronize Sidebar with Viewport Resize and Media Query Listener
+  useEffect(() => {
+    const mql = window.matchMedia('(max-width: 700px)');
+    const handleMediaChange = (e) => {
+      if (e.matches) {
+        setSidebarOpen(false);
+      } else {
+        setSidebarOpen(true);
+      }
+    };
+
+    if (mql.addEventListener) {
+      mql.addEventListener('change', handleMediaChange);
+    } else {
+      mql.addListener(handleMediaChange);
+    }
+
+    const handleKeyDown = (e) => {
+      if (e.key === 'Escape' && sidebarOpen && window.innerWidth <= 700) {
+        setSidebarOpen(false);
+      }
+    };
+    window.addEventListener('keydown', handleKeyDown);
+
+    return () => {
+      if (mql.removeEventListener) {
+        mql.removeEventListener('change', handleMediaChange);
+      } else {
+        mql.removeListener(handleMediaChange);
+      }
+      window.removeEventListener('keydown', handleKeyDown);
+    };
+  }, [sidebarOpen]);
+
+  const handleUpload = async (stagedList) => {
+    if (!stagedList || stagedList.length === 0 || isThinking || isUploading) return;
     setIsUploading(true);
     const formData = new FormData();
-    fileList.forEach((f) => formData.append('files', f));
+    stagedList.forEach((item) => formData.append('files', item.file));
     formData.append('chunk_mode', strategy);
 
     try {
       const res = await api.uploadFiles(formData);
-      if (res.ok) {
-        setSelectedFiles([]);
-        await fetchStatus();
-        // res.ok only means the /upload REQUEST itself succeeded — each
-        // file in res.documents can still have its own per-file "error"
-        // (failed to index entirely) or "warning" (indexed, but degraded —
-        // e.g. embeddings failed so it's keyword-search-only). Previously
-        // neither was ever surfaced: a partially-failed multi-file upload
-        // looked identical to a fully successful one.
-        const failed = (res.documents || []).filter((d) => d.error);
-        const degraded = (res.documents || []).filter((d) => d.warning);
-        if (failed.length > 0) {
-          alert(
-            `${failed.length} file(s) failed to index:\n` +
-            failed.map((d) => `• ${d.filename}: ${d.error}`).join('\n')
-          );
-        }
-        if (degraded.length > 0) {
-          alert(
-            `${degraded.length} file(s) indexed with reduced functionality:\n` +
-            degraded.map((d) => `• ${d.filename}: ${d.warning}`).join('\n')
-          );
-        }
+      handleClearSelectedFiles();
+      await fetchStatus();
+      const failed = (res.documents || []).filter((d) => d.error);
+      const degraded = (res.documents || []).filter((d) => d.warning);
+      if (failed.length > 0) {
+        showToast(
+          `${failed.length} file(s) failed: ${failed.map((d) => d.filename + ' (' + d.error + ')').join(', ')}`,
+          'error',
+          7000
+        );
+      } else if (degraded.length > 0) {
+        showToast(
+          `${degraded.length} file(s) indexed with warnings: ${degraded.map((d) => d.filename).join(', ')}`,
+          'info',
+          6000
+        );
       } else {
-        alert(res.error || 'Upload failed');
+        showToast('Documents uploaded and indexed successfully!', 'success', 4000);
       }
     } catch (err) {
-      alert('Upload failed: ' + err.message);
+      showToast('Upload failed: ' + err.message, 'error', 6000);
     } finally {
       setIsUploading(false);
     }
   };
 
   const handleLoadUrl = async (url) => {
-    const res = await api.loadUrl(url, strategy);
-    if (res.ok) {
+    if (isThinking || isUploading) return;
+    try {
+      await api.loadUrl(url, strategy);
       await fetchStatus();
-    } else {
-      alert(res.error || 'Failed to load URL');
+      showToast('Web page fetched and indexed successfully!', 'success', 4000);
+    } catch (err) {
+      showToast('Failed to load URL: ' + err.message, 'error', 6000);
     }
   };
 
   const handleRemoveDoc = async (doc_id) => {
-    await api.removeDoc(doc_id);
-    await fetchStatus();
+    if (isThinking || isUploading) return;
+    try {
+      await api.removeDoc(doc_id);
+      await fetchStatus();
+      showToast('Document removed from index.', 'info', 3000);
+    } catch (err) {
+      showToast('Failed to remove document: ' + err.message, 'error', 6000);
+    }
   };
 
   const handleClear = async () => {
-    await api.clearSession();
-    setMessages([]);
-    await fetchStatus();
+    if (isThinking || isUploading) return;
+    try {
+      await api.clearSession();
+      setMessages([]);
+      await fetchStatus();
+      showToast('All documents and chat history cleared.', 'info', 3000);
+    } catch (err) {
+      showToast('Failed to clear documents: ' + err.message, 'error', 6000);
+    }
   };
 
   const handleSend = async (query) => {
-    const userMsg = { role: 'user', text: query };
+    if (isThinking || isUploading) return;
+    const userMsg = { id: generateId('user-msg'), role: 'user', text: query };
     setMessages((prev) => [...prev, userMsg]);
     setIsThinking(true);
 
+    const controller = new AbortController();
+    activeAbortControllerRef.current = controller;
+
     try {
-      const res = await api.askQuestion(query, strategy);
+      const res = await api.askQuestion(query, strategy, topK, temperature, controller.signal);
       const aiMsg = {
+        id: generateId('ai-msg'),
         role: 'ai',
         text: res.answer || "I don't know.",
         sources: res.sources || [],
         query,
+        topK: res.top_k != null ? res.top_k : topK,
+        temperature: res.temperature != null ? res.temperature : temperature,
       };
       setMessages((prev) => [...prev, aiMsg]);
     } catch (err) {
+      if (err.name === 'AbortError') {
+        return;
+      }
       setMessages((prev) => [
         ...prev,
-        { role: 'ai', text: 'Error executing query: ' + err.message }
+        {
+          id: generateId('err-msg'),
+          role: 'ai',
+          text: 'Error executing query: ' + err.message,
+          topK,
+          temperature
+        }
       ]);
+      showToast('Query error: ' + err.message, 'error', 6000);
     } finally {
       setIsThinking(false);
+      activeAbortControllerRef.current = null;
     }
   };
 
   return (
-    <div className="layout">
-      <Topbar backendMode={backendMode} docsCount={files.length} retrievalMode={retrievalMode} />
+    <div className={`layout ${sidebarOpen ? '' : 'sidebar-collapsed'}`}>
+      <ToastContainer toasts={toasts} onDismiss={dismissToast} />
+      <Topbar
+        backendMode={backendMode}
+        backendStatus={backendStatus}
+        docsCount={files.length}
+        retrievalMode={retrievalMode}
+        topK={topK}
+        temperature={temperature}
+        sidebarOpen={sidebarOpen}
+        onToggleSidebar={() => setSidebarOpen((v) => !v)}
+      />
+      <div
+        className="sidebar-backdrop"
+        onClick={() => setSidebarOpen(false)}
+        aria-hidden="true"
+      />
       <Sidebar
         strategy={strategy}
         setStrategy={setStrategy}
+        setStrategySelected={setStrategySelected}
+        topK={topK}
+        setTopK={setTopK}
+        temperature={temperature}
+        setTemperature={setTemperature}
         files={files}
         onUpload={handleUpload}
         onLoadUrl={handleLoadUrl}
         onRemoveDoc={handleRemoveDoc}
         onClear={handleClear}
         isUploading={isUploading}
+        isThinking={isThinking}
         selectedFiles={selectedFiles}
-        setSelectedFiles={setSelectedFiles}
+        onAddSelectedFiles={handleAddSelectedFiles}
+        onRemoveSelectedFile={handleRemoveSelectedFile}
+        onClearSelectedFiles={handleClearSelectedFiles}
       />
       <ChatArea
         messages={messages}
@@ -622,6 +1106,8 @@ function App() {
         isThinking={isThinking}
         filesCount={files.length}
         selectedFilesCount={selectedFiles.length}
+        strategy={strategy}
+        strategySelected={strategySelected}
       />
     </div>
   );

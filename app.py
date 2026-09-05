@@ -2077,7 +2077,7 @@ def rewrite_query(query: str) -> str:
         return query
 
 
-def generate_answer(query: str, results: list[dict]) -> str:
+def generate_answer(query: str, results: list[dict], temperature: float = 0.0) -> str:
     """Ask the LLM to produce a grounded answer with [N] source citations."""
     system = register_prompt(QA_PROMPT_VERSION, (
         "You are a grounded question-answering assistant. Answer using ONLY the "
@@ -2095,7 +2095,7 @@ def generate_answer(query: str, results: list[dict]) -> str:
     user = build_qa_user_prompt(query, results)
 
     try:
-        return _chat_call(system, user, temperature=0)
+        return _chat_call(system, user, temperature=temperature)
     except Exception:
         return ""
 
@@ -2445,6 +2445,15 @@ def load_url():
         "chunk_comparison": CHUNK_COUNTS.get(sid, {})})
 
 
+@app.route("/favicon.ico")
+def favicon():
+    """Serves the project's RAG icon as favicon."""
+    ico_path = Path(__file__).parent / "static" / "favicon.ico"
+    if ico_path.exists():
+        return send_file(ico_path, mimetype="image/x-icon")
+    return send_file(Path(__file__).parent / "static" / "rag.svg", mimetype="image/svg+xml")
+
+
 @app.route("/file/<doc_id>", methods=["GET"])
 def serve_file(doc_id: str):
     """View an uploaded document (e.g. PDF) in an HTML viewer page."""
@@ -2523,9 +2532,22 @@ def ask():
         return jsonify({"error": "No documents uploaded yet"}), 400
 
     sid = session["session_id"]
-    data = request.get_json()
-    query = (data or {}).get("query", "").strip()
-    method_filter = (data or {}).get("chunk_mode", "").strip() or None
+    data = request.get_json(silent=True) or {}
+    query = data.get("query", "").strip()
+    method_filter = data.get("chunk_mode", "").strip() or None
+
+    # Dynamic TOP_K and TEMPERATURE from request payload (fallback to env/defaults)
+    req_top_k = data.get("top_k")
+    try:
+        top_k = max(1, min(20, int(req_top_k))) if req_top_k is not None else TOP_K
+    except (ValueError, TypeError):
+        top_k = TOP_K
+
+    req_temp = data.get("temperature")
+    try:
+        temperature = max(0.0, min(1.0, float(req_temp))) if req_temp is not None else 0.0
+    except (ValueError, TypeError):
+        temperature = 0.0
 
     trace_id = str(uuid.uuid4())
     _t0 = time.time()
@@ -2543,7 +2565,7 @@ def ask():
             "search_query": redact(search_query) if search_query != query else None,
             "chunk_mode_filter": method_filter,
             "retrieval_mode": retrieval_mode,
-            "top_k": TOP_K,
+            "top_k": top_k,
             "embed_min_score": EMBED_MIN_SCORE,
             "rerank_enabled": RERANK_ENABLED,
             "rerank_score": rerank_score,
@@ -2579,6 +2601,8 @@ def ask():
         "Session ID": sid[:8],
         "Strategy Filter": method_filter or "All",
         "Total Session Chunks": len(store.chunks),
+        "Top-K": top_k,
+        "Temperature": temperature,
     })
 
     search_query = rewrite_query(query) if QUERY_REWRITE_ENABLED else query
@@ -2598,6 +2622,8 @@ def ask():
             "found": False,
             "answer": "No documents have been uploaded yet. Please upload a PDF, text file, or web page first.",
             "sources": [],
+            "top_k": top_k,
+            "temperature": temperature,
         })
 
     active_store = store
@@ -2610,31 +2636,26 @@ def ask():
                           f"strategy yet. Upload one under that strategy first, or ask "
                           f"without a strategy filter to search everything indexed."),
                 "sources": [],
+                "top_k": top_k,
+                "temperature": temperature,
             })
 
     # Path 1: embeddings + LLM (if configured and vectors exist)
-    # Path 1 needs BOTH: a working embeddings backend (Gemini w/ key, or a
-    # local Ollama server — see _embeddings_configured()) for retrieval,
-    # and a working chat backend (xAI w/ key, or local Ollama — see
-    # _chat_configured()) for the actual answer generation. Gating on
-    # only one meant a missing/misconfigured chat backend still ran full
-    # retrieval before failing inside generate_answer() and falling back
-    # to TF-IDF anyway — correct but wasteful. Checking both up front
-    # skips straight to Path 2.
     if _embeddings_configured() and _chat_configured() and active_store.vectors and len(active_store.vectors) == len(active_store.chunks):
         try:
             if RETRIEVAL_MODE == "hybrid-legacy":
-                raw_results = hybrid_search(active_store, search_query, top_k=TOP_K)
+                raw_results = hybrid_search(active_store, search_query, top_k=top_k)
             elif RETRIEVAL_MODE == "embed":
                 q_vec = embed_text(search_query)
-                raw_results = active_store.query(q_vec, top_k=TOP_K, min_score=0.0)
+                raw_results = active_store.query(q_vec, top_k=top_k, min_score=0.0)
             else:  # "hybrid" (default) — Reciprocal Rank Fusion
-                raw_results = reciprocal_rank_fusion(active_store, search_query, top_k=TOP_K)
+                raw_results = reciprocal_rank_fusion(active_store, search_query, top_k=top_k)
             near_miss = raw_results[0] if raw_results else None
             results = [r for r in raw_results if r["score"] >= EMBED_MIN_SCORE]
             
             RAGTracer.trace("RETRIEVAL", 3, 6, "Hybrid Retrieval & RRF Fusion", {
                 "Retrieval Mode": RETRIEVAL_MODE,
+                "Top-K Requested": top_k,
                 "Raw Candidates Returned": len(raw_results),
                 "Above Min Threshold (" + str(EMBED_MIN_SCORE) + ")": len(results),
                 "Top Match Score": f"{near_miss['score']:.4f}" if near_miss else "0.0000",
@@ -2663,7 +2684,7 @@ def ask():
             if not valid:
                 log_ask_trace(
                     retrieval_mode=RETRIEVAL_MODE, retrieved=raw_results,
-                    valid_context=False, model=LLM_MODEL, temperature=0,
+                    valid_context=False, model=LLM_MODEL, temperature=temperature,
                     prompt_version=None, raw_output=None,
                     answer="I don't know — no document content matched your question closely enough.",
                     found=False, rerank_score=rerank_score,
@@ -2673,6 +2694,8 @@ def ask():
                     "answer": "I don't know — no document content matched your question closely enough.",
                     "sources": [],
                     "trace_id": trace_id,
+                    "top_k": top_k,
+                    "temperature": temperature,
                     "closest_match": ({
                         "filename": near_miss["filename"],
                         "section": near_miss.get("section"),
@@ -2681,15 +2704,16 @@ def ask():
                         "threshold": EMBED_MIN_SCORE,
                     } if near_miss else None),
                 })
-            answer = generate_answer(query, results)
+            answer = generate_answer(query, results, temperature=temperature)
             RAGTracer.trace("RETRIEVAL", 6, 6, "LLM Answer Generation", {
                 "Model Identifier": LLM_MODEL,
+                "Temperature": temperature,
                 "Sources Grounded": len(results),
                 "Answer Character Count": len(answer),
             })
             log_ask_trace(
                 retrieval_mode=RETRIEVAL_MODE, retrieved=results,
-                valid_context=True, model=LLM_MODEL, temperature=0,
+                valid_context=True, model=LLM_MODEL, temperature=temperature,
                 prompt_version=QA_PROMPT_VERSION, raw_output=answer,
                 answer=answer or "I don't know.",
                 found=not _is_dont_know(answer), rerank_score=rerank_score,
@@ -2699,6 +2723,8 @@ def ask():
                 "answer": answer or "I don't know.",
                 "sources": annotate_openable(results),
                 "trace_id": trace_id,
+                "top_k": top_k,
+                "temperature": temperature,
             })
         except urllib.error.HTTPError as exc:
             reason = {
@@ -2723,7 +2749,7 @@ def ask():
     # Path 2: offline TF-IDF fallback
     chunks = active_store.chunks
     index = active_store.get_tfidf_index()
-    results = search_chunks(search_query, chunks, index, top_k=TOP_K)
+    results = search_chunks(search_query, chunks, index, top_k=top_k)
     results = fit_to_token_budget(results, MAX_CONTEXT_TOKENS)
     if not validate_context(results, TFIDF_MIN_SCORE, query):
         near_miss = results[0] if results else None
@@ -2739,6 +2765,8 @@ def ask():
             "answer": "I don't know — no document content matched your question closely enough.",
             "sources": [],
             "trace_id": trace_id,
+            "top_k": top_k,
+            "temperature": temperature,
             "closest_match": ({
                 "filename": near_miss["filename"],
                 "section": near_miss.get("section"),
@@ -2750,6 +2778,8 @@ def ask():
     resp = synthesize_answer(query, results)
     resp["sources"] = annotate_openable(resp.get("sources", []))
     resp["trace_id"] = trace_id
+    resp["top_k"] = top_k
+    resp["temperature"] = temperature
     log_ask_trace(
         retrieval_mode="tfidf", retrieved=results, valid_context=True,
         model="tfidf-template", temperature=None, prompt_version=None,

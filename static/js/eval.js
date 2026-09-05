@@ -745,7 +745,7 @@ function EvalApp() {
     { id: generateId(), question: '', expected: '' },
     { id: generateId(), question: '', expected: '' },
   ]);
-  const [topK, setTopK]                     = useState(3);
+  const [topK, setTopK]                     = useState(8);
   const [strategyFilter, setStrategyFilter] = useState('');
   const [presets, setPresets]               = useState({
     'tfidf': true,
