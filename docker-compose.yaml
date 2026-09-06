@@ -84,6 +84,11 @@ services:
       QUERY_REWRITE_ENABLED: ${QUERY_REWRITE_ENABLED:-false}
       TRACE_LOG_PATH: ${TRACE_LOG_PATH:-traces/traces.jsonl}
       SECRET_KEY: ${SECRET_KEY:?SECRET_KEY must be set in .env to preserve session continuity}
+      # Adds the Secure flag to the session cookie. The app port below is
+      # loopback-bound plain HTTP, so this defaults off — enable it only once
+      # a TLS-terminating reverse proxy sits in front, otherwise browsers drop
+      # the cookie and sessions stop working entirely.
+      SESSION_COOKIE_SECURE: ${SESSION_COOKIE_SECURE:-false}
       ADMIN_API_KEY: ${ADMIN_API_KEY:-}
       LOG_LEVEL: ${LOG_LEVEL:-INFO}
       PORT: 5000
@@ -98,6 +103,8 @@ services:
       qdrant:
         condition: service_healthy
     healthcheck:
+      # /healthz is a plain liveness probe and is unchanged by the FastAPI
+      # migration — same path, same JSON body, still 200 with no dependencies.
       test: ["CMD-SHELL", "python -c 'import urllib.request; urllib.request.urlopen(\"http://localhost:5000/healthz\")' || exit 1"]
       interval: 10s
       timeout: 5s

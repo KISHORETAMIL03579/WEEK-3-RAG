@@ -87,11 +87,16 @@ def evaluate_preset(store: VectorStore, questions: list[dict], k: int, preset_na
     per_question = []
     hits = 0
 
-    for q in questions:
+    for idx, q in enumerate(questions, start=1):
         q_text = q.get("question", "").strip()
         expected = q.get("expected") or q.get("expected_doc", "").strip()
-        
-        res = _run_eval_preset(store, q_text, expected, k, preset)
+        q_id = str(q.get("id") or f"q_{idx}")
+
+        # NOTE: _run_eval_preset()'s signature is
+        # (store, q_id, question, expected, k, preset) — this call site was
+        # missing q_id, which shifted every argument one position left and
+        # raised TypeError before a single question could be scored.
+        res = _run_eval_preset(store, q_id, q_text, expected, k, preset)
         hits += int(res["hit"])
         per_question.append(res)
 

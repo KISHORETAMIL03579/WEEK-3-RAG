@@ -7,6 +7,7 @@ import time
 import uuid
 import pickle
 import base64
+import shutil
 import tempfile
 import hashlib
 import hmac
@@ -22,6 +23,7 @@ import html.parser
 from datetime import datetime, timezone
 from pathlib import Path
 from collections import Counter
+from typing import Annotated, Any
 from filelock import FileLock
 
 try:
@@ -33,8 +35,19 @@ import pymupdf as fitz  # PyMuPDF — imports the real module directly, avoiding
                         # the deprecated `import fitz` legacy-alias shim that
                         # prints the runtime warning. Every fitz.* call below
                         # is unaffected since this is just a local alias.
-from flask import Flask, request, jsonify, render_template, session, send_file
-from werkzeug.utils import secure_filename
+import jinja2
+from fastapi import Body, Depends, FastAPI, File, Form, Query, Request, Response, UploadFile
+from fastapi.encoders import jsonable_encoder
+from fastapi.exceptions import RequestValidationError
+from fastapi.responses import FileResponse, JSONResponse
+from fastapi.staticfiles import StaticFiles
+from fastapi.templating import Jinja2Templates
+from pydantic import BaseModel, ConfigDict
+from starlette.datastructures import Headers
+from starlette.middleware import Middleware
+from starlette.middleware.sessions import SessionMiddleware
+from starlette.types import ASGIApp, Receive, Scope, Send
+from werkzeug.utils import secure_filename  # Starlette does not vendor this; werkzeug is an explicit dep
 
 from trace_store import (
     TraceStore, redact, redact_deep, register_prompt, get_prompt,
@@ -119,27 +132,175 @@ class RAGTracer:
 #  App Setup
 # ─────────────────────────────────────────────────────────────────────────────
 
-app = Flask(__name__)
+BASE_DIR = Path(__file__).parent
+
 _env_secret = os.environ.get("SECRET_KEY")
-_env_mode = os.environ.get("FLASK_ENV", os.environ.get("ENV", "")).lower()
+# APP_ENV is the preferred name now that Flask is gone; ENV and the legacy
+# FLASK_ENV are still honored so existing .env files keep working unchanged.
+_env_mode = os.environ.get(
+    "APP_ENV", os.environ.get("ENV", os.environ.get("FLASK_ENV", ""))
+).lower()
 
 if _env_secret:
-    app.secret_key = _env_secret
+    SECRET_KEY = _env_secret
 elif _env_mode == "production":
     raise RuntimeError(
         "CRITICAL: SECRET_KEY environment variable is mandatory in production mode. "
         "Running with an ephemeral per-process key will break sessions across worker restarts."
     )
 else:
-    app.secret_key = secrets.token_hex(32)
+    SECRET_KEY = secrets.token_hex(32)
     logger.warning(
         "SECRET_KEY not set — using a random per-process key for development. Sessions will "
         "NOT survive a server restart, and running multiple workers (e.g. gunicorn) "
         "will break sessions. Set SECRET_KEY explicitly for production deployments."
     )
-app.config["MAX_CONTENT_LENGTH"] = 50 * 1024 * 1024  # 50 MB per request
 
-BASE_DIR = Path(__file__).parent
+# 50 MB per request. Flask enforced this itself via app.config["MAX_CONTENT_LENGTH"];
+# Starlette/FastAPI impose NO body-size limit of their own, so MaxBodySizeMiddleware
+# below re-implements the cap explicitly. Dropping it would turn every upload
+# endpoint into an unbounded read.
+MAX_CONTENT_LENGTH = 50 * 1024 * 1024
+SESSION_COOKIE_MAX_AGE = 14 * 24 * 60 * 60  # 14 days, matching Starlette's default
+# Off by default, exactly as Flask's SESSION_COOKIE_SECURE was. Turn it on
+# ONLY once TLS actually terminates in front of the app: browsers silently
+# drop a Secure cookie sent over plain HTTP, which breaks sessions rather
+# than hardening them.
+SESSION_COOKIE_SECURE = os.environ.get("SESSION_COOKIE_SECURE", "").lower() in ("1", "true", "yes")
+
+
+class _BodyTooLarge(BaseException):
+    """Raised from the wrapped `receive` once a request body exceeds the cap.
+
+    Deliberately a BaseException, not an Exception: FastAPI wraps *any*
+    Exception raised while parsing a request body into a generic
+    400 "There was an error parsing the body", which would swallow the 413
+    this is supposed to produce. MaxBodySizeMiddleware has a second
+    safety net for that case anyway (see send_wrapper), but not tripping
+    the wrapper in the first place keeps the common path honest.
+    """
+
+
+def _too_large_response() -> JSONResponse:
+    return JSONResponse({"error": "File too large (max 50 MB)"}, status_code=413)
+
+
+class MaxBodySizeMiddleware:
+    """
+    Enforces a hard cap on request body size — the FastAPI equivalent of
+    Flask's MAX_CONTENT_LENGTH.
+
+    Two layers, because neither alone is sufficient:
+      1. A declared Content-Length larger than the cap is rejected before a
+         single body byte is read. This catches every ordinary browser or
+         HTTP-client upload.
+      2. Bodies with no declared length (HTTP/1.1 chunked transfer encoding)
+         are counted as they stream through and aborted the moment the
+         running total crosses the cap — otherwise (1) is trivially bypassed
+         by simply omitting the header.
+
+    Pure ASGI rather than BaseHTTPMiddleware so the body can be inspected
+    without buffering the whole request first, which would defeat the point.
+    """
+
+    def __init__(self, app: ASGIApp, max_body_size: int) -> None:
+        self.app = app
+        self.max_body_size = max_body_size
+
+    def _declares_oversized_body(self, scope: Scope) -> bool:
+        """True only when Content-Length is present, parseable, and over the
+        cap. A missing or malformed header falls through to the byte counter
+        rather than being trusted either way."""
+        declared = Headers(scope=scope).get("content-length")
+        if declared is None:
+            return False
+        try:
+            return int(declared) > self.max_body_size
+        except ValueError:
+            return False
+
+    async def __call__(self, scope: Scope, receive: Receive, send: Send) -> None:
+        if scope["type"] != "http":
+            await self.app(scope, receive, send)
+            return
+
+        if self._declares_oversized_body(scope):
+            await _too_large_response()(scope, receive, send)
+            return
+
+        received = 0
+        exceeded = False
+        response_started = False
+        replaced = False
+
+        async def limited_receive() -> Any:
+            nonlocal received, exceeded
+            message = await receive()
+            if message["type"] == "http.request":
+                received += len(message.get("body", b""))
+                if received > self.max_body_size:
+                    exceeded = True
+                    raise _BodyTooLarge()
+            return message
+
+        async def send_wrapper(message: Any) -> None:
+            nonlocal response_started, replaced
+            if replaced:
+                return  # the rest of the superseded response is dropped
+            if message["type"] == "http.response.start":
+                if exceeded:
+                    # Something downstream caught the aborted read and turned
+                    # it into its own error response. Replace it: the caller
+                    # must see 413, not a misleading 400/500.
+                    replaced = True
+                    await _too_large_response()(scope, receive, send)
+                    return
+                response_started = True
+            await send(message)
+
+        try:
+            await self.app(scope, limited_receive, send_wrapper)
+        except BaseException:
+            if not exceeded:
+                raise
+            # The exception is a consequence of us aborting the read (possibly
+            # re-wrapped by an intermediate task group), so it is ours to answer.
+            if not response_started and not replaced:
+                await _too_large_response()(scope, receive, send)
+
+
+app = FastAPI(
+    title="Ask My Docs",
+    description=(
+        "Universal multimodal RAG: upload documents, retrieve with hybrid "
+        "BM25 + embedding search fused by RRF, and answer with grounded citations."
+    ),
+    version="5.0.0",
+    middleware=[
+        # Outermost first. The size cap runs before session decoding so an
+        # oversized body is refused without any further work being done on it.
+        Middleware(MaxBodySizeMiddleware, max_body_size=MAX_CONTENT_LENGTH),
+        Middleware(
+            SessionMiddleware,
+            secret_key=SECRET_KEY,
+            session_cookie="session",
+            max_age=SESSION_COOKIE_MAX_AGE,
+            same_site="lax",
+            https_only=SESSION_COOKIE_SECURE,
+        ),
+    ],
+)
+
+# Flask auto-served ./static; FastAPI needs it mounted explicitly.
+app.mount("/static", StaticFiles(directory=str(BASE_DIR / "static")), name="static")
+
+templates = Jinja2Templates(directory=str(BASE_DIR / "templates"))
+# Flask registers a `tojson` filter automatically; Starlette's Jinja2Templates
+# builds a bare jinja2.Environment. Jinja ships `tojson` in its own defaults,
+# but templates/view.html depends on it for script-context escaping of
+# window.DOC_ID et al, so register it explicitly rather than relying on a
+# Jinja default that could change underneath us.
+templates.env.filters["tojson"] = jinja2.filters.do_tojson
 
 # ─────────────────────────────────────────────────────────────────────────────
 #  Trace logging (W5 Task Set C — durable, replayable /ask traces)
@@ -182,7 +343,7 @@ ORPHANED_DOCS: dict[str, list[dict]] = {}  # In-memory index: sid -> list of orp
 ADMIN_API_KEY = os.environ.get("ADMIN_API_KEY", "").strip()
 
 
-def _is_admin_request(req) -> bool:
+def _is_admin_request(req: Request) -> bool:
     """Validate administrative authorization via ADMIN_API_KEY (Bearer token or X-Admin-Key)."""
     if not ADMIN_API_KEY:
         return False
@@ -1070,6 +1231,17 @@ def _get_store(sid: str) -> VectorStore:
 
 def allowed_file(filename: str) -> bool:
     return "." in filename and filename.rsplit(".", 1)[1].lower() in ALLOWED_EXTENSIONS
+
+
+def _save_upload_to(upload: UploadFile, destination: Path) -> None:
+    """Stream an UploadFile to disk — the FastAPI equivalent of Werkzeug's
+    FileStorage.save(). Copied in chunks rather than via .read(), so a large
+    (but still within MAX_CONTENT_LENGTH) upload never has to sit in memory
+    in its entirety."""
+    upload.file.seek(0)
+    with open(destination, "wb") as out:
+        shutil.copyfileobj(upload.file, out, length=1024 * 1024)
+    upload.file.seek(0)
 
 
 # ─────────────────────────────────────────────────────────────────────────────
@@ -2326,14 +2498,196 @@ def build_qa_user_prompt(query: str, results: list[dict]) -> str:
 
 
 # ─────────────────────────────────────────────────────────────────────────────
-#  Flask Routes
+#  Request / response schemas
+# ─────────────────────────────────────────────────────────────────────────────
+# These exist for two concrete reasons: real request validation at the edge
+# (instead of hand-rolled `.get()` chains inside every handler) and an
+# accurate, self-updating OpenAPI schema at /docs. Response models are used
+# only where the payload shape is genuinely fixed — the endpoints whose
+# bodies vary by branch (/ask, /upload, /eval/run, ...) keep returning plain
+# dicts so the wire format stays byte-for-byte what the frontend already
+# expects.
+
+
+class _LenientModel(BaseModel):
+    """Base for request bodies: unknown keys are ignored rather than rejected,
+    matching the previous `request.get_json(silent=True) or {}` tolerance."""
+
+    model_config = ConfigDict(extra="ignore")
+
+
+class UploadCancelRequest(_LenientModel):
+    upload_id: str | None = None
+
+
+class LoadUrlRequest(_LenientModel):
+    url: str | None = None
+    chunk_mode: str | None = None
+
+
+class AskRequest(_LenientModel):
+    query: str = ""
+    chunk_mode: str | None = None
+    top_k: int | None = None
+    temperature: float | None = None
+
+
+class RemoveRequest(_LenientModel):
+    doc_id: str | None = None
+
+
+class EvalQuestion(_LenientModel):
+    id: str | None = None
+    question: str | None = None
+    expected: str | None = None
+    expected_doc: str | None = None
+    expected_section: str | None = None
+
+
+class EvalRunRequest(_LenientModel):
+    questions: list[EvalQuestion] = []
+    top_k: int | None = None
+    k: int = 3
+    strategy_filter: str | None = None
+    chunk_mode: str | None = None
+    presets: list[str] | None = None
+    modes: list[str] | None = None  # legacy alias for `presets`
+
+
+class OkResponse(BaseModel):
+    ok: bool = True
+
+
+class ClearResponse(BaseModel):
+    ok: bool = True
+    warning: str | None = None
+
+
+class RemoveResponse(BaseModel):
+    ok: bool = True
+    removed_chunks: int = 0
+    warning: str | None = None
+
+
+class StatusDocument(BaseModel):
+    filename: str
+    doc_id: str
+    chunk_count: int
+    method: str
+    openable: bool
+
+
+class StatusResponse(BaseModel):
+    total_chunks: int
+    documents: list[StatusDocument]
+    methods: list[str]
+    mode: str
+    vector_backend: str
+
+
+class HealthzResponse(BaseModel):
+    status: str
+    embeddings_configured: bool
+    chat_configured: bool
+    chat_backend: str
+    embeddings_backend: str
+    retrieval_mode: str
+    vector_backend: str
+    active_sessions: int
+
+
+class ReadyzResponse(BaseModel):
+    ready: bool
+    checks: dict[str, bool]
+
+
+class TracesResponse(BaseModel):
+    count: int
+    trace_ids: list[str]
+
+
+# ─────────────────────────────────────────────────────────────────────────────
+#  Session dependencies
+# ─────────────────────────────────────────────────────────────────────────────
+# Flask's `session` was an implicit request-global; Starlette's lives on the
+# Request. Rather than repeat the same three lines at the top of every
+# handler, the two access patterns the app actually needs are expressed as
+# dependencies: "give me a session, creating one if this is a first visit"
+# and "there must already be one, else 400".
+
+
+class NoActiveSessionError(Exception):
+    """Raised by require_session_id() when the caller has no session cookie."""
+
+
+@app.exception_handler(NoActiveSessionError)
+async def _no_active_session_handler(request: Request, exc: NoActiveSessionError) -> JSONResponse:
+    return JSONResponse({"error": "No active session"}, status_code=400)
+
+
+@app.exception_handler(RequestValidationError)
+async def _validation_error_handler(request: Request, exc: RequestValidationError) -> JSONResponse:
+    """Every error this API returns carries an `error` string — that is what
+    static/js/app.js's handleResponse() reads. FastAPI's default 422 body is
+    `{"detail": [...]}` instead, which the frontend would render as a bare
+    "Request failed with status 422". This keeps the envelope consistent
+    while still exposing the structured `detail` for API clients and /docs.
+    """
+    problems = "; ".join(
+        f"{'.'.join(str(p) for p in err.get('loc', ())[1:]) or 'body'}: {err.get('msg', 'invalid')}"
+        for err in exc.errors()
+    )
+    return JSONResponse(
+        {"error": f"Invalid request: {problems}", "detail": jsonable_encoder(exc.errors())},
+        status_code=422,
+    )
+
+
+def ensure_session_id(request: Request) -> str:
+    """Session id for this browser, minting one on first contact."""
+    sid = request.session.get("session_id")
+    if not sid:
+        sid = str(uuid.uuid4())
+        request.session["session_id"] = sid
+    return sid
+
+
+def require_session_id(request: Request) -> str:
+    """Session id for this browser, or a 400 {"error": "No active session"}."""
+    sid = request.session.get("session_id")
+    if not sid:
+        raise NoActiveSessionError()
+    return sid
+
+
+def optional_session_id(request: Request) -> str | None:
+    """Session id if there is one, else None — for endpoints that answer
+    differently (or with a different status code) when there's no session."""
+    return request.session.get("session_id")
+
+
+def require_session_store(sid: Annotated[str, Depends(require_session_id)]) -> VectorStore:
+    """This session's loaded vector store (Qdrant- or memory-backed), or a
+    400 if there is no session at all."""
+    return _get_store(sid)
+
+
+SessionId = Annotated[str, Depends(ensure_session_id)]
+RequiredSessionId = Annotated[str, Depends(require_session_id)]
+OptionalSessionId = Annotated[str | None, Depends(optional_session_id)]
+RequiredStore = Annotated[VectorStore, Depends(require_session_store)]
+
+
+# ─────────────────────────────────────────────────────────────────────────────
+#  Routes
 # ─────────────────────────────────────────────────────────────────────────────
 
-@app.route("/")
-def index():
-    if "session_id" not in session:
-        session["session_id"] = str(uuid.uuid4())
-    return render_template("index.html")
+@app.get("/", include_in_schema=False)
+def index(request: Request, sid: SessionId):
+    # `sid` is unused in the body on purpose: depending on it is what mints
+    # the session cookie for a first-time visitor, exactly as the old
+    # `if "session_id" not in session` block did.
+    return templates.TemplateResponse(request, "index.html")
 
 
 def _index_into_store(sid: str, doc_info: dict, pages: list[dict],
@@ -2351,8 +2705,8 @@ def _index_into_store(sid: str, doc_info: dict, pages: list[dict],
     store.add(new_chunks, vectors)
 
 
-@app.route("/upload-cancel", methods=["POST"])
-def upload_cancel():
+@app.post("/upload-cancel", response_model=OkResponse)
+def upload_cancel(payload: UploadCancelRequest | None = Body(default=None)):
     """
     Signals that an in-flight /upload call (identified by the same
     upload_id the client sent with its FormData) should be cancelled.
@@ -2363,26 +2717,24 @@ def upload_cancel():
     (nothing left to cancel) and cleaned up by the TTL sweep.
     """
     _sweep_cancelled_uploads()
-    data = request.get_json(silent=True) or {}
-    upload_id = (data.get("upload_id") or "").strip()
+    upload_id = ((payload.upload_id if payload else None) or "").strip()
     if upload_id:
         CANCELLED_UPLOADS[upload_id] = time.time()
-    return jsonify({"ok": True})
+    return OkResponse()
 
 
-@app.route("/upload", methods=["POST"])
-def upload():
-    if "session_id" not in session:
-        session["session_id"] = str(uuid.uuid4())
-
-    sid = session["session_id"]
-    chunk_mode = request.form.get("chunk_mode", "structured")
-    upload_id = (request.form.get("upload_id") or "").strip()
+@app.post("/upload")
+def upload(
+    sid: SessionId,
+    files: list[UploadFile] = File(default=[]),
+    chunk_mode: str = Form(default="structured"),
+    upload_id: str = Form(default=""),
+):
+    upload_id = (upload_id or "").strip()
     _sweep_cancelled_uploads()
 
-    files = request.files.getlist("files")
     if not files:
-        return jsonify({"error": "No files provided"}), 400
+        return JSONResponse({"error": "No files provided"}, status_code=400)
 
     logger.info("📤 Upload request received: %d file(s) (chunk_mode: %s, session: %s)",
                 len(files), chunk_mode, sid[:8])
@@ -2399,7 +2751,7 @@ def upload():
     })
 
     for f in files:
-        if not f or not allowed_file(f.filename):
+        if not f or not allowed_file(f.filename or ""):
             logger.warning("⚠️ Unsupported file type uploaded: %s", getattr(f, "filename", "?"))
             results.append({"filename": getattr(f, "filename", "?") or "?",
                             "error": "Unsupported file type (allowed: PDF, TXT, MD)"})
@@ -2415,7 +2767,7 @@ def upload():
 
         dedupe_key = None
         try:
-            f.save(filepath)
+            _save_upload_to(f, filepath)
             with open(filepath, "rb") as fh:
                 content_hash = hashlib.sha256(fh.read()).hexdigest()
             dedupe_key = (content_hash, chunk_mode)
@@ -2487,8 +2839,8 @@ def upload():
             results.append({"filename": original_name, "error": f"Failed to index: {exc}"})
 
     if not pending:
-        return jsonify({"ok": False, "error": "No valid documents were indexed.",
-                        "documents": results}), 400
+        return JSONResponse({"ok": False, "error": "No valid documents were indexed.",
+                             "documents": results}, status_code=400)
 
     store = _get_store(sid)
     committed_doc_ids: list[str] = []  # tracks what THIS call actually added, for rollback below
@@ -2665,53 +3017,49 @@ def upload():
         CANCELLED_UPLOADS.pop(upload_id, None)
 
         if failed_rollbacks:
-            return jsonify({
+            return {
                 "ok": False,
                 "cancelled": True,
                 "cleanup_complete": False,
                 "error": f"Upload cancelled but cleanup was incomplete: failed to remove {len(failed_rollbacks)} document(s) from vector store.",
                 "failed_cleanup": failed_rollbacks,
                 "documents": [],
-            }), 200
+            }
         else:
-            return jsonify({
+            return {
                 "ok": False,
                 "cancelled": True,
                 "cleanup_complete": True,
                 "error": "Upload cancelled — nothing was indexed.",
                 "documents": [],
-            }), 200
+            }
 
-    return jsonify({"ok": True, "documents": results, "total_chunks": len(store.chunks),
-                    "chunk_comparison": CHUNK_COUNTS.get(sid, {})})
+    return {"ok": True, "documents": results, "total_chunks": len(store.chunks),
+            "chunk_comparison": CHUNK_COUNTS.get(sid, {})}
 
 
-@app.route("/load-url", methods=["POST"])
-def load_url():
-    if "session_id" not in session:
-        session["session_id"] = str(uuid.uuid4())
-
-    sid = session["session_id"]
-    data = request.get_json(silent=True) or {}
-    url = (data.get("url") or "").strip()
-    chunk_mode = data.get("chunk_mode", "structured")
+@app.post("/load-url")
+def load_url(sid: SessionId, payload: LoadUrlRequest | None = Body(default=None)):
+    payload = payload or LoadUrlRequest()
+    url = (payload.url or "").strip()
+    chunk_mode = payload.chunk_mode or "structured"
 
     if not url:
-        return jsonify({"error": "Empty URL"}), 400
+        return JSONResponse({"error": "Empty URL"}, status_code=400)
 
     parsed = urllib.parse.urlparse(url)
     if parsed.scheme not in ("http", "https") or not parsed.netloc:
-        return jsonify({"error": "URL must start with http:// or https://"}), 400
+        return JSONResponse({"error": "URL must start with http:// or https://"}, status_code=400)
 
     embedding_ok = _embeddings_configured()
 
     try:
         title, text = fetch_web_page(url)
     except Exception as exc:
-        return jsonify({"error": f"Failed to fetch URL: {exc}"}), 400
+        return JSONResponse({"error": f"Failed to fetch URL: {exc}"}, status_code=400)
 
     if len(text.split()) < 20:
-        return jsonify({"error": "Page returned too little text to index."}), 400
+        return JSONResponse({"error": "Page returned too little text to index."}, status_code=400)
 
     doc_id = str(uuid.uuid4())[:8]
     doc_info = {"doc_id": doc_id, "filename": title[:80] or parsed.netloc}
@@ -2719,26 +3067,27 @@ def load_url():
 
     new_chunks = chunk_text(doc_info, pages, chunk_mode)
     if not new_chunks:
-        return jsonify({"error": "No chunks produced from this page."}), 400
+        return JSONResponse({"error": "No chunks produced from this page."}, status_code=400)
 
     store = _get_store(sid)
     if VECTOR_BACKEND == "qdrant":
         if not embedding_ok:
-            return jsonify({
+            return JSONResponse({
                 "error": "Qdrant vector backend requires embeddings. Configure an embedding backend first."
-            }), 503
+            }, status_code=503)
         try:
             vectors = embed_texts([c["text"] for c in new_chunks])
             store.add(new_chunks, vectors)
         except Exception as exc:
-            return jsonify({"error": f"Embedding/indexing failed on Qdrant backend: {exc}"}), 503
+            return JSONResponse({"error": f"Embedding/indexing failed on Qdrant backend: {exc}"},
+                                status_code=503)
     else:
         if embedding_ok:
             try:
                 vectors = embed_texts([c["text"] for c in new_chunks])
                 store.add(new_chunks, vectors)
             except Exception as exc:
-                return jsonify({"error": f"Embedding failed: {exc}"}), 500
+                return JSONResponse({"error": f"Embedding failed: {exc}"}, status_code=500)
         else:
             store.add(new_chunks, [])
 
@@ -2746,7 +3095,7 @@ def load_url():
     for mode in ("structured", "128", "256", "512"):
         CHUNK_COUNTS[sid][mode] = len(chunk_text(doc_info, pages, mode))
 
-    return jsonify({"ok": True, "documents": [{
+    return {"ok": True, "documents": [{
         "filename": doc_info["filename"],
         "doc_id": doc_id,
         "openable": False,
@@ -2754,31 +3103,27 @@ def load_url():
         "chunks": len(new_chunks),
         "method": chunk_mode,
     }], "total_chunks": len(store.chunks),
-        "chunk_comparison": CHUNK_COUNTS.get(sid, {})})
+        "chunk_comparison": CHUNK_COUNTS.get(sid, {})}
 
 
-@app.route("/favicon.ico")
+@app.get("/favicon.ico", include_in_schema=False)
 def favicon():
     """Serves the project's RAG icon as favicon."""
-    ico_path = Path(__file__).parent / "static" / "favicon.ico"
+    ico_path = BASE_DIR / "static" / "favicon.ico"
     if ico_path.exists():
-        return send_file(ico_path, mimetype="image/x-icon")
-    return send_file(Path(__file__).parent / "static" / "rag.svg", mimetype="image/svg+xml")
+        return FileResponse(ico_path, media_type="image/x-icon")
+    return FileResponse(BASE_DIR / "static" / "rag.svg", media_type="image/svg+xml")
 
 
-@app.route("/file/<doc_id>", methods=["GET"])
-def serve_file(doc_id: str):
+@app.get("/file/{doc_id}", include_in_schema=False)
+def serve_file(request: Request, doc_id: str, store: RequiredStore):
     """View an uploaded document (e.g. PDF) in an HTML viewer page."""
-    sid = session.get("session_id")
-    if not sid:
-        return jsonify({"error": "No active session"}), 400
-
+    sid = request.session["session_id"]
     info = SESSION_FILES.get(sid, {}).get(doc_id)
-    store = _get_store(sid)
     doc_chunks = [c for c in store.chunks if c["doc_id"] == doc_id]
 
     if not info and not doc_chunks:
-        return jsonify({"error": "File not found or no longer available"}), 404
+        return JSONResponse({"error": "File not found or no longer available"}, status_code=404)
 
     if info and info["path"].exists():
         name = info["name"]
@@ -2787,34 +3132,34 @@ def serve_file(doc_id: str):
         name = doc_chunks[0]["filename"] if doc_chunks else "Document"
         ext = "txt"
 
-    return render_template("view.html", doc_id=doc_id, filename=name, ext=ext)
+    return templates.TemplateResponse(
+        request, "view.html", {"doc_id": doc_id, "filename": name, "ext": ext}
+    )
 
 
-@app.route("/file/<doc_id>/raw", methods=["GET"])
-def serve_file_raw(doc_id: str):
+@app.get("/file/{doc_id}/raw")
+def serve_file_raw(doc_id: str, sid: RequiredSessionId):
     """Stream the raw PDF bytes (used by the viewer page's embedded viewer)."""
-    sid = session.get("session_id")
-    if not sid:
-        return jsonify({"error": "No active session"}), 400
     info = SESSION_FILES.get(sid, {}).get(doc_id)
     if not info or not info["path"].exists():
-        return jsonify({"error": "File not found or no longer available"}), 404
-    return send_file(info["path"], download_name=info["name"], as_attachment=False)
+        return JSONResponse({"error": "File not found or no longer available"}, status_code=404)
+    # content_disposition_type="inline" is what Flask's as_attachment=False did.
+    # FileResponse defaults to "attachment" when a filename is given, which
+    # would make the browser download the PDF instead of rendering it in the
+    # viewer's <embed>.
+    return FileResponse(
+        info["path"], filename=info["name"], content_disposition_type="inline"
+    )
 
 
-@app.route("/file/<doc_id>/pages", methods=["GET"])
-def serve_file_pages(doc_id: str):
+@app.get("/file/{doc_id}/pages")
+def serve_file_pages(doc_id: str, sid: RequiredSessionId, store: RequiredStore):
     """Return the extracted pages (for the text viewer) of an uploaded document."""
-    sid = session.get("session_id")
-    if not sid:
-        return jsonify({"error": "No active session"}), 400
-
     info = SESSION_FILES.get(sid, {}).get(doc_id)
-    store = _get_store(sid)
     doc_chunks = [c for c in store.chunks if c["doc_id"] == doc_id]
 
     if not info and not doc_chunks:
-        return jsonify({"error": "File not found or no longer available"}), 404
+        return JSONResponse({"error": "File not found or no longer available"}, status_code=404)
 
     if info and info["path"].exists():
         name = info["name"]
@@ -2822,7 +3167,7 @@ def serve_file_pages(doc_id: str):
         try:
             pages = extract_document_pages(str(info["path"]), ext)
         except Exception as exc:
-            return jsonify({"error": f"Could not read document: {exc}"}), 500
+            return JSONResponse({"error": f"Could not read document: {exc}"}, status_code=500)
     else:
         # Reconstruct text pages from vector store chunks!
         name = doc_chunks[0]["filename"] if doc_chunks else "Document"
@@ -2830,36 +3175,28 @@ def serve_file_pages(doc_id: str):
         combined_text = "\n\n".join(c["text"] for c in doc_chunks)
         pages = [{"page": 1, "text": combined_text}]
 
-    return jsonify({
+    return {
         "filename": name,
         "ext": ext,
         "total_pages": len(pages),
         "pages": [{"num": i + 1, "text": p.get("text", "")} for i, p in enumerate(pages)],
-    })
+    }
 
 
-@app.route("/ask", methods=["POST"])
-def ask():
-    if "session_id" not in session:
-        return jsonify({"error": "No documents uploaded yet"}), 400
+@app.post("/ask")
+def ask(sid: OptionalSessionId, payload: AskRequest | None = Body(default=None)):
+    if not sid:
+        return JSONResponse({"error": "No documents uploaded yet"}, status_code=400)
 
-    sid = session["session_id"]
-    data = request.get_json(silent=True) or {}
-    query = data.get("query", "").strip()
-    method_filter = data.get("chunk_mode", "").strip() or None
+    payload = payload or AskRequest()
+    query = (payload.query or "").strip()
+    method_filter = (payload.chunk_mode or "").strip() or None
 
-    # Dynamic TOP_K and TEMPERATURE from request payload (fallback to env/defaults)
-    req_top_k = data.get("top_k")
-    try:
-        top_k = max(1, min(20, int(req_top_k))) if req_top_k is not None else TOP_K
-    except (ValueError, TypeError):
-        top_k = TOP_K
-
-    req_temp = data.get("temperature")
-    try:
-        temperature = max(0.0, min(1.0, float(req_temp))) if req_temp is not None else 0.0
-    except (ValueError, TypeError):
-        temperature = 0.0
+    # Dynamic TOP_K and TEMPERATURE from request payload (fallback to env/defaults).
+    # Pydantic has already coerced/validated the types; these just clamp to the
+    # supported range rather than rejecting an out-of-range value outright.
+    top_k = max(1, min(20, payload.top_k)) if payload.top_k is not None else TOP_K
+    temperature = max(0.0, min(1.0, payload.temperature)) if payload.temperature is not None else 0.0
 
     trace_id = str(uuid.uuid4())
     _t0 = time.time()
@@ -2930,19 +3267,19 @@ def ask():
             r["openable"] = r["doc_id"] in files
         return results
     if not store.chunks:
-        return jsonify({
+        return {
             "found": False,
             "answer": "No documents have been uploaded yet. Please upload a PDF, text file, or web page first.",
             "sources": [],
             "top_k": top_k,
             "temperature": temperature,
-        })
+        }
 
     active_store = store
     if method_filter:
         active_store = store.filtered_by_method(method_filter)
         if not active_store.chunks:
-            return jsonify({
+            return {
                 "found": False,
                 "answer": (f"No documents are indexed under the '{method_filter}' chunking "
                           f"strategy yet. Upload one under that strategy first, or ask "
@@ -2950,7 +3287,7 @@ def ask():
                 "sources": [],
                 "top_k": top_k,
                 "temperature": temperature,
-            })
+            }
 
     # Path 1: embeddings + LLM (if configured and vectors exist)
     if _embeddings_configured() and _chat_configured() and active_store.vectors and len(active_store.vectors) == len(active_store.chunks):
@@ -3001,7 +3338,7 @@ def ask():
                     answer="I don't know — no document content matched your question closely enough.",
                     found=False, rerank_score=rerank_score,
                 )
-                return jsonify({
+                return {
                     "found": False,
                     "answer": "I don't know — no document content matched your question closely enough.",
                     "sources": [],
@@ -3015,7 +3352,7 @@ def ask():
                         "score": round(near_miss["score"], 4),
                         "threshold": EMBED_MIN_SCORE,
                     } if near_miss else None),
-                })
+                }
             answer = generate_answer(query, results, temperature=temperature)
             RAGTracer.trace("RETRIEVAL", 6, 6, "LLM Answer Generation", {
                 "Model Identifier": LLM_MODEL,
@@ -3030,20 +3367,20 @@ def ask():
                 answer=answer or "I don't know.",
                 found=not _is_dont_know(answer), rerank_score=rerank_score,
             )
-            return jsonify({
+            return {
                 "found": not _is_dont_know(answer),
                 "answer": answer or "I don't know.",
                 "sources": annotate_openable(results),
                 "trace_id": trace_id,
                 "top_k": top_k,
                 "temperature": temperature,
-            })
+            }
         except RetrievalBackendError as exc:
             logger.error("❌ Vector database retrieval failed in /ask: %s", exc, exc_info=True)
-            return jsonify({
+            return JSONResponse({
                 "error": f"Vector database retrieval failed: {exc}",
                 "status": 503,
-            }), 503
+            }, status_code=503)
         except urllib.error.HTTPError as exc:
             reason = {
                 400: "Bad request — check your API key format and model name.",
@@ -3078,7 +3415,7 @@ def ask():
             answer="I don't know — no document content matched your question closely enough.",
             found=False,
         )
-        return jsonify({
+        return {
             "found": False,
             "answer": "I don't know — no document content matched your question closely enough.",
             "sources": [],
@@ -3092,7 +3429,7 @@ def ask():
                 "score": round(near_miss["score"], 4),
                 "threshold": TFIDF_MIN_SCORE,
             } if near_miss else None),
-        })
+        }
     resp = synthesize_answer(query, results)
     resp["sources"] = annotate_openable(resp.get("sources", []))
     resp["trace_id"] = trace_id
@@ -3104,36 +3441,34 @@ def ask():
         raw_output=resp.get("answer"), answer=resp.get("answer"),
         found=resp.get("found", True),
     )
-    return jsonify(resp)
+    return resp
 
 
-@app.route("/traces", methods=["GET"])
-def list_traces():
+@app.get("/traces", response_model=TracesResponse)
+def list_traces(current_sid: OptionalSessionId):
     """List logged trace_ids for the current session."""
-    current_sid = session.get("session_id")
     if not current_sid:
-        return jsonify({"count": 0, "trace_ids": []})
+        return TracesResponse(count=0, trace_ids=[])
     expected_hash = hashlib.sha256(current_sid.encode()).hexdigest()[:16]
     session_traces = [r["trace_id"] for r in TRACES.all() if r.get("session_id_hash") == expected_hash and "trace_id" in r]
-    return jsonify({"count": len(session_traces), "trace_ids": session_traces})
+    return TracesResponse(count=len(session_traces), trace_ids=session_traces)
 
 
-@app.route("/replay/<trace_id>", methods=["POST"])
-def replay_trace(trace_id):
+@app.post("/replay/{trace_id}")
+def replay_trace(trace_id: str, current_sid: OptionalSessionId):
     """Replay requirement#1: privacy-preserving replay reconstructing the
     generation from the durable prompt template version artifact, recorded model/temperature,
     and persisted redacted context snapshot."""
-    current_sid = session.get("session_id")
     if not current_sid:
-        return jsonify({"error": "No active session"}), 401
+        return JSONResponse({"error": "No active session"}, status_code=401)
 
     record = TRACES.get(trace_id)
     if not record:
-        return jsonify({"error": f"No trace found for trace_id={trace_id}"}), 404
+        return JSONResponse({"error": f"No trace found for trace_id={trace_id}"}, status_code=404)
 
     expected_hash = hashlib.sha256(current_sid.encode()).hexdigest()[:16]
     if record.get("session_id_hash") != expected_hash:
-        return jsonify({"error": "Unauthorized: trace belongs to another session"}), 403
+        return JSONResponse({"error": "Unauthorized: trace belongs to another session"}, status_code=403)
 
     missing = []
     for field in ("prompt_version", "model", "retrieved", "raw_output"):
@@ -3141,7 +3476,7 @@ def replay_trace(trace_id):
             missing.append(field)
 
     if record.get("retrieval_mode") == "tfidf" or not record.get("prompt_version"):
-        return jsonify({
+        return {
             "trace_id": trace_id,
             "replayable": False,
             "reason": (
@@ -3155,12 +3490,12 @@ def replay_trace(trace_id):
                 "retrieved": record.get("retrieved"),
             },
             "fields_missing_from_trace": missing,
-        })
+        }
 
     prompt_text = get_prompt(record["prompt_version"])
     if prompt_text is None:
         # If exact prompt artifact is missing, abort replay immediately without invoking LLM
-        return jsonify({
+        return JSONResponse({
             "trace_id": trace_id,
             "replayable": False,
             "reason": f"Durable prompt artifact for prompt_version {record['prompt_version']!r} is missing from registry. Exact prompt version required to replay.",
@@ -3173,7 +3508,7 @@ def replay_trace(trace_id):
             "replayed": None,
             "outputs_match_exactly": None,
             "fields_missing_from_trace": missing,
-        }), 400
+        }, status_code=400)
 
     results_for_prompt = [
         {
@@ -3197,7 +3532,7 @@ def replay_trace(trace_id):
         replayed_raw = None
         replay_error = str(exc)
 
-    return jsonify({
+    return {
         "trace_id": trace_id,
         "replayable": True,
         "replay_type": "privacy_preserving",
@@ -3215,12 +3550,11 @@ def replay_trace(trace_id):
         },
         "outputs_match_exactly": (replayed_raw == record.get("raw_output")) if replayed_raw is not None else None,
         "fields_missing_from_trace": missing,
-    })
+    }
 
 
-@app.route("/clear", methods=["POST"])
-def clear():
-    sid = session.get("session_id")
+@app.post("/clear", response_model=ClearResponse, response_model_exclude_none=True)
+def clear(sid: OptionalSessionId):
     backend_error = None
     if sid:
         # _get_store() reconnects to the real backend (Qdrant collection
@@ -3242,26 +3576,22 @@ def clear():
         HASH_BY_DOC.pop(sid, None)
         CHUNK_COUNTS.pop(sid, None)
         _cleanup_session_files(sid)
-    resp = {"ok": True}
+    resp = ClearResponse(ok=True)
     if backend_error:
-        resp["warning"] = (f"Cleared locally, but the vector database delete "
-                          f"failed: {backend_error}. The data may still exist "
-                          f"in the backend.")
-    return jsonify(resp)
+        resp.warning = (f"Cleared locally, but the vector database delete "
+                        f"failed: {backend_error}. The data may still exist "
+                        f"in the backend.")
+    return resp
 
 
-@app.route("/remove", methods=["POST"])
-def remove_doc():
+@app.post("/remove", response_model=RemoveResponse, response_model_exclude_none=True)
+def remove_doc(sid: RequiredSessionId, payload: RemoveRequest | None = Body(default=None)):
     """Remove a single document: its chunks, its retained file, its manifest
     entry, and its content hash (so the same file can be re-uploaded later
     without being wrongly flagged as a duplicate)."""
-    sid = session.get("session_id")
-    if not sid:
-        return jsonify({"error": "No active session"}), 400
-    data = request.get_json(silent=True) or {}
-    doc_id = (data.get("doc_id") or "").strip()
+    doc_id = ((payload.doc_id if payload else None) or "").strip()
     if not doc_id:
-        return jsonify({"error": "Missing doc_id"}), 400
+        return JSONResponse({"error": "Missing doc_id"}, status_code=400)
 
     removed_chunks = 0
     store = _get_store(sid)
@@ -3283,17 +3613,17 @@ def remove_doc():
     if doc_hash is not None:
         HASH_STORE.get(sid, set()).discard(doc_hash)
 
-    resp = {"ok": True, "removed_chunks": removed_chunks}
+    resp = RemoveResponse(ok=True, removed_chunks=removed_chunks)
     backend_error = getattr(store, "last_backend_error", None)
     if backend_error:
         # Removed from the local view either way, but the real backend
         # (Qdrant) delete failed — surface this so it's not just a
         # server-log warning nobody sees. The document may reappear if
         # the session reloads from the backend later.
-        resp["warning"] = (f"Removed locally, but the vector database delete "
-                          f"failed: {backend_error}. The data may still exist "
-                          f"in the backend.")
-    return jsonify(resp)
+        resp.warning = (f"Removed locally, but the vector database delete "
+                        f"failed: {backend_error}. The data may still exist "
+                        f"in the backend.")
+    return resp
 
 
 def parse_qa_pairs(text: str) -> list[dict]:
@@ -3334,8 +3664,8 @@ def parse_qa_pairs(text: str) -> list[dict]:
     return pairs
 
 
-@app.route("/eval/parse-qa-pdf", methods=["POST"])
-def eval_parse_qa_pdf():
+@app.post("/eval/parse-qa-pdf")
+def eval_parse_qa_pdf(file: UploadFile | None = File(default=None)):
     """
     Accepts an uploaded PDF, TXT, or MD file containing Q:/A: formatted
     pairs, extracts its text (via PyMuPDF for PDF, direct decode for
@@ -3343,47 +3673,45 @@ def eval_parse_qa_pdf():
     to populate its question rows from — so a pre-written test set
     doesn't need to be retyped by hand into the UI.
     """
-    file = request.files.get("file")
     if not file or not file.filename:
-        return jsonify({"error": "No file uploaded"}), 400
+        return JSONResponse({"error": "No file uploaded"}, status_code=400)
 
     filename_lower = file.filename.lower()
     if filename_lower.endswith(".pdf"):
         tmp_path = Path(tempfile.gettempdir()) / f"qa_upload_{uuid.uuid4().hex}.pdf"
         try:
-            file.save(tmp_path)
+            _save_upload_to(file, tmp_path)
             pages = extract_pdf_pages(str(tmp_path))
             if not pages:
-                return jsonify({"error": "Could not extract any text from that PDF — "
-                                        "it may be corrupt, encrypted, or a scanned "
-                                        "image without a text layer"}), 400
+                return JSONResponse({"error": "Could not extract any text from that PDF — "
+                                              "it may be corrupt, encrypted, or a scanned "
+                                              "image without a text layer"}, status_code=400)
             full_text = "\n".join(p["text"] for p in pages)
         finally:
             tmp_path.unlink(missing_ok=True)
     elif filename_lower.endswith((".txt", ".md")):
         try:
-            full_text = file.read().decode("utf-8", errors="replace")
+            full_text = file.file.read().decode("utf-8", errors="replace")
         except Exception:
-            return jsonify({"error": "Could not read that file as text"}), 400
+            return JSONResponse({"error": "Could not read that file as text"}, status_code=400)
     else:
-        return jsonify({"error": "Only PDF, TXT, or MD files are supported here"}), 400
+        return JSONResponse({"error": "Only PDF, TXT, or MD files are supported here"}, status_code=400)
 
     pairs = parse_qa_pairs(full_text)
     if not pairs:
-        return jsonify({"error": 'No "Q:"/"A:" pairs found. Expected format: '
-                                '"Q: your question" on one line, "A: expected '
-                                'answer" on the next, blank line between pairs.'}), 400
-    return jsonify({"ok": True, "pairs": pairs})
+        return JSONResponse({"error": 'No "Q:"/"A:" pairs found. Expected format: '
+                                      '"Q: your question" on one line, "A: expected '
+                                      'answer" on the next, blank line between pairs.'},
+                            status_code=400)
+    return {"ok": True, "pairs": pairs}
 
 
-@app.route("/eval")
-def eval_page():
+@app.get("/eval", include_in_schema=False)
+def eval_page(request: Request, sid: SessionId):
     """Serves the Week 4 evaluation page — a real hit-rate@k measurement
     tool, separate from the main chat UI, using the documents already
     indexed in this session."""
-    if "session_id" not in session:
-        session["session_id"] = str(uuid.uuid4())
-    return render_template("eval.html")
+    return templates.TemplateResponse(request, "eval.html")
 
 
 # Named presets for the Week 4 ablation ladder — each maps to a specific,
@@ -3502,30 +3830,25 @@ def _run_eval_preset(active_store, q_id: str, question: str, expected: str, k: i
     }
 
 
-@app.route("/eval/run", methods=["POST"])
-def eval_run():
+@app.post("/eval/run")
+def eval_run(sid: RequiredSessionId, payload: EvalRunRequest | None = Body(default=None)):
     """
     Runs a real hit-rate@k evaluation: for each (question, expected) pair,
     retrieves top-k through the real retrieval pipeline and checks ground truth.
     """
-    sid = session.get("session_id")
-    if not sid:
-        return jsonify({"error": "No active session"}), 400
-
-    data = request.get_json(silent=True) or {}
-    k = max(1, min(int(data.get("top_k") or data.get("k", 3)), 20))
-    chunk_mode_filter = (data.get("strategy_filter") or data.get("chunk_mode") or "").strip() or None
-    preset_names = data.get("presets") or list(EVAL_PRESETS.keys())
-    legacy_modes = data.get("modes")
-    raw_questions = data.get("questions", [])
+    payload = payload or EvalRunRequest()
+    k = max(1, min(payload.top_k or payload.k, 20))
+    chunk_mode_filter = (payload.strategy_filter or payload.chunk_mode or "").strip() or None
+    preset_names = payload.presets or list(EVAL_PRESETS.keys())
+    legacy_modes = payload.modes
 
     questions = []
-    for idx, q in enumerate(raw_questions):
-        q_text = (q.get("question") or "").strip()
-        expected = (q.get("expected") or "").strip()
-        expected_doc = (q.get("expected_doc") or "").strip()
-        expected_section = (q.get("expected_section") or "").strip()
-        q_id = str(q.get("id") or f"q_{idx + 1}")
+    for idx, q in enumerate(payload.questions):
+        q_text = (q.question or "").strip()
+        expected = (q.expected or "").strip()
+        expected_doc = (q.expected_doc or "").strip()
+        expected_section = (q.expected_section or "").strip()
+        q_id = str(q.id or f"q_{idx + 1}")
 
         if q_text and (expected or expected_doc or expected_section):
             questions.append({
@@ -3537,15 +3860,20 @@ def eval_run():
             })
 
     if not questions:
-        return jsonify({"error": "No valid questions provided (both question and expected ground truth are required)"}), 400
+        return JSONResponse(
+            {"error": "No valid questions provided (both question and expected ground truth are required)"},
+            status_code=400,
+        )
 
     store = _get_store(sid)
     if not store.chunks:
-        return jsonify({"error": "No documents indexed in this session yet — upload one first"}), 400
+        return JSONResponse({"error": "No documents indexed in this session yet — upload one first"},
+                            status_code=400)
 
     active_store = store.filtered_by_method(chunk_mode_filter) if chunk_mode_filter else store
     if chunk_mode_filter and not active_store.chunks:
-        return jsonify({"error": f"No documents indexed under the '{chunk_mode_filter}' strategy"}), 400
+        return JSONResponse({"error": f"No documents indexed under the '{chunk_mode_filter}' strategy"},
+                            status_code=400)
 
     by_preset = {}
     names = legacy_modes if legacy_modes else preset_names
@@ -3579,26 +3907,26 @@ def eval_run():
             "results": per_question,
         }
 
-    return jsonify({"ok": True, "k": k, "total_questions": len(questions), "modes": by_preset})
+    return {"ok": True, "k": k, "total_questions": len(questions), "modes": by_preset}
 
 
-@app.route("/healthz", methods=["GET"])
+@app.get("/healthz", response_model=HealthzResponse)
 def healthz():
     """Liveness endpoint for deployment monitoring."""
-    return jsonify({
-        "status": "ok",
-        "embeddings_configured": _embeddings_configured(),
-        "chat_configured": _chat_configured(),
-        "chat_backend": CHAT_BACKEND,
-        "embeddings_backend": EMBED_BACKEND,
-        "retrieval_mode": RETRIEVAL_MODE if _embeddings_configured() else "tfidf-only",
-        "vector_backend": VECTOR_BACKEND,
-        "active_sessions": len(SESSION_ACCESS),
-    })
+    return HealthzResponse(
+        status="ok",
+        embeddings_configured=_embeddings_configured(),
+        chat_configured=_chat_configured(),
+        chat_backend=CHAT_BACKEND,
+        embeddings_backend=EMBED_BACKEND,
+        retrieval_mode=RETRIEVAL_MODE if _embeddings_configured() else "tfidf-only",
+        vector_backend=VECTOR_BACKEND,
+        active_sessions=len(SESSION_ACCESS),
+    )
 
 
-@app.route("/readyz", methods=["GET"])
-def readyz():
+@app.get("/readyz", response_model=ReadyzResponse)
+def readyz(response: Response):
     """Readiness endpoint: verifies external dependencies are reachable without expensive LLM inference."""
     checks = {"app": True}
     status_code = 200
@@ -3613,15 +3941,12 @@ def readyz():
             checks["qdrant"] = False
             status_code = 503
 
-    return jsonify({
-        "ready": status_code == 200,
-        "checks": checks,
-    }), status_code
+    response.status_code = status_code
+    return ReadyzResponse(ready=status_code == 200, checks=checks)
 
 
-@app.route("/status", methods=["GET"])
-def status():
-    sid = session.get("session_id")
+@app.get("/status", response_model=StatusResponse)
+def status(sid: OptionalSessionId):
     chunks = _get_store(sid).chunks if sid else []
 
     session_files = SESSION_FILES.get(sid, {})
@@ -3638,17 +3963,22 @@ def status():
             }
         docs_seen[c["doc_id"]]["chunk_count"] += 1
 
-    return jsonify({
-        "total_chunks": len(chunks),
-        "documents": list(docs_seen.values()),
-        "methods": sorted({c["method"] for c in chunks}),
-        "mode": (RETRIEVAL_MODE if _embeddings_configured() else "tfidf-only"),
-        "vector_backend": VECTOR_BACKEND,
-    })
+    return StatusResponse(
+        total_chunks=len(chunks),
+        documents=list(docs_seen.values()),
+        methods=sorted({c["method"] for c in chunks}),
+        mode=(RETRIEVAL_MODE if _embeddings_configured() else "tfidf-only"),
+        vector_backend=VECTOR_BACKEND,
+    )
 
 
-@app.route("/orphans", methods=["GET"])
-def list_orphans():
+@app.get("/orphans")
+def list_orphans(
+    request: Request,
+    sid: OptionalSessionId,
+    session_id: str | None = Query(default=None,
+                                   description="Admin-only: filter orphans to one session id."),
+):
     """Operational reconciliation endpoint: returns currently unresolved orphaned documents.
     Enforces authorization:
       - Admin (via ADMIN_API_KEY in Bearer token or X-Admin-Key header): can view system-wide
@@ -3657,26 +3987,24 @@ def list_orphans():
         redacted for privacy.
       - Unauthenticated caller without valid session or admin credentials: rejected with 401 Unauthorized."""
     is_admin = _is_admin_request(request)
-    sid = session.get("session_id")
 
     if not is_admin and not sid:
-        return jsonify({
+        return JSONResponse({
             "error": "Unauthorized: active session or admin credentials required."
-        }), 401
+        }, status_code=401)
 
     durable_orphans = _read_durable_orphans()
 
     if is_admin:
-        target_sid = request.args.get("session_id")
-        if target_sid:
-            raw_records = list(durable_orphans.get(target_sid, []))
+        if session_id:
+            raw_records = list(durable_orphans.get(session_id, []))
         else:
             raw_records = [item for items in durable_orphans.values() for item in items]
-        return jsonify({
+        return {
             "count": len(raw_records),
             "admin": True,
             "orphans": raw_records,
-        })
+        }
 
     # Normal session: strictly isolated to caller's session, stored_path and internal error details redacted
     records = list(durable_orphans.get(sid, []))
@@ -3690,19 +4018,21 @@ def list_orphans():
         }
         for r in records
     ]
-    return jsonify({
+    return {
         "count": len(safe_records),
         "admin": False,
         "orphans": safe_records,
-    })
+    }
 
 
-@app.errorhandler(413)
-def too_large(_e):
-    return jsonify({"error": "File too large (max 50 MB)"}), 413
+# NOTE: the 413 "File too large" response is produced by MaxBodySizeMiddleware
+# (see App Setup) rather than an exception handler — Starlette never raises a
+# 413 of its own, because it imposes no body-size limit in the first place.
 
 
 if __name__ == "__main__":
+    import uvicorn
+
     port = int(os.environ.get("PORT", 5000))
     # Defaults to loopback-only — safe for `python app.py` on your own
     # machine (not reachable from your LAN). MUST be "0.0.0.0" when run
@@ -3720,9 +4050,14 @@ if __name__ == "__main__":
     mode_label = (f"embeddings ({embed_label}) + LLM ({chat_label})" if (_embeddings_configured() and _chat_configured())
                   else "TF-IDF (offline fallback)")
     print(f"\n🚀 Ask My Docs is running → http://localhost:{port}")
-    print(f"   Mode: {mode_label}\n")
-    try:
-        from waitress import serve
-        serve(app, host=host, port=port)
-    except ImportError:
-        app.run(host=host, debug=debug, port=port)
+    print(f"   Mode: {mode_label}")
+    print(f"   API docs: http://localhost:{port}/docs\n")
+    # APP_DEBUG turns on uvicorn's autoreloader, which needs an import string
+    # rather than the app object (it re-imports the module in the child process).
+    uvicorn.run(
+        "app:app" if debug else app,
+        host=host,
+        port=port,
+        reload=debug,
+        log_level="debug" if debug else "info",
+    )

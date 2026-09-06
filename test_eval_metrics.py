@@ -9,13 +9,41 @@ Unit tests for RAG Evaluation Metric Correctness:
   7. MRR and Hit-Rate aggregation math
 """
 
+import base64
+import json
 import unittest
 import sys
 from pathlib import Path
 
+import itsdangerous
+from fastapi.testclient import TestClient
+
 sys.path.insert(0, str(Path(__file__).parent))
 
 from app import _rr_rank, _hit_check
+
+
+def make_client(app_obj) -> TestClient:
+    """FastAPI's TestClient is the drop-in replacement for Flask's
+    app.test_client(). Like Flask's, it keeps a cookie jar across calls on
+    the same instance, which is what the session-scoped tests below rely on."""
+    return TestClient(app_obj)
+
+
+def set_session(client: TestClient, session_id: str) -> None:
+    """Seed the signed session cookie directly — the FastAPI equivalent of
+    Flask's `with client.session_transaction() as sess: sess[...] = ...`.
+
+    Starlette's SessionMiddleware stores the session as base64(JSON) signed
+    with an itsdangerous TimestampSigner over SECRET_KEY, which is exactly
+    the mechanism Flask used, so the cookie can be minted here the same way
+    the middleware would mint it.
+    """
+    from app import SECRET_KEY
+
+    signer = itsdangerous.TimestampSigner(str(SECRET_KEY))
+    payload = base64.b64encode(json.dumps({"session_id": session_id}).encode("utf-8"))
+    client.cookies.set("session", signer.sign(payload).decode("utf-8"))
 
 
 class TestEvalMetrics(unittest.TestCase):
@@ -384,25 +412,23 @@ class TestEvalMetrics(unittest.TestCase):
                     "answer": "The policy detail is [1].",
                 })
 
-                client = app.test_client()
+                client = make_client(app)
 
                 # Session B tries to replay Session A's trace
-                with client.session_transaction() as sess:
-                    sess["session_id"] = "session_user_b_99999"
+                set_session(client, "session_user_b_99999")
 
                 resp = client.post(f"/replay/{trace_id}")
                 self.assertEqual(resp.status_code, 403)
-                data = resp.get_json()
+                data = resp.json()
                 self.assertIn("Unauthorized", data.get("error", ""))
 
                 # Session A can replay their own trace
-                with client.session_transaction() as sess:
-                    sess["session_id"] = sid_a
+                set_session(client, sid_a)
 
                 with patch("app._chat_call", return_value="The replayed policy detail is [1]."):
                     resp_ok = client.post(f"/replay/{trace_id}")
                     self.assertEqual(resp_ok.status_code, 200)
-                    data_ok = resp_ok.get_json()
+                    data_ok = resp_ok.json()
                     self.assertTrue(data_ok.get("replayable"))
 
     def test_replay_missing_prompt_artifact_no_llm_call(self):
@@ -428,14 +454,13 @@ class TestEvalMetrics(unittest.TestCase):
                     "answer": "The policy detail.",
                 })
 
-                client = app.test_client()
-                with client.session_transaction() as sess:
-                    sess["session_id"] = sid
+                client = make_client(app)
+                set_session(client, sid)
 
                 with patch("app._chat_call") as mock_chat:
                     resp = client.post(f"/replay/{trace_id}")
                     self.assertEqual(resp.status_code, 400)
-                    data = resp.get_json()
+                    data = resp.json()
                     self.assertFalse(data.get("replayable"))
                     self.assertIn("missing", data.get("reason", "").lower())
                     # LLM must NOT be called if prompt is missing
@@ -465,9 +490,8 @@ class TestEvalMetrics(unittest.TestCase):
                     "answer": "Output text.",
                 })
 
-                client = app.test_client()
-                with client.session_transaction() as sess:
-                    sess["session_id"] = sid
+                client = make_client(app)
+                set_session(client, sid)
 
                 with patch("app._chat_call", return_value="Output text.") as mock_chat:
                     resp = client.post(f"/replay/{trace_id}")
@@ -482,9 +506,8 @@ class TestEvalMetrics(unittest.TestCase):
         from app import app
         from qdrant_store import RetrievalBackendError
 
-        client = app.test_client()
-        with client.session_transaction() as sess:
-            sess["session_id"] = "test_ask_error_session"
+        client = make_client(app)
+        set_session(client, "test_ask_error_session")
 
         # Mock vector store to simulate Qdrant outage during /ask
         with patch("app._get_store") as mock_get_store, \
@@ -498,7 +521,7 @@ class TestEvalMetrics(unittest.TestCase):
             with patch("app.reciprocal_rank_fusion", side_effect=RetrievalBackendError("Qdrant cluster unavailable")):
                 resp = client.post("/ask", json={"query": "test query"})
                 self.assertEqual(resp.status_code, 503)
-                data = resp.get_json()
+                data = resp.json()
                 self.assertIn("Vector database retrieval failed", data.get("error", ""))
 
     def test_upload_stale_dedupe_key_regression(self):
@@ -536,9 +559,8 @@ class TestEvalMetrics(unittest.TestCase):
         from unittest.mock import patch, MagicMock
         from app import app
 
-        client = app.test_client()
-        with client.session_transaction() as sess:
-            sess["session_id"] = "test_rollback_file_move"
+        client = make_client(app)
+        set_session(client, "test_rollback_file_move")
 
         with patch("app._get_store") as mock_get_store, \
              patch("app.embed_texts", return_value=[[0.1, 0.2]]), \
@@ -548,12 +570,12 @@ class TestEvalMetrics(unittest.TestCase):
             mock_store.chunks = []
             mock_get_store.return_value = mock_store
 
-            data = {
-                "files": (io.BytesIO(b"Hello world document text content for testing."), "test_doc.txt")
+            files = {
+                "files": ("test_doc.txt", io.BytesIO(b"Hello world document text content for testing."), "text/plain")
             }
-            resp = client.post("/upload", data=data, content_type="multipart/form-data")
+            resp = client.post("/upload", files=files)
             self.assertEqual(resp.status_code, 200)
-            res_data = resp.get_json()
+            res_data = resp.json()
             mock_store.add.assert_called_once()
             mock_store.remove_doc.assert_called_once()
             self.assertTrue(any("Failed to index" in doc.get("error", "") for doc in res_data.get("documents", [])))
@@ -566,9 +588,8 @@ class TestEvalMetrics(unittest.TestCase):
         from unittest.mock import patch, MagicMock
         from app import app
 
-        client = app.test_client()
-        with client.session_transaction() as sess:
-            sess["session_id"] = "test_rollback_manifest"
+        client = make_client(app)
+        set_session(client, "test_rollback_manifest")
 
         with patch("app._get_store") as mock_get_store, \
              patch("app.embed_texts", return_value=[[0.1, 0.2]]), \
@@ -578,12 +599,12 @@ class TestEvalMetrics(unittest.TestCase):
             mock_store.chunks = []
             mock_get_store.return_value = mock_store
 
-            data = {
-                "files": (io.BytesIO(b"Hello world document text content for testing."), "test_manifest_doc.txt")
+            files = {
+                "files": ("test_manifest_doc.txt", io.BytesIO(b"Hello world document text content for testing."), "text/plain")
             }
-            resp = client.post("/upload", data=data, content_type="multipart/form-data")
+            resp = client.post("/upload", files=files)
             self.assertEqual(resp.status_code, 200)
-            res_data = resp.get_json()
+            res_data = resp.json()
             mock_store.add.assert_called_once()
             mock_store.remove_doc.assert_called_once()
             self.assertTrue(any("Failed to index" in doc.get("error", "") for doc in res_data.get("documents", [])))
@@ -600,9 +621,8 @@ class TestEvalMetrics(unittest.TestCase):
         sid = "test_rollback_failure_tracked"
         ORPHANED_DOCS.pop(sid, None)
 
-        client = app.test_client()
-        with client.session_transaction() as sess:
-            sess["session_id"] = sid
+        client = make_client(app)
+        set_session(client, sid)
 
         with patch("app._get_store") as mock_get_store, \
              patch("app.embed_texts", return_value=[[0.1, 0.2]]), \
@@ -613,12 +633,12 @@ class TestEvalMetrics(unittest.TestCase):
             mock_store.remove_doc.side_effect = RetrievalBackendError("Vector backend timed out during rollback")
             mock_get_store.return_value = mock_store
 
-            data = {
-                "files": (io.BytesIO(b"Document content for rollback failure test."), "doc_fail.txt")
+            files = {
+                "files": ("doc_fail.txt", io.BytesIO(b"Document content for rollback failure test."), "text/plain")
             }
-            resp = client.post("/upload", data=data, content_type="multipart/form-data")
+            resp = client.post("/upload", files=files)
             self.assertEqual(resp.status_code, 200)
-            res_data = resp.get_json()
+            res_data = resp.json()
             failed_doc = res_data["documents"][0]
 
             self.assertFalse(failed_doc.get("cleanup_complete"))
@@ -635,9 +655,8 @@ class TestEvalMetrics(unittest.TestCase):
         from unittest.mock import patch, MagicMock
         from app import app
 
-        client = app.test_client()
-        with client.session_transaction() as sess:
-            sess["session_id"] = "test_qdrant_embed_fail"
+        client = make_client(app)
+        set_session(client, "test_qdrant_embed_fail")
 
         with patch("app.VECTOR_BACKEND", "qdrant"), \
              patch("app._embeddings_configured", return_value=True), \
@@ -646,12 +665,12 @@ class TestEvalMetrics(unittest.TestCase):
             mock_store = MagicMock()
             mock_get_store.return_value = mock_store
 
-            data = {
-                "files": (io.BytesIO(b"Document content for qdrant embedding test."), "test_qdrant.txt")
+            files = {
+                "files": ("test_qdrant.txt", io.BytesIO(b"Document content for qdrant embedding test."), "text/plain")
             }
-            resp = client.post("/upload", data=data, content_type="multipart/form-data")
+            resp = client.post("/upload", files=files)
             self.assertEqual(resp.status_code, 200)
-            res_data = resp.get_json()
+            res_data = resp.json()
             mock_store.add.assert_not_called()
             self.assertTrue(any("Embedding generation failed on Qdrant backend" in doc.get("error", "") for doc in res_data.get("documents", [])))
 
@@ -660,9 +679,8 @@ class TestEvalMetrics(unittest.TestCase):
         from unittest.mock import patch, MagicMock
         from app import app
 
-        client = app.test_client()
-        with client.session_transaction() as sess:
-            sess["session_id"] = "test_load_url_qdrant"
+        client = make_client(app)
+        set_session(client, "test_load_url_qdrant")
 
         long_text = " ".join(["content_word"] * 40)
         with patch("app.VECTOR_BACKEND", "qdrant"), \
@@ -674,7 +692,7 @@ class TestEvalMetrics(unittest.TestCase):
 
             resp = client.post("/load-url", json={"url": "http://example.com/test"})
             self.assertEqual(resp.status_code, 503)
-            data = resp.get_json()
+            data = resp.json()
             self.assertIn("Qdrant vector backend requires embeddings", data.get("error", ""))
             mock_store.add.assert_not_called()
 
@@ -689,9 +707,8 @@ class TestEvalMetrics(unittest.TestCase):
         sid = "test_cancel_cleanup_incomplete"
         ORPHANED_DOCS.pop(sid, None)
 
-        client = app.test_client()
-        with client.session_transaction() as sess:
-            sess["session_id"] = sid
+        client = make_client(app)
+        set_session(client, sid)
 
         upload_id = "test_cancel_uid_123"
         cancelled_map = {}
@@ -710,13 +727,12 @@ class TestEvalMetrics(unittest.TestCase):
             mock_store.remove_doc.side_effect = RetrievalBackendError("Qdrant connection timed out during deletion")
             mock_get_store.return_value = mock_store
 
-            data = {
-                "files": (io.BytesIO(b"Doc 1 text content for cancellation test."), "doc1.txt"),
-                "upload_id": upload_id,
+            files = {
+                "files": ("doc1.txt", io.BytesIO(b"Doc 1 text content for cancellation test."), "text/plain")
             }
-            resp = client.post("/upload", data=data, content_type="multipart/form-data")
+            resp = client.post("/upload", files=files, data={"upload_id": upload_id})
             self.assertEqual(resp.status_code, 200)
-            res_data = resp.get_json()
+            res_data = resp.json()
             self.assertTrue(res_data.get("cancelled"))
             self.assertFalse(res_data.get("cleanup_complete"))
             self.assertIn("cleanup was incomplete", res_data.get("error", ""))
@@ -736,9 +752,8 @@ class TestEvalMetrics(unittest.TestCase):
         from app import app, SESSION_FILES, HASH_BY_DOC
 
         sid = "test_cancel_clean_rollback"
-        client = app.test_client()
-        with client.session_transaction() as sess:
-            sess["session_id"] = sid
+        client = make_client(app)
+        set_session(client, sid)
 
         upload_id = "test_cancel_clean_uid_456"
         cancelled_map = {}
@@ -756,13 +771,12 @@ class TestEvalMetrics(unittest.TestCase):
             mock_store.remove_doc.return_value = 1  # Deletion succeeds
             mock_get_store.return_value = mock_store
 
-            data = {
-                "files": (io.BytesIO(b"Doc text for clean cancellation."), "doc_clean.txt"),
-                "upload_id": upload_id,
+            files = {
+                "files": ("doc_clean.txt", io.BytesIO(b"Doc text for clean cancellation."), "text/plain")
             }
-            resp = client.post("/upload", data=data, content_type="multipart/form-data")
+            resp = client.post("/upload", files=files, data={"upload_id": upload_id})
             self.assertEqual(resp.status_code, 200)
-            res_data = resp.get_json()
+            res_data = resp.json()
             self.assertTrue(res_data.get("cancelled"))
             self.assertTrue(res_data.get("cleanup_complete"))
             self.assertIn("nothing was indexed", res_data.get("error", ""))
@@ -901,9 +915,8 @@ class TestEvalMetrics(unittest.TestCase):
             sid = "test_retryable_sess"
             ORPHANED_DOCS.pop(sid, None)
 
-            client = app.test_client()
-            with client.session_transaction() as sess:
-                sess["session_id"] = sid
+            client = make_client(app)
+            set_session(client, sid)
 
             with patch("app.ORPHAN_LOG_PATH", temp_log), \
                  patch("app._get_store") as mock_get_store, \
@@ -915,12 +928,12 @@ class TestEvalMetrics(unittest.TestCase):
                 mock_store.remove_doc.side_effect = RetrievalBackendError("Backend unreachable on delete")
                 mock_get_store.return_value = mock_store
 
-                data = {
-                    "files": (io.BytesIO(b"Document content for retryable orphan test."), "retryable.txt")
+                files = {
+                    "files": ("retryable.txt", io.BytesIO(b"Document content for retryable orphan test."), "text/plain")
                 }
-                resp = client.post("/upload", data=data, content_type="multipart/form-data")
+                resp = client.post("/upload", files=files)
                 self.assertEqual(resp.status_code, 200)
-                res_data = resp.get_json()
+                res_data = resp.json()
                 failed_doc = res_data["documents"][0]
 
                 # HTTP response exposes failure contract
@@ -932,7 +945,7 @@ class TestEvalMetrics(unittest.TestCase):
                 # Verify user observable via /orphans endpoint (stored_path redacted for normal users)
                 orphans_resp = client.get("/orphans")
                 self.assertEqual(orphans_resp.status_code, 200)
-                orphans_data = orphans_resp.get_json()
+                orphans_data = orphans_resp.json()
                 self.assertEqual(orphans_data["count"], 1)
                 orphan_rec = orphans_data["orphans"][0]
                 self.assertEqual(orphan_rec["doc_id"], doc_id)
@@ -944,7 +957,7 @@ class TestEvalMetrics(unittest.TestCase):
                 with patch("app.ADMIN_API_KEY", "admin_secret"):
                     admin_resp = client.get("/orphans", headers={"X-Admin-Key": "admin_secret"})
                     self.assertEqual(admin_resp.status_code, 200)
-                    admin_data = admin_resp.get_json()
+                    admin_data = admin_resp.json()
                     self.assertTrue(admin_data.get("admin"))
                     admin_rec = admin_data["orphans"][0]
                     self.assertIn(doc_id, admin_rec["stored_path"])
@@ -953,10 +966,10 @@ class TestEvalMetrics(unittest.TestCase):
     def test_orphans_unauthenticated_rejected(self):
         """GET /orphans without an active session or admin credentials must return 401 Unauthorized."""
         from app import app
-        client = app.test_client()
+        client = make_client(app)
         resp = client.get("/orphans")
         self.assertEqual(resp.status_code, 401)
-        self.assertIn("Unauthorized", resp.get_json().get("error", ""))
+        self.assertIn("Unauthorized", resp.json().get("error", ""))
 
     def test_orphans_session_isolation_and_path_redaction(self):
         """Normal session clients must only see their own orphans with stored_path strictly redacted."""
@@ -971,13 +984,12 @@ class TestEvalMetrics(unittest.TestCase):
                 _record_orphaned_doc("user_sess_1", "doc_u1", "user1_doc.pdf", "Error 1", "/secret/path/user1.pdf")
                 _record_orphaned_doc("user_sess_2", "doc_u2", "user2_doc.pdf", "Error 2", "/secret/path/user2.pdf")
 
-                client = app.test_client()
-                with client.session_transaction() as sess:
-                    sess["session_id"] = "user_sess_1"
+                client = make_client(app)
+                set_session(client, "user_sess_1")
 
                 resp = client.get("/orphans")
                 self.assertEqual(resp.status_code, 200)
-                data = resp.get_json()
+                data = resp.json()
                 self.assertFalse(data.get("admin"))
                 self.assertEqual(data["count"], 1)
                 self.assertEqual(data["orphans"][0]["doc_id"], "doc_u1")
@@ -1001,7 +1013,7 @@ class TestEvalMetrics(unittest.TestCase):
                 _record_orphaned_doc("sess_alpha", "doc_a", "alpha.pdf", "Err A", "/data/alpha.pdf")
                 _record_orphaned_doc("sess_beta", "doc_b", "beta.pdf", "Err B", "/data/beta.pdf")
 
-                client = app.test_client()
+                client = make_client(app)
 
                 # Wrong key rejected
                 bad_resp = client.get("/orphans", headers={"X-Admin-Key": "wrong_key"})
@@ -1010,7 +1022,7 @@ class TestEvalMetrics(unittest.TestCase):
                 # Valid Bearer token gets system-wide records
                 admin_resp = client.get("/orphans", headers={"Authorization": "Bearer admin_pass_123"})
                 self.assertEqual(admin_resp.status_code, 200)
-                admin_data = admin_resp.get_json()
+                admin_data = admin_resp.json()
                 self.assertTrue(admin_data["admin"])
                 self.assertEqual(admin_data["count"], 2)
                 self.assertTrue(all("stored_path" in o for o in admin_data["orphans"]))
@@ -1018,7 +1030,7 @@ class TestEvalMetrics(unittest.TestCase):
                 # Admin filter by session_id
                 filter_resp = client.get("/orphans?session_id=sess_beta", headers={"X-Admin-Key": "admin_pass_123"})
                 self.assertEqual(filter_resp.status_code, 200)
-                filter_data = filter_resp.get_json()
+                filter_data = filter_resp.json()
                 self.assertEqual(filter_data["count"], 1)
                 self.assertEqual(filter_data["orphans"][0]["doc_id"], "doc_b")
                 self.assertEqual(filter_data["orphans"][0]["stored_path"], "/data/beta.pdf")
@@ -1041,13 +1053,12 @@ class TestEvalMetrics(unittest.TestCase):
                 self.assertEqual(len(ORPHANED_DOCS), 0)
 
                 # Worker B serves GET /orphans
-                client = app.test_client()
-                with client.session_transaction() as sess:
-                    sess["session_id"] = "worker_sess"
+                client = make_client(app)
+                set_session(client, "worker_sess")
 
                 resp = client.get("/orphans")
                 self.assertEqual(resp.status_code, 200)
-                data = resp.get_json()
+                data = resp.json()
                 # Worker B observed Worker A's record directly from durable log
                 self.assertEqual(data["count"], 1)
                 self.assertEqual(data["orphans"][0]["doc_id"], "worker_doc_99")
@@ -1080,9 +1091,8 @@ class TestEvalMetrics(unittest.TestCase):
                 self.assertNotIn("persisted", rec)
 
             # Upload endpoint with failing disk write during rollback
-            client = app.test_client()
-            with client.session_transaction() as sess:
-                sess["session_id"] = sid
+            client = make_client(app)
+            set_session(client, sid)
 
             with patch("app.ORPHAN_LOG_PATH", temp_log), \
                  patch("app._get_store") as mock_get_store, \
@@ -1095,12 +1105,14 @@ class TestEvalMetrics(unittest.TestCase):
                 mock_store.remove_doc.side_effect = RetrievalBackendError("Delete failed")
                 mock_get_store.return_value = mock_store
 
-                data = {
-                    "files": (io.BytesIO(b"Document content for persistence failure test with enough words."), "persist_fail.txt")
+                files = {
+                    "files": ("persist_fail.txt",
+                              io.BytesIO(b"Document content for persistence failure test with enough words."),
+                              "text/plain")
                 }
-                resp = client.post("/upload", data=data, content_type="multipart/form-data")
+                resp = client.post("/upload", files=files)
                 self.assertEqual(resp.status_code, 200)
-                failed_doc = resp.get_json()["documents"][0]
+                failed_doc = resp.json()["documents"][0]
                 self.assertFalse(failed_doc["cleanup_complete"])
                 self.assertTrue(failed_doc.get("reconciliation_persistence_failed"))
 
@@ -1293,6 +1305,259 @@ class TestEvalMetrics(unittest.TestCase):
                     self.assertIn("doc2", SESSION_FILES.get(sid, {}))
                     self.assertEqual(len(store2_updated.chunks), 2)
                     self.assertEqual(store2_updated.chunks[1]["id"], "c2")
+
+
+class TestFastAPIMigration(unittest.TestCase):
+    """Covers the behaviours that Flask provided implicitly and FastAPI does
+    not, so a silent regression in any of them fails the suite rather than
+    only showing up in production."""
+
+    def test_oversized_upload_rejected_by_content_length(self):
+        """Flask enforced MAX_CONTENT_LENGTH itself; Starlette imposes no body
+        limit at all. A declared Content-Length over 50 MB must be refused
+        with the same 413 body the old @app.errorhandler(413) returned."""
+        import io
+        from app import app, MAX_CONTENT_LENGTH
+
+        client = make_client(app)
+        oversized = b"x" * (MAX_CONTENT_LENGTH + 1024)
+        resp = client.post("/upload", files={"files": ("big.txt", io.BytesIO(oversized), "text/plain")})
+        self.assertEqual(resp.status_code, 413)
+        self.assertEqual(resp.json(), {"error": "File too large (max 50 MB)"})
+
+    def test_oversized_upload_rejected_without_content_length(self):
+        """A chunked request declares no Content-Length, so the header check
+        alone is trivially bypassable — the streamed byte counter must catch
+        it too. The body here is a *valid* multipart stream, so nothing else
+        can reject it first; only the size guard can."""
+        from app import app, MAX_CONTENT_LENGTH
+
+        client = make_client(app)
+        boundary = "streamedboundary123"
+        chunk = b"y" * (1024 * 1024)
+        total_chunks = (MAX_CONTENT_LENGTH // len(chunk)) + 2
+
+        def body_stream():
+            yield (
+                f"--{boundary}\r\n"
+                'Content-Disposition: form-data; name="files"; filename="big.txt"\r\n'
+                "Content-Type: text/plain\r\n\r\n"
+            ).encode()
+            for _ in range(total_chunks):
+                yield chunk
+            yield f"\r\n--{boundary}--\r\n".encode()
+
+        resp = client.post(
+            "/upload",
+            content=body_stream(),
+            headers={"Content-Type": f"multipart/form-data; boundary={boundary}"},
+        )
+        self.assertEqual(resp.status_code, 413)
+        self.assertEqual(resp.json(), {"error": "File too large (max 50 MB)"})
+
+    def test_oversized_json_body_rejected_without_content_length(self):
+        """The cap is transport-level, not upload-specific: a chunked JSON
+        body over the limit must be refused on a plain JSON endpoint too."""
+        from app import app, MAX_CONTENT_LENGTH
+
+        client = make_client(app)
+        chunk = b"z" * (1024 * 1024)
+        total_chunks = (MAX_CONTENT_LENGTH // len(chunk)) + 2
+
+        def body_stream():
+            yield b'{"query": "'
+            for _ in range(total_chunks):
+                yield chunk
+            yield b'"}'
+
+        resp = client.post(
+            "/ask",
+            content=body_stream(),
+            headers={"Content-Type": "application/json"},
+        )
+        self.assertEqual(resp.status_code, 413)
+        self.assertEqual(resp.json(), {"error": "File too large (max 50 MB)"})
+
+    def test_normal_sized_upload_is_not_blocked_by_the_cap(self):
+        """Guard against the cap being set so aggressively it breaks ordinary
+        uploads — a 2 MB document must still index normally."""
+        import io
+        import tempfile
+        from pathlib import Path
+        from unittest.mock import patch, MagicMock
+        from app import app
+
+        client = make_client(app)
+        set_session(client, "test_under_limit_sess")
+        body = (b"Section One\n\nThe quick brown fox jumps over the lazy dog. " * 40_000)[: 2 * 1024 * 1024]
+
+        with tempfile.TemporaryDirectory() as tmpdir, \
+             patch("app.UPLOAD_FOLDER", Path(tmpdir)), \
+             patch("app._get_store") as mock_get_store, \
+             patch("app._embeddings_configured", return_value=False):
+            mock_store = MagicMock()
+            mock_store.chunks = []
+            mock_get_store.return_value = mock_store
+
+            resp = client.post("/upload", files={"files": ("under_limit.txt", io.BytesIO(body), "text/plain")})
+            self.assertEqual(resp.status_code, 200)
+            self.assertTrue(resp.json().get("ok"))
+
+    def test_session_cookie_round_trips_and_is_stable(self):
+        """Starlette's SessionMiddleware must reproduce Flask's signed-cookie
+        semantics: a session id minted on first contact stays the same across
+        subsequent requests from the same client."""
+        from app import app
+
+        client = make_client(app)
+        first = client.get("/")
+        self.assertEqual(first.status_code, 200)
+        self.assertIn("session", client.cookies)
+        cookie_after_first = client.cookies["session"]
+
+        # A later request must reuse the SAME session id, not mint a new one.
+        client.get("/status")
+        self.assertEqual(client.cookies["session"], cookie_after_first)
+
+        # And the cookie must actually decode to the session id the server used.
+        sid = _decode_session_cookie(cookie_after_first)["session_id"]
+        self.assertTrue(sid)
+
+        # A tampered cookie must be rejected (bad signature -> empty session),
+        # not silently trusted.
+        tampered = make_client(app)
+        tampered.cookies.set("session", cookie_after_first[:-4] + "AAAA")
+        self.assertEqual(tampered.get("/orphans").status_code, 401)
+
+    def test_tojson_filter_is_registered_and_script_safe(self):
+        """templates/view.html embeds values into a <script> block via
+        `| tojson`. Flask registers that filter automatically; Starlette's
+        Jinja2Templates does not guarantee it, so it is wired up explicitly."""
+        from app import templates
+
+        self.assertIn("tojson", templates.env.filters)
+        hostile = '</script><script>alert(1)</script>'
+        rendered = templates.env.from_string("{{ v | tojson }}").render(v=hostile)
+        # Must not be able to break out of the surrounding <script> element...
+        self.assertNotIn("</script>", rendered)
+        # ...while still round-tripping to the exact original value.
+        self.assertEqual(json.loads(rendered), hostile)
+
+    def test_static_files_are_mounted(self):
+        """Flask served ./static automatically; in FastAPI it is an explicit
+        mount, so a missing mount would only surface as a broken UI."""
+        from app import app
+
+        client = make_client(app)
+        for path in ("/static/js/app.js", "/static/js/view.js", "/static/css/app.css"):
+            with self.subTest(path=path):
+                self.assertEqual(client.get(path).status_code, 200)
+
+    def test_every_documented_route_is_registered(self):
+        """The frontend calls these paths by hard-coded string; a renamed or
+        dropped path during the migration must fail here, not in the browser."""
+        from app import app
+
+        registered = {
+            (path, method)
+            for route in app.routes
+            for path in [getattr(route, "path", None)]
+            for method in (getattr(route, "methods", None) or set())
+            if path
+        }
+        expected = [
+            ("/", "GET"), ("/upload", "POST"), ("/upload-cancel", "POST"),
+            ("/load-url", "POST"), ("/ask", "POST"), ("/status", "GET"),
+            ("/remove", "POST"), ("/clear", "POST"), ("/eval", "GET"),
+            ("/eval/run", "POST"), ("/eval/parse-qa-pdf", "POST"),
+            ("/file/{doc_id}", "GET"), ("/file/{doc_id}/raw", "GET"),
+            ("/file/{doc_id}/pages", "GET"), ("/healthz", "GET"),
+            ("/readyz", "GET"), ("/orphans", "GET"), ("/traces", "GET"),
+            ("/replay/{trace_id}", "POST"), ("/favicon.ico", "GET"),
+        ]
+        for path, method in expected:
+            with self.subTest(route=f"{method} {path}"):
+                self.assertIn((path, method), registered)
+
+    def test_openapi_schema_is_served(self):
+        """Auto-generated docs are a genuine addition from the migration —
+        assert they actually build (a bad response_model would 500 here)."""
+        from app import app
+
+        client = make_client(app)
+        resp = client.get("/openapi.json")
+        self.assertEqual(resp.status_code, 200)
+        schema = resp.json()
+        self.assertIn("/ask", schema["paths"])
+        self.assertIn("/upload", schema["paths"])
+        self.assertEqual(client.get("/docs").status_code, 200)
+
+    def test_ask_without_session_returns_400(self):
+        """/ask has no session-creating side effect — an unknown caller gets
+        the same 400 contract as before."""
+        from app import app
+
+        client = make_client(app)
+        resp = client.post("/ask", json={"query": "anything"})
+        self.assertEqual(resp.status_code, 400)
+        self.assertEqual(resp.json(), {"error": "No documents uploaded yet"})
+
+    def test_validation_errors_use_the_apis_error_envelope(self):
+        """Pydantic validation is new (Flask silently ignored unparseable
+        values), but every error this API returns must still carry an `error`
+        string — that is the only field static/js/app.js's handleResponse()
+        looks at."""
+        from app import app
+
+        client = make_client(app)
+        set_session(client, "test_validation_envelope")
+        resp = client.post("/ask", json={"query": "hi", "top_k": "not-a-number"})
+        self.assertEqual(resp.status_code, 422)
+        body = resp.json()
+        self.assertIn("error", body)
+        self.assertIn("top_k", body["error"])
+        # The structured FastAPI detail is still available for API clients.
+        self.assertIsInstance(body.get("detail"), list)
+
+    def test_out_of_range_tuning_values_are_clamped_not_rejected(self):
+        """top_k/temperature clamping is existing behaviour and must survive
+        the move to Pydantic — an out-of-range number is clamped, not 422'd."""
+        from app import app
+
+        client = make_client(app)
+        set_session(client, "test_clamping_sess")
+        resp = client.post("/ask", json={"query": "hi", "top_k": 999, "temperature": 7.5})
+        self.assertEqual(resp.status_code, 200)
+        self.assertEqual(resp.json()["top_k"], 20)
+        self.assertEqual(resp.json()["temperature"], 1.0)
+
+    def test_routes_requiring_a_session_return_the_same_400_contract(self):
+        """These five endpoints shared a hand-written 'No active session'
+        check in the Flask version; they now share one dependency, so verify
+        the response contract is unchanged for all of them."""
+        from app import app
+
+        client = make_client(app)
+        cases = [
+            ("get", "/file/abc123"),
+            ("get", "/file/abc123/raw"),
+            ("get", "/file/abc123/pages"),
+            ("post", "/remove"),
+            ("post", "/eval/run"),
+        ]
+        for method, path in cases:
+            with self.subTest(route=f"{method.upper()} {path}"):
+                resp = getattr(client, method)(path)
+                self.assertEqual(resp.status_code, 400)
+                self.assertEqual(resp.json(), {"error": "No active session"})
+
+
+def _decode_session_cookie(cookie_value: str) -> dict:
+    """Inverse of set_session() — unsign + decode Starlette's session cookie."""
+    from app import SECRET_KEY
+
+    signer = itsdangerous.TimestampSigner(str(SECRET_KEY))
+    return json.loads(base64.b64decode(signer.unsign(cookie_value.encode("utf-8"))))
 
 
 if __name__ == '__main__':

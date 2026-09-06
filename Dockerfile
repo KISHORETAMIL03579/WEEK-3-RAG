@@ -24,4 +24,19 @@ EXPOSE 5000
 
 ENV PORT=5000
 
-CMD ["gunicorn", "--bind", "0.0.0.0:5000", "--workers", "2", "--timeout", "120", "app:app"]
+# FastAPI is ASGI, so Gunicorn can no longer serve `app:app` on its own — it
+# runs an ASGI worker class instead. Keeping Gunicorn as the process manager
+# preserves the existing worker-count / timeout / graceful-restart operational
+# knowledge; the worker class is the only change from the previous WSGI
+# command. Route handlers are plain `def`, so each worker runs them in
+# uvicorn's threadpool — the same blocking-call concurrency model the Flask +
+# Gunicorn sync workers had.
+#
+# NOTE: uvicorn_worker.UvicornWorker (the `uvicorn-worker` package), not the
+# older uvicorn.workers.UvicornWorker — the in-uvicorn module is deprecated
+# and emits a DeprecationWarning on import.
+CMD ["gunicorn", "app:app", \
+     "-k", "uvicorn_worker.UvicornWorker", \
+     "--bind", "0.0.0.0:5000", \
+     "--workers", "2", \
+     "--timeout", "120"]

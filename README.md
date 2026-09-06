@@ -1,6 +1,6 @@
 # Ask My Docs — Universal Multimodal RAG & Retrieval Debugging Framework
 
-A production-grade Retrieval-Augmented Generation (RAG) system built with Flask, React, and **pluggable local/cloud backends**. It supports **universal text extraction** (PDFs, Word Docs, CSV/Spreadsheets, Data files, Source Code, and **Images via Vision OCR**), grounded QA with clickable source citations that deep-link into the exact page, side-by-side diagnostic inspection, automated retrieval evaluation (`Hit-Rate@K`, `MRR`, `Recall@K`), and durable, replayable trace logging for error analysis.
+A production-grade Retrieval-Augmented Generation (RAG) system built with FastAPI, React, and **pluggable local/cloud backends**. It supports **universal text extraction** (PDFs, Word Docs, CSV/Spreadsheets, Data files, Source Code, and **Images via Vision OCR**), grounded QA with clickable source citations that deep-link into the exact page, side-by-side diagnostic inspection, automated retrieval evaluation (`Hit-Rate@K`, `MRR`, `Recall@K`), and durable, replayable trace logging for error analysis.
 
 Every model call in the pipeline — embeddings, image OCR, and chat/answer generation — is independently switchable between a **fully local, zero-API-key stack (Ollama)** and a **cloud stack (Google Gemini for embeddings/OCR, xAI Grok for chat)**. The whole app also runs with zero cloud keys at all, falling back to offline BM25/TF-IDF keyword search.
 
@@ -16,7 +16,7 @@ python -m venv .venv
 .venv\Scripts\Activate.ps1
 python -c "import sys; print(sys.executable)"
 python -m pip install -r requirements.txt
-python -c "import pymupdf, docx, flask, werkzeug, waitress, qdrant_client; print('ALL IMPORTS OK')"
+python -c "import pymupdf, docx, fastapi, uvicorn, jinja2, itsdangerous, werkzeug, qdrant_client; print('ALL IMPORTS OK')"
 cp .env.example .env
 ```
 
@@ -43,11 +43,18 @@ Python: Select Interpreter
 ```bash
 python app.py
 ```
+`app.py` still runs standalone — its `__main__` block now starts **uvicorn** (with the autoreloader when `APP_DEBUG=true`). Equivalent, if you prefer driving the server directly:
+```bash
+uvicorn app:app --host 127.0.0.1 --port 5000 --reload
+```
 Open **http://localhost:5000** in your browser. The startup banner tells you which mode actually loaded, e.g.:
 ```
 🚀 Ask My Docs is running → http://localhost:5000
    Mode: embeddings (Ollama (local)) + LLM (Ollama (local))
+   API docs: http://localhost:5000/docs
 ```
+
+Because the app is now FastAPI, the whole JSON API is self-documenting: **Swagger UI at `/docs`**, **ReDoc at `/redoc`**, and the raw schema at **`/openapi.json`** — generated from the request/response models in `app.py`, so it cannot drift from the code.
 
 ---
 
@@ -206,6 +213,15 @@ Open **http://localhost:5000** in your browser. The startup banner tells you whi
 | `GET` | `/orphans` | Lists unindexed / cleanup-failed orphaned documents (requires active session or `X-Admin-Key` header) |
 | `GET` | `/traces` | Lists all logged trace_ids |
 | `POST` | `/replay/<trace_id>` | Replays a trace from the trace record alone; returns original vs. replayed raw output (session-scoped or requires `X-Admin-Key`) |
+| `GET` | `/docs`, `/redoc`, `/openapi.json` | Auto-generated interactive API documentation (FastAPI) |
+
+Every path, HTTP method, request body and response body above is unchanged from the Flask implementation — `static/js/*.js` calls them by hard-coded string and needed no edits. Path parameters are written `{doc_id}` internally now (FastAPI syntax) rather than `<doc_id>`, but the URLs on the wire are identical.
+
+**Request/response validation.** JSON bodies are parsed into Pydantic models (`AskRequest`, `LoadUrlRequest`, `RemoveRequest`, `EvalRunRequest`, `UploadCancelRequest`), and the fixed-shape endpoints (`/status`, `/healthz`, `/readyz`, `/traces`, `/clear`, `/remove`, `/upload-cancel`) declare response models. Endpoints whose payload genuinely varies by branch (`/ask`, `/upload`, `/load-url`, `/eval/run`, `/orphans`, `/replay/<id>`, `/file/<id>/pages`) return plain dicts so their wire format stays byte-identical.
+
+The models are deliberately permissive where the old code was — unknown keys are ignored (`extra="ignore"`), every field is optional with the same defaults, an entirely absent body is treated as `{}`, and `top_k` / `temperature` are still *clamped* to their supported ranges rather than rejected. The one genuinely new behaviour: a value that cannot be parsed at all (e.g. `"top_k": "abc"`, previously ignored in silence) now returns **422**. That response uses this API's normal `{"error": "..."}` envelope — see `_validation_error_handler` in `app.py` — so `handleResponse()` in `static/js/app.js` surfaces a real message rather than a bare status code, with FastAPI's structured `detail` array alongside it.
+
+**Request size limit.** Every request body is capped at **50 MB**. Flask enforced this via `MAX_CONTENT_LENGTH`; Starlette imposes no limit of its own, so `MaxBodySizeMiddleware` in `app.py` re-implements it — rejecting an oversized `Content-Length` up front, *and* counting bytes for chunked requests that declare no length. Both paths return `413 {"error": "File too large (max 50 MB)"}`, exactly as the old `@app.errorhandler(413)` did.
 
 ---
 
@@ -235,9 +251,11 @@ Clicking **Open ↗** on any source card navigates to `/file/<doc_id>?page=N&hl=
 - **Non-PDF documents** (`.txt`, `.md`, extracted Word/CSV/code text) render through a custom React page-by-page viewer (`static/js/view.js`) with **real in-page highlighting**: the `hl` snippet (the first ~100 characters of the actual retrieved chunk, not the raw question — the question almost never appears verbatim in the source) is matched against the page text with a whitespace-flexible regex, since chunk text gets newlines collapsed during ingestion while the raw page text keeps them.
 - **PDF documents** are handed to the **browser's own native PDF plugin** via `<embed>` — there is no API surface for us to inject a highlight into that renderer's content. What *does* work: the standard `#page=N` URL fragment (supported by Chrome/Firefox/Safari/Edge/Brave) jumps straight to the cited page. For the passage itself, a banner above the embed shows the exact excerpt text to look for, with a nudge to use the browser's native Find (Ctrl/Cmd+F) — an honest fallback rather than a highlight that silently does nothing.
 
-`templates/view.html` injects `window.DOC_ID` / `DOC_FILENAME` / `DOC_EXT` as the very first script in `<head>` (via Flask's `tojson` filter, which safely escapes the values for script-context embedding) — before the React/Babel CDN scripts even load, so the viewer never depends on a `?doc_id=` query param that the route never actually has (the Flask route is `/file/<doc_id>`, a path segment).
+`templates/view.html` injects `window.DOC_ID` / `DOC_FILENAME` / `DOC_EXT` as the very first script in `<head>` (via the Jinja `tojson` filter, which safely escapes the values for script-context embedding) — before the React/Babel CDN scripts even load, so the viewer never depends on a `?doc_id=` query param that the route never actually has (the route is `/file/<doc_id>`, a path segment).
 
-> If you see red squiggly "Property assignment expected" errors on the `{{ doc_id | tojson }}` lines in VS Code — that's the editor's JS linter misreading Jinja2 template syntax as literal JavaScript. It's a local editor-only false positive; Flask replaces every `{{ ... }}` with a real value before the browser ever sees the page. Install the **Better Jinja** extension and set this file's language mode to **Jinja HTML** to silence it.
+> **`tojson` under FastAPI:** Flask registered this filter on its Jinja environment automatically. Starlette's `Jinja2Templates` builds a bare `jinja2.Environment`, so `app.py` registers `tojson` explicitly rather than relying on a Jinja default. `test_tojson_filter_is_registered_and_script_safe` in `test_eval_metrics.py` asserts both that it is present and that it escapes a `</script>` payload.
+
+> If you see red squiggly "Property assignment expected" errors on the `{{ doc_id | tojson }}` lines in VS Code — that's the editor's JS linter misreading Jinja2 template syntax as literal JavaScript. It's a local editor-only false positive; the server replaces every `{{ ... }}` with a real value before the browser ever sees the page. Install the **Better Jinja** extension and set this file's language mode to **Jinja HTML** to silence it.
 
 ---
 
@@ -325,11 +343,13 @@ Copy `.env.example` to `.env` and fill in what you need — see the file itself 
 | `TRACE_LOG_PATH` | `traces/traces.jsonl` | Durable `/ask` trace log path (see §5a) |
 | `DEFAULT_CHUNK_MODE` | `structured` | Default chunking strategy |
 | `DEFAULT_CHUNK_SIZE` | `512` | Default fixed chunk size (words) |
-| `SECRET_KEY` | *(random per-process if unset)* | Signs session cookies — **mandatory in production** to preserve session continuity across worker restarts |
+| `SECRET_KEY` | *(random per-process if unset)* | Signs session cookies (Starlette `SessionMiddleware`, itsdangerous) — **mandatory in production** to preserve session continuity across worker restarts |
+| `APP_ENV` | *(empty)* | Set to `production` to make `SECRET_KEY` mandatory (boot fails without it). `ENV` / `FLASK_ENV` still work as legacy aliases |
+| `SESSION_COOKIE_SECURE` | `false` | Adds the `Secure` flag to the session cookie. Enable **only** behind TLS — browsers silently drop `Secure` cookies over plain HTTP |
 | `ADMIN_API_KEY` | *(empty)* | Optional administrative token for inspecting cross-session `/orphans` and replaying traces via `X-Admin-Key` header |
 | `LOG_LEVEL` | `INFO` | `DEBUG` / `INFO` / `WARNING` / `ERROR` |
 | `PORT` / `HOST` | `5000` / `127.0.0.1` | Set `HOST=0.0.0.0` when running inside Docker |
-| `APP_DEBUG` | `false` | Flask debug mode — never enable outside local dev |
+| `APP_DEBUG` | `false` | Turns on uvicorn's autoreloader + debug logging for `python app.py` — never enable outside local dev |
 
 ---
 
@@ -341,7 +361,9 @@ docker compose up --build
 ```
 This starts:
 - **`qdrant`**: `qdrant/qdrant:v1.13.4`, bound to `127.0.0.1:6333` on the host to prevent direct network exposure. Readiness is validated via a native bash socket probe on `/readyz` (`qdrant:v1.13.4` has no `curl`), protected by `stop_grace_period: 30s` and bounded by resource limits (`cpus: "2"`, `memory: 4G`).
-- **`app`**: built from the included `Dockerfile` (Python 3.11-slim base, non-root `appuser`), served via **Gunicorn** (`--workers 2 --timeout 120 app:app`), loopback-bound to `127.0.0.1:5000:5000` on the host to prevent unauthenticated public exposure. Resource limits (`cpus: "2"`, `memory: 4G`) and `stop_grace_period: 30s` protect against runaway OCR/embedding workloads and ensure clean request drainage on shutdown.
+- **`app`**: built from the included `Dockerfile` (Python 3.11-slim base, non-root `appuser`), served via **Gunicorn managing uvicorn ASGI workers** (`gunicorn app:app -k uvicorn_worker.UvicornWorker --workers 2 --timeout 120`), loopback-bound to `127.0.0.1:5000:5000` on the host to prevent unauthenticated public exposure. Resource limits (`cpus: "2"`, `memory: 4G`) and `stop_grace_period: 30s` protect against runaway OCR/embedding workloads and ensure clean request drainage on shutdown.
+
+  > FastAPI is ASGI, so Gunicorn can no longer run `app:app` on its own — it needs an ASGI worker class. Keeping Gunicorn as the process manager preserves the existing worker-count / timeout / graceful-restart operational knowledge; `-k uvicorn_worker.UvicornWorker` is the only change from the previous WSGI command. (Use the `uvicorn-worker` package, not the older in-uvicorn `uvicorn.workers` module, which is deprecated.)
 
 ### Production Network & Reverse Proxy Architecture
 In production deployments, the application should never be exposed directly to the public internet without a reverse proxy or cloud load balancer:
@@ -352,13 +374,15 @@ Internet / Clients
 Reverse Proxy / LB (Nginx / Caddy / Cloudflare / AWS ALB)
        │
        ▼ [127.0.0.1:5000 / Internal Docker Network]
-Gunicorn WSGI Server (2 workers, 120s timeout)
+Gunicorn process manager (2 uvicorn ASGI workers, 120s timeout)
        │
        ▼
-Flask Application (Ask My Docs)
+FastAPI Application (Ask My Docs)
   ├── Qdrant Vector Store (127.0.0.1:6333 / http://qdrant:6333)
   └── Model Backends (Host Ollama via host.docker.internal / Cloud APIs)
 ```
+
+> **Concurrency model:** every route handler is a plain `def`, not `async def`. Starlette runs sync handlers in a threadpool, so the app's blocking `urllib.request` calls to Ollama / Gemini / xAI, blocking file I/O, and blocking Qdrant client calls behave exactly as they did under Gunicorn's sync workers — no event loop to starve. Converting the I/O layer to `httpx.AsyncClient` / an async Qdrant client would be a separate, much larger change.
 
 To point at **Qdrant Cloud** instead of the bundled container, set in your `.env` before running compose:
 ```bash
@@ -404,7 +428,7 @@ Run the regression test suite covering retrieval logic, Qdrant transactional con
 ```bash
 python -m unittest test_eval_metrics.py -v
 ```
-All 47 unit and integration tests run offline without external API keys or live Ollama/Qdrant servers (using in-memory mocks and controlled error injection).
+All 60 unit and integration tests run offline without external API keys or live Ollama/Qdrant servers (using in-memory mocks and controlled error injection).
 
 Key areas verified by the suite:
 - **Evaluation & Retrieval Metrics**: Context relevance, answer relevance, groundedness, MRR, Hit-Rate@K, and diagnostic categorizations.
@@ -413,6 +437,7 @@ Key areas verified by the suite:
 - **Durable Orphan Tracking**: Persistence and resolution tracking in `orphans.jsonl`, cross-process locking (`filelock`), and crash-recovery state preservation.
 - **Session & Replay Security**: Session isolation for `/orphans` and `/replay/<trace_id>`, admin authentication via `X-Admin-Key`, and sensitive path redaction.
 - **Trace Auditing**: Deep redaction (`redact_deep()`), prompt version pinning and SHA-256 hash validation, and deterministic trace sampling (`sample_trace.py`).
+- **Web-Layer Contracts** (`TestFastAPIMigration`): the 50 MB body cap on both the `Content-Length` and chunked/streamed paths, session-cookie round-tripping and tamper rejection, the `tojson` filter's script-context escaping, the `static/` mount, the full route table the frontend depends on, and the shared "No active session" 400 contract.
 
 ### Interactive & Diagnostic Tools
 - **`eval_retrieval.py`** — CLI tool computing `Hit-Rate@K`, `MRR`, and failure categorization directly against your indexed documents:
@@ -421,7 +446,8 @@ Key areas verified by the suite:
   ```
 - **The `/eval` UI** (see §4) — Web-based evaluation matrix to benchmark retrieval presets against realistic HR question sets with side-by-side diagnostic drawers.
 - **`/healthz` & `/readyz`** — Liveness check (`/healthz`) and readiness check (`/readyz` verifies vector store connectivity).
-- **Flask Test Client** — For automated end-to-end testing of document ingestion, hybrid search, and viewer routes in offline mode.
+- **`/docs` & `/redoc`** — Auto-generated interactive API documentation. Swagger UI at `/docs` will execute real requests against the running app, which makes it a usable manual test console for every endpoint in §5.
+- **FastAPI Test Client** (`from fastapi.testclient import TestClient`) — For automated end-to-end testing of document ingestion, hybrid search, and viewer routes in offline mode. It keeps a cookie jar across calls on the same instance, so session-scoped flows work the same way Flask's test client handled them. Flask's `client.session_transaction()` has no direct equivalent; `set_session()` in `test_eval_metrics.py` mints the signed session cookie directly instead (same itsdangerous mechanism the middleware uses).
 
 ---
 

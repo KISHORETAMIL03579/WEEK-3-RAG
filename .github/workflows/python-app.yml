@@ -32,6 +32,10 @@ jobs:
         run: |
           flake8 . --count --select=E9,F63,F7,F82 --show-source --statistics
           flake8 . --count --exit-zero --max-complexity=10 --max-line-length=127 --statistics
+      # The suite is fully offline — no API keys, no live Ollama/Qdrant — so it
+      # can gate the image build rather than only being run by hand.
+      - name: Run test suite
+        run: python -m unittest test_eval_metrics.py -v
       - name: Compute lowercase image name
         id: image
         run: |
