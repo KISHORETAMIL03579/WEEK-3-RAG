@@ -9,6 +9,35 @@ Every model call in the pipeline — embeddings, image OCR, and chat/answer gene
 ## ⚡ Quick Start & Setup
 
 ### 1. Environment Setup
+### Option A: Complete Docker Compose Deployment (Recommended)
+With Docker installed, you can start the entire stack (FastAPI + React 18 SPA, Qdrant Vector DB, Ollama inference engine, and automatic model initialization) in a single command:
+
+```bash
+# 1. Copy environment template and configure secret key
+cp .env.example .env
+
+# 2. Build and start all services in detached mode
+docker compose up -d --build
+```
+
+`docker compose` automatically:
+1. Builds the React 18 + TypeScript + Vite frontend and FastAPI container (`weekly-rag-build-app:latest`).
+2. Starts the Qdrant vector database (`weekly-rag-build-qdrant`, image: `qdrant/qdrant:v1.13.4`).
+3. Starts the Ollama inference engine (`weekly-rag-build-ollama`, image: `ollama/ollama:0.33.3`).
+4. Executes `ollama_init` to automatically pull all 3 required models into the persistent `ollama_data` volume:
+   - `nomic-embed-text` (Dense embeddings)
+   - `llava` (Multimodal Vision OCR)
+   - `llama3.1:8b` (Chat and grounded QA generation)
+
+- **Application URL**: [http://localhost:5000](http://localhost:5000)
+- **API Documentation**: [http://localhost:5000/docs](http://localhost:5000/docs) (Swagger UI) & [http://localhost:5000/redoc](http://localhost:5000/redoc)
+- **Stopping the stack**: `docker compose down` (stops all services immediately with zero host background processes).
+
+---
+
+### Option B: Local Python Development
+If you prefer running directly on your host machine:
+
 ```bash
 git clone https://github.com/KISHORETAMIL03579/WEEKLY-RAG-BUILD.git
 cd WEEKLY-RAG-BUILD
@@ -22,6 +51,7 @@ cp .env.example .env
 
 ### 2. Choose your backends (edit `.env`)
 The app defaults to **fully local** — no cloud API key required at all:
+Launch the application:
 ```bash
 ollama pull nomic-embed-text   # embeddings
 ollama pull llava              # vision OCR (skip if you never upload images)
@@ -53,6 +83,7 @@ Open **http://localhost:5000** in your browser. The startup banner tells you whi
    Mode: embeddings (Ollama (local)) + LLM (Ollama (local))
    API docs: http://localhost:5000/docs
 ```
+`python app.py` automatically checks if `frontend/dist` is present and builds the React 18 + Vite frontend if needed before starting Uvicorn. Open **http://localhost:5000**.
 
 Because the app is now FastAPI, the whole JSON API is self-documenting: **Swagger UI at `/docs`**, **ReDoc at `/redoc`**, and the raw schema at **`/openapi.json`** — generated from the request/response models in `app.py`, so it cannot drift from the code.
 
@@ -348,16 +379,56 @@ Copy `.env.example` to `.env` and fill in what you need — see the file itself 
 ---
 
 ## 8. Docker & Docker-Compose Deployment
+ 
+The repository provides a single canonical [`docker-compose.yml`](file:///d:/RAG_WEEK_3/WEEK-3-RAG/docker-compose.yml) orchestrating the production multi-container deployment:
 
-`docker-compose.yaml` runs a self-hosted Qdrant instance alongside the app in one command:
 ```bash
-docker compose up --build
+docker compose up -d --build
 ```
-This starts:
-- **`qdrant`**: `qdrant/qdrant:v1.13.4`, bound to `127.0.0.1:6333` on the host to prevent direct network exposure. Readiness is validated via a native bash socket probe on `/readyz` (`qdrant:v1.13.4` has no `curl`), protected by `stop_grace_period: 30s` and bounded by resource limits (`cpus: "2"`, `memory: 4G`).
-- **`app`**: built from the included `Dockerfile` (Python 3.11-slim base, non-root `appuser`), served via **Gunicorn managing uvicorn ASGI workers** (`gunicorn app:app -k uvicorn_worker.UvicornWorker --workers 2 --timeout 120`), loopback-bound to `127.0.0.1:5000:5000` on the host to prevent unauthenticated public exposure. Resource limits (`cpus: "2"`, `memory: 4G`) and `stop_grace_period: 30s` protect against runaway OCR/embedding workloads and ensure clean request drainage on shutdown.
 
-  > FastAPI is ASGI, so Gunicorn can no longer run `app:app` on its own — it needs an ASGI worker class. Keeping Gunicorn as the process manager preserves the existing worker-count / timeout / graceful-restart operational knowledge; `-k uvicorn_worker.UvicornWorker` is the only change from the previous WSGI command. (Use the `uvicorn-worker` package, not the older in-uvicorn `uvicorn.workers` module, which is deprecated.)
+### Services Managed by Docker Compose:
+1. **`weekly-rag-build-app`**:
+   - Multi-stage build (`Dockerfile`): Stage 1 compiles the React 18 + TypeScript + Vite SPA into `/build/frontend/dist`; Stage 2 sets up Python 3.11-slim runtime with non-root `appuser`.
+   - Served via **Gunicorn with Uvicorn ASGI workers** (`gunicorn app:app -k uvicorn_worker.UvicornWorker --workers 2 --timeout 120`).
+   - Published securely on `127.0.0.1:5000:5000`.
+   - Connected via Docker internal DNS to `http://qdrant:6333` and `http://ollama:11434`.
+2. **`weekly-rag-build-qdrant`**:
+   - Official `qdrant/qdrant:v1.13.4` vector database.
+   - Named volume `qdrant_data:/qdrant/storage` guarantees all indexed vector embeddings persist across container restart and down/up cycles.
+   - Socket-based `/readyz` healthcheck (`exec 3<>/dev/tcp/127.0.0.1/6333`).
+3. **`weekly-rag-build-ollama`**:
+   - Official `ollama/ollama:0.33.3` inference engine running entirely within Docker.
+   - Port mapped to `127.0.0.1:11434:11434`.
+   - Named volume `ollama_data:/root/.ollama` stores all model weights persistently without cluttering host machine storage.
+4. **`weekly-rag-build-ollama-init`**:
+   - One-shot initialization container that waits for `ollama` health, checks downloaded models, and automatically and idempotently pulls:
+     - `nomic-embed-text` (Embeddings)
+     - `llava` (Vision OCR)
+     - `llama3.1:8b` (Chat / Generation)
+
+---
+
+### Image Updates & Rebuilding with Latest Code
+When you make code changes and run:
+```bash
+docker compose up -d --build
+```
+- Docker builds the new `weekly-rag-build-app:latest` image using Docker layer caching (avoiding re-downloading npm or pip packages if `package.json` / `requirements.txt` haven't changed).
+- The existing container is replaced seamlessly in-place.
+- Old untagged build layers can be cleaned anytime with `docker image prune -f`.
+- **Downloaded models and vectors are preserved**: Because models are stored in `ollama_data` and vectors in `qdrant_data`, rebuilding the application image does **not** re-download model weights or wipe indexed documents!
+
+---
+
+### Clean Lifecycle Management (Stopping & Starting)
+Because Ollama runs strictly inside its Docker container (and not as a host background service):
+- **Start stack**: `docker compose up -d`
+- **Check status**: `docker compose ps`
+- **View live logs**: `docker compose logs -f`
+- **Stop everything cleanly**: `docker compose down` (instantly stops and removes containers; zero processes remain on host machine)
+- **Reset all data**: `docker compose down -v` (removes named volumes `qdrant_data` and `ollama_data`)
+
+---
 
 ### Production Network & Reverse Proxy Architecture
 In production deployments, the application should never be exposed directly to the public internet without a reverse proxy or cloud load balancer:
@@ -372,11 +443,13 @@ Gunicorn process manager (2 uvicorn ASGI workers, 120s timeout)
        │
        ▼
 FastAPI Application (Ask My Docs)
-  ├── Qdrant Vector Store (127.0.0.1:6333 / http://qdrant:6333)
-  └── Model Backends (Host Ollama via host.docker.internal / Cloud APIs)
+  ├── Qdrant Vector Store (http://qdrant:6333)
+  └── Ollama Model Inference (http://ollama:11434)
+```
 ```
 
 > **Concurrency model:** every route handler is a plain `def`, not `async def`. Starlette runs sync handlers in a threadpool, so the app's blocking `urllib.request` calls to Ollama / Gemini / xAI, blocking file I/O, and blocking Qdrant client calls behave exactly as they did under Gunicorn's sync workers — no event loop to starve. Converting the I/O layer to `httpx.AsyncClient` / an async Qdrant client would be a separate, much larger change.
+> **Concurrency model:** every route handler is a plain `def`, not `async def`. Starlette runs sync handlers in a threadpool, so the app's blocking `urllib.request` calls to Ollama / Gemini / xAI, blocking file I/O, and blocking Qdrant client calls behave safely — no event loop starvation.
 
 To point at **Qdrant Cloud** instead of the bundled container, set in your `.env` before running compose:
 ```bash
@@ -389,6 +462,7 @@ The `app` container's health check hits `/healthz` directly via Python standard 
 
 > **Production Secrets Enforcement:**
 > `docker-compose.yaml` enforces `${SECRET_KEY:?SECRET_KEY must be set in .env to preserve session continuity}`. Startup will fail fast with a descriptive error if `SECRET_KEY` is omitted, preventing inadvertent deployment with ephemeral per-process session cookies.
+> `docker-compose.yml` enforces `${SECRET_KEY:?SECRET_KEY must be set in .env to preserve session continuity}`. Startup will fail fast with a descriptive error if `SECRET_KEY` is omitted, preventing inadvertent deployment with ephemeral per-process session cookies.
 
 > **Deployment Architecture Note (Single-Host vs Clustered):**
 > The bundled Docker Compose configuration is hardened for a **single-host deployment** (`restart: unless-stopped`, non-root container user `appuser`, isolated loopback bindings, durable host volume mounts for `./uploads`, `./vectorstore`, and `./traces`, and `filelock` for cross-worker serialized writes).

@@ -4020,6 +4020,20 @@ def readyz(response: Response):
             checks["qdrant"] = False
             status_code = 503
 
+    if EMBED_BACKEND == "ollama" or CHAT_BACKEND == "ollama":
+        try:
+            req = urllib.request.Request(f"{OLLAMA_URL}/api/tags", headers={"User-Agent": "AskMyDocs-Readyz"})
+            with urllib.request.urlopen(req, timeout=2.0) as r:
+                if r.status == 200:
+                    checks["ollama"] = True
+                else:
+                    checks["ollama"] = False
+                    status_code = 503
+        except Exception as exc:
+            logger.warning("Readiness check: Ollama unreachable at %s: %s", OLLAMA_URL, exc)
+            checks["ollama"] = False
+            status_code = 503
+
     response.status_code = status_code
     return ReadyzResponse(ready=status_code == 200, checks=checks)
 

@@ -1,0 +1,210 @@
+# Self-hosted Qdrant, Ollama & Weekly RAG Server
+# Deployment note:
+#   This Docker Compose configuration provides a complete, self-contained
+#   multi-service stack: FastAPI + React application, Qdrant vector database,
+#   and Ollama local LLM/embedding inference engine with automated model initialization.
+#
+# Usage:
+#   docker compose up -d --build
+#
+# Persistent data:
+#   - qdrant_data: Vector embeddings stored in named volume
+#   - ollama_data: Downloaded LLM/embedding models stored in named volume (strictly in Docker)
+#   - ./uploads, ./traces, ./vectorstore: Local directory mounts
+
+name: weekly-rag-build
+
+services:
+  qdrant:
+    image: qdrant/qdrant:v1.13.4
+    container_name: weekly-rag-build-qdrant
+    restart: unless-stopped
+    stop_grace_period: 30s
+    # Bind to 127.0.0.1 to prevent exposing vector database directly to the public network.
+    # The application connects via internal DNS: http://qdrant:6333
+    ports:
+      - "127.0.0.1:6333:6333"
+    volumes:
+      - qdrant_data:/qdrant/storage
+    healthcheck:
+      # qdrant/qdrant:v1.13.4 minimal base does not ship with curl; test readiness via native bash socket probe
+      test: ["CMD-SHELL", "bash -c 'exec 3<>/dev/tcp/127.0.0.1/6333 && echo -e \"GET /readyz HTTP/1.1\\r\\nHost: 127.0.0.1\\r\\nConnection: close\\r\\n\\r\\n\" >&3 && cat <&3 | grep -q \"200 OK\"' || exit 1"]
+      interval: 5s
+      timeout: 3s
+      retries: 10
+    deploy:
+      resources:
+        limits:
+          cpus: "1"
+          memory: 1G
+
+  ollama:
+    image: ollama/ollama:0.33.3
+    container_name: weekly-rag-build-ollama
+    restart: unless-stopped
+    stop_grace_period: 30s
+    # Expose port on 127.0.0.1 (defaults to standard 11434 on host)
+    # The application connects internally via Docker DNS: http://ollama:11434
+    ports:
+      - "${OLLAMA_PORT_BINDING:-127.0.0.1:11434:11434}"
+    volumes:
+      - ollama_data:/root/.ollama
+    healthcheck:
+      test: ["CMD-SHELL", "ollama list || exit 1"]
+      interval: 5s
+      timeout: 3s
+      retries: 10
+      start_period: 5s
+    deploy:
+      resources:
+        limits:
+          cpus: "4"
+          memory: 6G
+
+  ollama_init:
+    image: ollama/ollama:0.33.3
+    container_name: weekly-rag-build-ollama-init
+    restart: "no"
+    environment:
+      OLLAMA_HOST: http://ollama:11434
+      EMBED_BACKEND: ${EMBED_BACKEND:-ollama}
+      VISION_BACKEND: ${VISION_BACKEND:-ollama}
+      CHAT_BACKEND: ${CHAT_BACKEND:-ollama}
+      OLLAMA_EMBED_MODEL: ${OLLAMA_EMBED_MODEL:-nomic-embed-text}
+      OLLAMA_VISION_MODEL: ${OLLAMA_VISION_MODEL:-llava}
+      OLLAMA_CHAT_MODEL: ${OLLAMA_CHAT_MODEL:-llama3.1:8b}
+    entrypoint: ["/bin/sh", "-c"]
+    command:
+      - |
+        set -e
+        echo "[OLLAMA_INIT] Waiting for Ollama daemon at $$OLLAMA_HOST..."
+        until ollama list > /dev/null 2>&1; do
+          sleep 1
+        done
+        echo "[OLLAMA_INIT] Ollama daemon reachable. Checking backend model requirements..."
+
+        # 1. Embedding Model
+        if [ "$${EMBED_BACKEND:-ollama}" = "ollama" ]; then
+          EMBED_M="$${OLLAMA_EMBED_MODEL:-nomic-embed-text}"
+          if ollama show "$$EMBED_M" > /dev/null 2>&1; then
+            echo "[OLLAMA_INIT] Embedding model '$$EMBED_M' is already downloaded."
+          else
+            echo "[OLLAMA_INIT] Pulling embedding model '$$EMBED_M'..."
+            ollama pull "$$EMBED_M"
+            echo "[OLLAMA_INIT] Embedding model '$$EMBED_M' downloaded successfully."
+          fi
+        else
+          echo "[OLLAMA_INIT] EMBED_BACKEND is '$${EMBED_BACKEND}', skipping local embedding model."
+        fi
+
+        # 2. Vision OCR Model
+        if [ "$${VISION_BACKEND:-ollama}" = "ollama" ]; then
+          VISION_M="$${OLLAMA_VISION_MODEL:-llava}"
+          if ollama show "$$VISION_M" > /dev/null 2>&1; then
+            echo "[OLLAMA_INIT] Vision OCR model '$$VISION_M' is already downloaded."
+          else
+            echo "[OLLAMA_INIT] Pulling vision OCR model '$$VISION_M'..."
+            ollama pull "$$VISION_M"
+            echo "[OLLAMA_INIT] Vision OCR model '$$VISION_M' downloaded successfully."
+          fi
+        else
+          echo "[OLLAMA_INIT] VISION_BACKEND is '$${VISION_BACKEND}', skipping local vision OCR model."
+        fi
+
+        # 3. Chat / Generation Model
+        if [ "$${CHAT_BACKEND:-ollama}" = "ollama" ]; then
+          CHAT_M="$${OLLAMA_CHAT_MODEL:-llama3.1:8b}"
+          if ollama show "$$CHAT_M" > /dev/null 2>&1; then
+            echo "[OLLAMA_INIT] Chat model '$$CHAT_M' is already downloaded."
+          else
+            echo "[OLLAMA_INIT] Pulling chat model '$$CHAT_M'..."
+            ollama pull "$$CHAT_M"
+            echo "[OLLAMA_INIT] Chat model '$$CHAT_M' downloaded successfully."
+          fi
+        else
+          echo "[OLLAMA_INIT] CHAT_BACKEND is '$${CHAT_BACKEND}', skipping local chat model."
+        fi
+
+        echo "[OLLAMA_INIT] Model initialization completed successfully."
+    depends_on:
+      ollama:
+        condition: service_healthy
+
+  app:
+    build: .
+    image: weekly-rag-build-app:latest
+    container_name: weekly-rag-build-app
+    restart: unless-stopped
+    stop_grace_period: 30s
+    # Bind to 127.0.0.1 to prevent unauthenticated direct exposure on public network interfaces.
+    ports:
+      - "127.0.0.1:5000:5000"
+    environment:
+      VECTOR_BACKEND: ${VECTOR_BACKEND:-qdrant}
+      QDRANT_URL: ${DOCKER_QDRANT_URL:-http://qdrant:6333}
+      QDRANT_API_KEY: ${DOCKER_QDRANT_API_KEY:-}
+      # Embeddings backend — "ollama" (default, no key) or "gemini"
+      EMBED_BACKEND: ${EMBED_BACKEND:-ollama}
+      OLLAMA_URL: ${DOCKER_OLLAMA_URL:-http://ollama:11434}
+      OLLAMA_EMBED_MODEL: ${OLLAMA_EMBED_MODEL:-nomic-embed-text}
+      GEMINI_API_KEY: ${GEMINI_API_KEY:-}
+      EMBED_MODEL: ${EMBED_MODEL:-gemini-embedding-001}
+      # Vision OCR backend — "ollama" (default) or "gemini"
+      VISION_BACKEND: ${VISION_BACKEND:-ollama}
+      OLLAMA_VISION_MODEL: ${OLLAMA_VISION_MODEL:-llava}
+      GEMINI_VISION_MODEL: ${GEMINI_VISION_MODEL:-gemini-3.7-flash}
+      # Chat/generation backend — "ollama" (default) or "xai"
+      CHAT_BACKEND: ${CHAT_BACKEND:-ollama}
+      OLLAMA_CHAT_MODEL: ${OLLAMA_CHAT_MODEL:-llama3.1:8b}
+      XAI_API_KEY: ${XAI_API_KEY:-}
+      XAI_URL: ${XAI_URL:-https://api.x.ai/v1}
+      XAI_MODEL: ${XAI_MODEL:-grok-4.3}
+      EMBED_MIN_SCORE: ${EMBED_MIN_SCORE:-0.55}
+      RETRIEVAL_MODE: ${RETRIEVAL_MODE:-hybrid}
+      HYBRID_ALPHA: ${HYBRID_ALPHA:-0.6}
+      RRF_K: ${RRF_K:-10}
+      BM25_K1: ${BM25_K1:-1.5}
+      BM25_B: ${BM25_B:-0.75}
+      TOP_K: ${TOP_K:-8}
+      MAX_CONTEXT_TOKENS: ${MAX_CONTEXT_TOKENS:-6000}
+      DEFAULT_CHUNK_MODE: ${DEFAULT_CHUNK_MODE:-structured}
+      DEFAULT_CHUNK_SIZE: ${DEFAULT_CHUNK_SIZE:-512}
+      QDRANT_SCROLL_LIMIT: ${QDRANT_SCROLL_LIMIT:-5000}
+      EVAL_CHUNK_MODE: ${EVAL_CHUNK_MODE:-structured}
+      EMBED_BATCH: ${EMBED_BATCH:-32}
+      RERANK_ENABLED: ${RERANK_ENABLED:-false}
+      RERANK_TOP_N: ${RERANK_TOP_N:-8}
+      RERANK_MIN_RELEVANCE: ${RERANK_MIN_RELEVANCE:-5}
+      QUERY_REWRITE_ENABLED: ${QUERY_REWRITE_ENABLED:-false}
+      TRACE_LOG_PATH: ${TRACE_LOG_PATH:-traces/traces.jsonl}
+      SECRET_KEY: ${SECRET_KEY:?SECRET_KEY must be set in .env to preserve session continuity}
+      SESSION_COOKIE_SECURE: ${SESSION_COOKIE_SECURE:-false}
+      ADMIN_API_KEY: ${ADMIN_API_KEY:-}
+      LOG_LEVEL: ${LOG_LEVEL:-INFO}
+      PORT: 5000
+      HOST: 0.0.0.0
+    depends_on:
+      qdrant:
+        condition: service_healthy
+      ollama:
+        condition: service_healthy
+      ollama_init:
+        condition: service_completed_successfully
+    healthcheck:
+      test: ["CMD-SHELL", "python -c 'import urllib.request; urllib.request.urlopen(\"http://localhost:5000/healthz\")' || exit 1"]
+      interval: 10s
+      timeout: 5s
+      retries: 5
+    deploy:
+      resources:
+        limits:
+          cpus: "2"
+          memory: 2G
+    volumes:
+      - ./uploads:/app/uploads
+      - ./vectorstore:/app/vectorstore
+      - ./traces:/app/traces
+
+volumes:
+  qdrant_data:
+  ollama_data:
