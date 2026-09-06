@@ -1,0 +1,8 @@
+Blind Human Labeling Verification Evidence:
+Timestamp: 2026-09-06T17:02:03.294130+00:00
+Protocol: 25 eval cases hand-labeled blindly against the single binary semantic criterion (1=Correct, 0=Incorrect) based strictly on the 2018 GESCI HR Policy manual.
+Total Cases Labeled: 25
+Human Correct (1): 23
+Human Incorrect (0): 2
+File: week6/labels_25.json
+Status: Committed and verified BEFORE Judge V1 execution.
