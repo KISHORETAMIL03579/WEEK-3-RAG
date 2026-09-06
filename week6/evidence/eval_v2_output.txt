@@ -1,0 +1,246 @@
+JUDGE V2 EVALUATION EVIDENCE
+==================================================
+Total Cases: 25
+Human Labels: 23 Correct (1), 2 Incorrect (0)
+Judge V2: 5 Correct (1), 20 Incorrect (0)
+Agreements: 7 / 25
+Agreement Percentage: 28.00%
+Disagreements Count: 18
+
+DISAGREEMENTS:
+
+--- Disagreement #1 ---
+Case ID: case_02
+Trace ID: 067c1ade-4abd-4a3a-84b3-04fe54d1f329
+Question: Under what circumstances is an employee entitled to paid sick leave?
+Taxonomy Mode: Low-K Multi-Clause Truncation
+Human Label: 1
+Judge V2 Label: 0
+Assistant Answer:
+An employee is entitled to paid sick leave when they are incapacitated for the performance of their duties by illness or injury, and have completed at least two consecutive months of service [1]. They are entitled to two working days per month of completed service, with one day at full pay and one day at half pay [1].
+Raw Judge Response: ERROR: timed out
+
+--- Disagreement #2 ---
+Case ID: case_04
+Trace ID: 8cd01732-6446-41a0-b1fc-38969812cfa4
+Question: Under what conditions can a staff member apply for an emergency salary advance?
+Taxonomy Mode: Low-K Multi-Clause Truncation
+Human Label: 1
+Judge V2 Label: 0
+Assistant Answer:
+A staff member can apply for an emergency salary advance in the following cases: 
+
+- serious illness [2]; 
+- legitimate emergencies [2]; 
+- in exceptional and compelling circumstances, with a detailed justification in writing, as authorized by the CEO [2].
+Raw Judge Response: 0
+
+The answer presents a truncated 3-item
+
+--- Disagreement #3 ---
+Case ID: case_05
+Trace ID: c30ee16f-7361-49fe-8a0f-b3ff58bae9a7
+Question: What is the maternity leave entitlement for female staff members?
+Taxonomy Mode: Low-K Multi-Clause Truncation
+Human Label: 1
+Judge V2 Label: 0
+Assistant Answer:
+A female staff member shall be entitled to maternity leave for a total period of sixteen (16) weeks, with full pay for the entire duration of her absence [1].
+Raw Judge Response: 0
+
+--- Disagreement #4 ---
+Case ID: case_06
+Trace ID: c71b8fb1-7b8f-4e6b-817f-23c63546364b
+Question: What is the formal procedure for reporting workplace bullying or harassment?
+Taxonomy Mode: Sub-Clause Dispersal Across Disparate Policy Chapters
+Human Label: 1
+Judge V2 Label: 0
+Assistant Answer:
+According to section 2.2.3 of the HR Policy (page 11), staff members are encouraged to report incidents of workplace bullying or harassment to their immediate Manager, a Senior Manager, or the CEO. If the complaint is against the CEO, it may be made to the Board. The Manager or Senior Manager should then report the incident to the Manager: Finance and Operations and/or the CEO, so that an investigation can be commenced where appropriate.
+Raw Judge Response: ERROR: timed out
+
+--- Disagreement #5 ---
+Case ID: case_08
+Trace ID: 39623159-a1a2-4cff-ba62-011d5e39e442
+Question: What is the policy regarding acceptance of gifts, hospitality, or entertainment from clients?
+Taxonomy Mode: Sub-Clause Dispersal Across Disparate Policy Chapters
+Human Label: 1
+Judge V2 Label: 0
+Assistant Answer:
+According to [2] HRPolicy.pdf (page 8), section: 2.2.2 Avoidance of Conflict of Interest Policy, GESCI's policy is that staff members should not accept gifts, benefits, or favours (including non-work related hospitality) connected with their employment from any external party, including partners and/or clients. This is to avoid any actual or potential conflict of interest and to maintain the highest standards of integrity and impartiality.
+Raw Judge Response: ERROR: HTTP Error 500: Internal Server Error
+
+--- Disagreement #6 ---
+Case ID: case_09
+Trace ID: 379e2c7d-d8a7-48d4-ac21-8ba25dcce55c
+Question: What is the policy regarding acceptance of gifts, hospitality, or entertainment from clients?
+Taxonomy Mode: Sub-Clause Dispersal Across Disparate Policy Chapters
+Human Label: 1
+Judge V2 Label: 0
+Assistant Answer:
+According to [2] HRPolicy.pdf (page 8), section: 2.2.2 Avoidance of Conflict of Interest Policy, it is GESCI's policy that staff members do not accept gifts, benefits, or favours (including non-work related hospitality) connected with their employment from any external party, including partners and/or clients. This is to avoid any actual or potential conflict of interest and to ensure that their dealings with all external parties or organizations bear the closest possible scrutiny.
+
+Additionally, [4] HRPolicy.pdf (page 10) states that GESCI staff members should not accept offers of hospitality which go beyond routine practices, except where acceptance of such an offer can be clearly shown to be in the interest of GESCI and has been approved by their Manager.
+
+[1] HRPolicy.pdf (page 10) also provides guidelines for accepting hospitality, stating that all offers of hospitality from commercial interests which have or might have contractual relations with GESCI must be reported by the GESCI staff member to the CEO for direction.
+
+It is worth noting that [5] HRPolicy.pdf (page 9) mentions that staff members may accept and retain gifts of modest value, but any gifts of more significant value should be refused or handed over to the Manager Finance and Administration.
+Raw Judge Response: ERROR: timed out
+
+--- Disagreement #7 ---
+Case ID: case_10
+Trace ID: 729dbf45-51cd-49cf-966d-192c7d543bb8
+Question: How much notice is required when a staff member resigns from their position?
+Taxonomy Mode: Sub-Clause Dispersal Across Disparate Policy Chapters
+Human Label: 1
+Judge V2 Label: 0
+Assistant Answer:
+A staff member resigning must give GESCI four weeks written notice or one week written notice in the case of staff members on probation [1]. The CEO may accept resignation on shorter notice [1].
+Raw Judge Response: 0
+
+The Assistant Answer only quotes the policy regarding
+
+--- Disagreement #8 ---
+Case ID: case_12
+Trace ID: cfd0d330-2c61-4500-b197-aec7abc61d1f
+Question: Does the policy grant paternity leave to male employees and for how long?
+Taxonomy Mode: Citation Drifting & In-Prose Structural Inversion
+Human Label: 1
+Judge V2 Label: 0
+Assistant Answer:
+Yes, the policy grants paternity leave to male employees. According to section 5.3.3 Parental Leave in HRPolicy.pdf (page 37), a staff member shall be entitled to paternity leave of two weeks with full pay. [1]
+Raw Judge Response: ERROR: timed out
+
+--- Disagreement #9 ---
+Case ID: case_14
+Trace ID: ded4abe6-18e7-4b6f-a273-7a122a166a74
+Question: What acts are classified as misdemeanors under the disciplinary policy?
+Taxonomy Mode: Citation Drifting & In-Prose Structural Inversion
+Human Label: 1
+Judge V2 Label: 0
+Assistant Answer:
+The acts classified as misdemeanors under the disciplinary policy are listed as follows: [1]
+
+a) Late arrival or early departure from work without the approval of the supervisor
+b) Idling and wandering during working hours
+c) Avoiding work by malingering or feigning illness
+d) Failure to account for cash advances within the required period
+e) Failure to comply with any or all of GESCI’s code of conduct.
+Raw Judge Response: ERROR: timed out
+
+--- Disagreement #10 ---
+Case ID: case_15
+Trace ID: 575135b4-12e6-47ba-a626-cd7fd0f30038
+Question: What are the core responsibilities of the Human Resources Manager?
+Taxonomy Mode: Citation Drifting & In-Prose Structural Inversion
+Human Label: 1
+Judge V2 Label: 0
+Assistant Answer:
+The core responsibilities of the Human Resources Manager include:
+
+* initiating and developing human resource policies, procedures, and practices [3]
+* implementing and monitoring human resource policies and procedures as contained in the Manual [3]
+* facilitating the recruitment and hiring of staff [3]
+* providing fair and equitable compensation based on job demand and regular appraisal of an individual’s performance [3]
+* advising management on all human resource matters [3]
+* facilitating the achievement of a working environment which encourages staff development, motivation, and enhances the personal dignity of staff members [3]
+* co-ordinating the preparation of annual leave programme [3]
+* advising Management on matters relating to discipline and the procedures to be followed in handling disciplinary cases [3]
+* being the custodian of the Manual and initiating regular reviews of the same [3]
+Raw Judge Response: ERROR: timed out
+
+--- Disagreement #11 ---
+Case ID: case_16
+Trace ID: 64d8a643-69d6-4afb-9f2b-58f62ed4cef8
+Question: What is the mandatory retirement age for permanent staff?
+Taxonomy Mode: Unstated Policy Invariant Refusal
+Human Label: 1
+Judge V2 Label: 0
+Assistant Answer:
+I don't know.
+Raw Judge Response: ERROR: timed out
+
+--- Disagreement #12 ---
+Case ID: case_17
+Trace ID: 9d868423-12f1-4413-a601-6afcebffbaec
+Question: What standards are expected regarding office dress code and grooming?
+Taxonomy Mode: Unstated Policy Invariant Refusal
+Human Label: 1
+Judge V2 Label: 0
+Assistant Answer:
+I don't know.
+Raw Judge Response: ERROR: timed out
+
+--- Disagreement #13 ---
+Case ID: case_18
+Trace ID: 57b6a4af-1aec-40a9-af10-05ed074f73fc
+Question: Who is eligible for overtime compensation and how is the rate determined?
+Taxonomy Mode: Unstated Policy Invariant Refusal
+Human Label: 1
+Judge V2 Label: 0
+Assistant Answer:
+I don't know.
+Raw Judge Response: ERROR: timed out
+
+--- Disagreement #14 ---
+Case ID: case_20
+Trace ID: 34a545d6-51d3-46c8-854f-9edf7f91ad5a
+Question: What is the mandatory retirement age for permanent staff?
+Taxonomy Mode: Unstated Policy Invariant Refusal
+Human Label: 1
+Judge V2 Label: 0
+Assistant Answer:
+I don't know.
+Raw Judge Response: 0
+
+The handbook context does not mention a mandatory
+
+--- Disagreement #15 ---
+Case ID: case_21
+Trace ID: 7f03ac6c-c991-458a-972a-b1822472f0f6
+Question: What is the probation period length for new recruits?
+Taxonomy Mode: Embedding Similarity Threshold Starvation
+Human Label: 1
+Judge V2 Label: 0
+Assistant Answer:
+The probation period will be six months for all staff contracts exceeding 12 months. [1]
+Raw Judge Response: 0
+
+The answer only quotes a partial subset of
+
+--- Disagreement #16 ---
+Case ID: case_22
+Trace ID: 51e1eed1-c25c-43b8-913d-9b4b5ba965b1
+Question: What is the probation period length for new recruits?
+Taxonomy Mode: Embedding Similarity Threshold Starvation
+Human Label: 1
+Judge V2 Label: 0
+Assistant Answer:
+The probation period is six months for all staff contracts exceeding 12 months [1].
+Raw Judge Response: 0
+
+The answer only quotes a partial subset of
+
+--- Disagreement #17 ---
+Case ID: case_23
+Trace ID: 50dbc236-f1a7-4193-b5c5-6173c8982ec3
+Question: What are the rules and eligibility criteria for working from home?
+Taxonomy Mode: Embedding Similarity Threshold Starvation
+Human Label: 1
+Judge V2 Label: 0
+Assistant Answer:
+According to section 8.6 of the HRPolicy.pdf (page 57), staff members can work from home with GESCI's consent, and their home is considered a location of work subject to the OSHA. To work from home, staff members must be aware that authorized occupational safety and health officers can visit their home-based office, and GESCI reserves the right to inspect their home-working environment to ensure health and safety standards are met. [1]
+Raw Judge Response: 0
+
+--- Disagreement #18 ---
+Case ID: case_24
+Trace ID: 1666a48b-f054-4263-adea-bf26e3e3283c
+Question: What are the standard daily working hours and lunch break provisions?
+Taxonomy Mode: Embedding Similarity Threshold Starvation
+Human Label: 1
+Judge V2 Label: 0
+Assistant Answer:
+The standard daily working hours are 9.00 am to 5:30 pm, Monday to Friday [1]. Staff members are also required to take one hour for lunch [1].
+Raw Judge Response: 0
+
+The Assistant Answer only quotes a partial subset

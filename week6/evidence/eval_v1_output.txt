@@ -1,0 +1,117 @@
+JUDGE V1 EVALUATION EVIDENCE
+==================================================
+Total Cases: 25
+Human Labels: 23 Correct (1), 2 Incorrect (0)
+Judge V1: 17 Correct (1), 8 Incorrect (0)
+Agreements: 17 / 25
+Agreement Percentage: 68.00%
+Disagreements Count: 8
+
+DISAGREEMENTS:
+
+--- Disagreement #1 ---
+Case ID: case_02
+Trace ID: 067c1ade-4abd-4a3a-84b3-04fe54d1f329
+Question: Under what circumstances is an employee entitled to paid sick leave?
+Taxonomy Mode: Low-K Multi-Clause Truncation
+Human Label: 1
+Judge V1 Label: 0
+Assistant Answer:
+An employee is entitled to paid sick leave when they are incapacitated for the performance of their duties by illness or injury, and have completed at least two consecutive months of service [1]. They are entitled to two working days per month of completed service, with one day at full pay and one day at half pay [1].
+Raw Judge Response: ERROR: timed out
+
+--- Disagreement #2 ---
+Case ID: case_03
+Trace ID: c87ef1b4-a959-420e-b866-5daab98220d0
+Question: Under what conditions can a staff member apply for an emergency salary advance?
+Taxonomy Mode: Low-K Multi-Clause Truncation
+Human Label: 0
+Judge V1 Label: 1
+Assistant Answer:
+According to [2], a staff member can apply for an emergency salary advance in the following conditions: 
+
+* In cases of serious illness; 
+* In legitimate emergencies.
+Raw Judge Response: 1
+
+--- Disagreement #3 ---
+Case ID: case_06
+Trace ID: c71b8fb1-7b8f-4e6b-817f-23c63546364b
+Question: What is the formal procedure for reporting workplace bullying or harassment?
+Taxonomy Mode: Sub-Clause Dispersal Across Disparate Policy Chapters
+Human Label: 1
+Judge V1 Label: 0
+Assistant Answer:
+According to section 2.2.3 of the HR Policy (page 11), staff members are encouraged to report incidents of workplace bullying or harassment to their immediate Manager, a Senior Manager, or the CEO. If the complaint is against the CEO, it may be made to the Board. The Manager or Senior Manager should then report the incident to the Manager: Finance and Operations and/or the CEO, so that an investigation can be commenced where appropriate.
+Raw Judge Response: ERROR: timed out
+
+--- Disagreement #4 ---
+Case ID: case_08
+Trace ID: 39623159-a1a2-4cff-ba62-011d5e39e442
+Question: What is the policy regarding acceptance of gifts, hospitality, or entertainment from clients?
+Taxonomy Mode: Sub-Clause Dispersal Across Disparate Policy Chapters
+Human Label: 1
+Judge V1 Label: 0
+Assistant Answer:
+According to [2] HRPolicy.pdf (page 8), section: 2.2.2 Avoidance of Conflict of Interest Policy, GESCI's policy is that staff members should not accept gifts, benefits, or favours (including non-work related hospitality) connected with their employment from any external party, including partners and/or clients. This is to avoid any actual or potential conflict of interest and to maintain the highest standards of integrity and impartiality.
+Raw Judge Response: ERROR: timed out
+
+--- Disagreement #5 ---
+Case ID: case_12
+Trace ID: cfd0d330-2c61-4500-b197-aec7abc61d1f
+Question: Does the policy grant paternity leave to male employees and for how long?
+Taxonomy Mode: Citation Drifting & In-Prose Structural Inversion
+Human Label: 1
+Judge V1 Label: 0
+Assistant Answer:
+Yes, the policy grants paternity leave to male employees. According to section 5.3.3 Parental Leave in HRPolicy.pdf (page 37), a staff member shall be entitled to paternity leave of two weeks with full pay. [1]
+Raw Judge Response: ERROR: timed out
+
+--- Disagreement #6 ---
+Case ID: case_14
+Trace ID: ded4abe6-18e7-4b6f-a273-7a122a166a74
+Question: What acts are classified as misdemeanors under the disciplinary policy?
+Taxonomy Mode: Citation Drifting & In-Prose Structural Inversion
+Human Label: 1
+Judge V1 Label: 0
+Assistant Answer:
+The acts classified as misdemeanors under the disciplinary policy are listed as follows: [1]
+
+a) Late arrival or early departure from work without the approval of the supervisor
+b) Idling and wandering during working hours
+c) Avoiding work by malingering or feigning illness
+d) Failure to account for cash advances within the required period
+e) Failure to comply with any or all of GESCI’s code of conduct.
+Raw Judge Response: ERROR: timed out
+
+--- Disagreement #7 ---
+Case ID: case_15
+Trace ID: 575135b4-12e6-47ba-a626-cd7fd0f30038
+Question: What are the core responsibilities of the Human Resources Manager?
+Taxonomy Mode: Citation Drifting & In-Prose Structural Inversion
+Human Label: 1
+Judge V1 Label: 0
+Assistant Answer:
+The core responsibilities of the Human Resources Manager include:
+
+* initiating and developing human resource policies, procedures, and practices [3]
+* implementing and monitoring human resource policies and procedures as contained in the Manual [3]
+* facilitating the recruitment and hiring of staff [3]
+* providing fair and equitable compensation based on job demand and regular appraisal of an individual’s performance [3]
+* advising management on all human resource matters [3]
+* facilitating the achievement of a working environment which encourages staff development, motivation, and enhances the personal dignity of staff members [3]
+* co-ordinating the preparation of annual leave programme [3]
+* advising Management on matters relating to discipline and the procedures to be followed in handling disciplinary cases [3]
+* being the custodian of the Manual and initiating regular reviews of the same [3]
+Raw Judge Response: ERROR: timed out
+
+--- Disagreement #8 ---
+Case ID: case_18
+Trace ID: 57b6a4af-1aec-40a9-af10-05ed074f73fc
+Question: Who is eligible for overtime compensation and how is the rate determined?
+Taxonomy Mode: Unstated Policy Invariant Refusal
+Human Label: 1
+Judge V1 Label: 0
+Assistant Answer:
+I don't know.
+Raw Judge Response: ERROR: timed out

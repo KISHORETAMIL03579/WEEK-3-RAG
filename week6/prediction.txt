@@ -1,0 +1,1 @@
+I predict that adding two few-shot exemplars derived from real Judge V1 disagreements (penalizing truncated condition sets like case_03 and rewarding valid refusals on unstated policies like case_18) will eliminate at least 5 of the 8 disagreements and increase human-judge agreement from 68.0% (17/25) to over 88.0% (22/25+).
