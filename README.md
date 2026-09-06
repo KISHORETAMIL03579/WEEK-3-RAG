@@ -10,8 +10,8 @@ Every model call in the pipeline — embeddings, image OCR, and chat/answer gene
 
 ### 1. Environment Setup
 ```bash
-git clone https://github.com/KISHORETAMIL03579/weekly-rag.git
-cd weekly-rag
+git clone https://github.com/KISHORETAMIL03579/WEEKLY-RAG-BUILD.git
+cd WEEKLY-RAG-BUILD
 python -m venv .venv
 .venv\Scripts\Activate.ps1
 python -c "import sys; print(sys.executable)"
