@@ -1474,3 +1474,145 @@ a:focus-visible,
     display: none;
   }
 }
+
+
+/* ── Evaluation Suite Additional Enterprise Styles ─────────────────── */
+.eval-root {
+  --surface: #111827;
+  --surface-raised: #1f2937;
+  --border-subtle: rgba(255, 255, 255, 0.07);
+  --green-bg: rgba(16, 185, 129, 0.12);
+  --green-text: #10b981;
+  --green-border: rgba(16, 185, 129, 0.25);
+  --red-bg: rgba(239, 68, 68, 0.12);
+  --red-text: #ef4444;
+  --red-border: rgba(239, 68, 68, 0.25);
+  --amber-bg: rgba(245, 158, 11, 0.12);
+  --amber-text: #f59e0b;
+  --amber-border: rgba(245, 158, 11, 0.25);
+  min-height: 100vh;
+  display: flex;
+  flex-direction: column;
+  background: var(--bg);
+  color: var(--text-primary);
+}
+
+.eval-card {
+  background: var(--bg-surface);
+  border: 1px solid var(--border);
+  border-radius: 12px;
+  padding: 24px;
+}
+
+.eval-input-field {
+  background: var(--bg-raised);
+  border: 1px solid var(--border);
+  border-radius: 8px;
+  padding: 9px 12px;
+  font-size: 0.83rem;
+  color: #fff;
+  outline: none;
+  transition: border-color 0.15s ease;
+}
+
+.eval-input-field:focus {
+  border-color: var(--accent);
+}
+
+.stage-checkbox {
+  display: flex;
+  align-items: center;
+  gap: 10px;
+  padding: 10px 14px;
+  border-radius: 8px;
+  border: 1px solid var(--border);
+  background: var(--bg-raised);
+  cursor: pointer;
+  transition: all 0.15s ease;
+  user-select: none;
+}
+
+.stage-checkbox:hover {
+  border-color: var(--border-mid);
+}
+
+.stage-checkbox.checked {
+  border-color: var(--accent-border);
+  background: var(--accent-dim);
+}
+
+.clean-table {
+  width: 100%;
+  border-collapse: collapse;
+  font-size: 0.82rem;
+}
+
+.clean-table th {
+  text-align: left;
+  padding: 12px 14px;
+  color: var(--text-muted);
+  font-weight: 600;
+  font-size: 0.74rem;
+  text-transform: uppercase;
+  letter-spacing: 0.04em;
+  border-bottom: 1px solid var(--border);
+  background: rgba(17, 24, 39, 0.7);
+}
+
+.clean-table td {
+  padding: 12px 14px;
+  border-bottom: 1px solid rgba(255, 255, 255, 0.07);
+}
+
+.clean-table tr:hover td {
+  background: rgba(255, 255, 255, 0.015);
+}
+
+.badge-hit {
+  display: inline-flex;
+  align-items: center;
+  gap: 4px;
+  padding: 2px 8px;
+  border-radius: 6px;
+  background: rgba(16, 185, 129, 0.12);
+  border: 1px solid rgba(16, 185, 129, 0.25);
+  color: #10b981;
+  font-weight: 600;
+  font-size: 0.74rem;
+}
+
+.badge-miss {
+  display: inline-flex;
+  align-items: center;
+  justify-content: center;
+  width: 22px;
+  height: 22px;
+  border-radius: 5px;
+  background: rgba(239, 68, 68, 0.12);
+  border: 1px solid rgba(239, 68, 68, 0.25);
+  color: #ef4444;
+  font-weight: 700;
+  font-size: 0.8rem;
+}
+
+.score-pill {
+  display: inline-flex;
+  align-items: center;
+  padding: 3px 8px;
+  border-radius: 6px;
+  font-weight: 700;
+  font-family: ui-monospace, monospace;
+  font-size: 0.78rem;
+}
+
+.sr-only {
+  position: absolute;
+  width: 1px;
+  height: 1px;
+  padding: 0;
+  margin: -1px;
+  overflow: hidden;
+  clip: rect(0, 0, 0, 0);
+  white-space: nowrap;
+  border-width: 0;
+}

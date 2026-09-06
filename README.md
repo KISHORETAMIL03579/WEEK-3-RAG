@@ -16,7 +16,7 @@ python -m venv .venv
 .venv\Scripts\Activate.ps1
 python -c "import sys; print(sys.executable)"
 python -m pip install -r requirements.txt
-python -c "import pymupdf, docx, fastapi, uvicorn, jinja2, itsdangerous, werkzeug, qdrant_client; print('ALL IMPORTS OK')"
+python -c "import pymupdf, docx, fastapi, uvicorn, itsdangerous, werkzeug, qdrant_client; print('ALL IMPORTS OK')"
 cp .env.example .env
 ```
 
@@ -215,11 +215,11 @@ Because the app is now FastAPI, the whole JSON API is self-documenting: **Swagge
 | `POST` | `/replay/<trace_id>` | Replays a trace from the trace record alone; returns original vs. replayed raw output (session-scoped or requires `X-Admin-Key`) |
 | `GET` | `/docs`, `/redoc`, `/openapi.json` | Auto-generated interactive API documentation (FastAPI) |
 
-Every path, HTTP method, request body and response body above is unchanged from the Flask implementation — `static/js/*.js` calls them by hard-coded string and needed no edits. Path parameters are written `{doc_id}` internally now (FastAPI syntax) rather than `<doc_id>`, but the URLs on the wire are identical.
+Every path, HTTP method, request body and response body above is unchanged from the backend API contract — `frontend/src/services/api.ts` calls them with strongly typed TypeScript models. Path parameters are written `{doc_id}` internally (FastAPI syntax), and the URLs on the wire are identical.
 
 **Request/response validation.** JSON bodies are parsed into Pydantic models (`AskRequest`, `LoadUrlRequest`, `RemoveRequest`, `EvalRunRequest`, `UploadCancelRequest`), and the fixed-shape endpoints (`/status`, `/healthz`, `/readyz`, `/traces`, `/clear`, `/remove`, `/upload-cancel`) declare response models. Endpoints whose payload genuinely varies by branch (`/ask`, `/upload`, `/load-url`, `/eval/run`, `/orphans`, `/replay/<id>`, `/file/<id>/pages`) return plain dicts so their wire format stays byte-identical.
 
-The models are deliberately permissive where the old code was — unknown keys are ignored (`extra="ignore"`), every field is optional with the same defaults, an entirely absent body is treated as `{}`, and `top_k` / `temperature` are still *clamped* to their supported ranges rather than rejected. The one genuinely new behaviour: a value that cannot be parsed at all (e.g. `"top_k": "abc"`, previously ignored in silence) now returns **422**. That response uses this API's normal `{"error": "..."}` envelope — see `_validation_error_handler` in `app.py` — so `handleResponse()` in `static/js/app.js` surfaces a real message rather than a bare status code, with FastAPI's structured `detail` array alongside it.
+The models are deliberately permissive where the old code was — unknown keys are ignored (`extra="ignore"`), every field is optional with the same defaults, an entirely absent body is treated as `{}`, and `top_k` / `temperature` are still *clamped* to their supported ranges rather than rejected. The one genuinely new behaviour: a value that cannot be parsed at all (e.g. `"top_k": "abc"`, previously ignored in silence) now returns **422**. That response uses this API's normal `{"error": "..."}` envelope — see `_validation_error_handler` in `app.py` — so `handleResponse()` in `frontend/src/services/api.ts` surfaces a real message rather than a bare status code, with FastAPI's structured `detail` array alongside it.
 
 **Request size limit.** Every request body is capped at **50 MB**. Flask enforced this via `MAX_CONTENT_LENGTH`; Starlette imposes no limit of its own, so `MaxBodySizeMiddleware` in `app.py` re-implements it — rejecting an oversized `Content-Length` up front, *and* counting bytes for chunked requests that declare no length. Both paths return `413 {"error": "File too large (max 50 MB)"}`, exactly as the old `@app.errorhandler(413)` did.
 
@@ -246,16 +246,10 @@ Every `/ask` call writes one durable, redacted JSON line to `traces/traces.jsonl
 
 ## 5b. Document Viewer, Open Links & Highlighting
 
-Clicking **Open ↗** on any source card navigates to `/file/<doc_id>?page=N&hl=<snippet>`. What happens next depends on file type:
+Clicking **Open ↗** on any source card navigates to `/#/file/<doc_id>?page=N&hl=<snippet>` in the React SPA. What happens next depends on file type:
 
-- **Non-PDF documents** (`.txt`, `.md`, extracted Word/CSV/code text) render through a custom React page-by-page viewer (`static/js/view.js`) with **real in-page highlighting**: the `hl` snippet (the first ~100 characters of the actual retrieved chunk, not the raw question — the question almost never appears verbatim in the source) is matched against the page text with a whitespace-flexible regex, since chunk text gets newlines collapsed during ingestion while the raw page text keeps them.
-- **PDF documents** are handed to the **browser's own native PDF plugin** via `<embed>` — there is no API surface for us to inject a highlight into that renderer's content. What *does* work: the standard `#page=N` URL fragment (supported by Chrome/Firefox/Safari/Edge/Brave) jumps straight to the cited page. For the passage itself, a banner above the embed shows the exact excerpt text to look for, with a nudge to use the browser's native Find (Ctrl/Cmd+F) — an honest fallback rather than a highlight that silently does nothing.
-
-`templates/view.html` injects `window.DOC_ID` / `DOC_FILENAME` / `DOC_EXT` as the very first script in `<head>` (via the Jinja `tojson` filter, which safely escapes the values for script-context embedding) — before the React/Babel CDN scripts even load, so the viewer never depends on a `?doc_id=` query param that the route never actually has (the route is `/file/<doc_id>`, a path segment).
-
-> **`tojson` under FastAPI:** Flask registered this filter on its Jinja environment automatically. Starlette's `Jinja2Templates` builds a bare `jinja2.Environment`, so `app.py` registers `tojson` explicitly rather than relying on a Jinja default. `test_tojson_filter_is_registered_and_script_safe` in `test_eval_metrics.py` asserts both that it is present and that it escapes a `</script>` payload.
-
-> If you see red squiggly "Property assignment expected" errors on the `{{ doc_id | tojson }}` lines in VS Code — that's the editor's JS linter misreading Jinja2 template syntax as literal JavaScript. It's a local editor-only false positive; the server replaces every `{{ ... }}` with a real value before the browser ever sees the page. Install the **Better Jinja** extension and set this file's language mode to **Jinja HTML** to silence it.
+- **Non-PDF documents** (`.txt`, `.md`, extracted Word/CSV/code text) render through the React page-by-page viewer (`frontend/src/pages/ViewerPage.tsx`) with **real in-page highlighting**: the `hl` snippet (the first ~100 characters of the actual retrieved chunk, not the raw question — the question almost never appears verbatim in the source) is matched against the page text with a whitespace-flexible regex, since chunk text gets newlines collapsed during ingestion while the raw page text keeps them.
+- **PDF documents** are handed to the **browser's own native PDF plugin** via `<embed>` with `/file/{doc_id}/raw` — there is no API surface for us to inject a highlight into that renderer's content. What *does* work: the standard `#page=N` URL fragment (supported by Chrome/Firefox/Safari/Edge/Brave) jumps straight to the cited page. For the passage itself, a banner above the embed shows the exact excerpt text to look for, with a nudge to use the browser's native Find (Ctrl/Cmd+F) — an honest fallback rather than a highlight that silently does nothing.
 
 ---
 
@@ -274,9 +268,9 @@ Clicking **Open ↗** on any source card navigates to `/file/<doc_id>?page=N&hl=
 | **LLM Reranker & Rewriter** | `app.py` | `rerank_with_llm()`, `rewrite_query()` |
 | **Evaluation Suite & Matrix** | `app.py`, `eval_retrieval.py` | `/eval/run`, `_run_eval_preset()`, `recall_at_k()` |
 | **Trace Logging & Replay** | `trace_store.py`, `app.py` | `TraceStore`, `redact()`, `/replay/<trace_id>`, `sample_trace.py` (CLI) |
-| **Main React Application** | `static/js/app.js` | React Chat UI, `SourceItem` grounded-source cards, Dropzone, Staged File List |
-| **Evaluation React UI** | `static/js/eval.js` | React Evaluation Matrix & Inspection Drawer |
-| **Document Viewer React UI** | `static/js/view.js`, `templates/view.html` | React Embedded Document Viewer, page-jump + highlight logic |
+| **Main React Application** | `frontend/src/pages/ChatPage.tsx` | React 18 Chat UI, `SourceItem` grounded-source cards, Dropzone, Staged File List |
+| **Evaluation React UI** | `frontend/src/pages/EvaluationPage.tsx` | React 18 Evaluation Matrix & Inspection Drawer |
+| **Document Viewer React UI** | `frontend/src/pages/ViewerPage.tsx` | React 18 Embedded Document Viewer, page-jump + highlight logic |
 
 ---
 
@@ -437,7 +431,7 @@ Key areas verified by the suite:
 - **Durable Orphan Tracking**: Persistence and resolution tracking in `orphans.jsonl`, cross-process locking (`filelock`), and crash-recovery state preservation.
 - **Session & Replay Security**: Session isolation for `/orphans` and `/replay/<trace_id>`, admin authentication via `X-Admin-Key`, and sensitive path redaction.
 - **Trace Auditing**: Deep redaction (`redact_deep()`), prompt version pinning and SHA-256 hash validation, and deterministic trace sampling (`sample_trace.py`).
-- **Web-Layer Contracts** (`TestFastAPIMigration`): the 50 MB body cap on both the `Content-Length` and chunked/streamed paths, session-cookie round-tripping and tamper rejection, the `tojson` filter's script-context escaping, the `static/` mount, the full route table the frontend depends on, and the shared "No active session" 400 contract.
+- **Web-Layer Contracts** (`TestFastAPIMigration`): the 50 MB body cap on both the `Content-Length` and chunked/streamed paths, session-cookie round-tripping and tamper rejection, the `/assets` static mount for compiled Vite assets, the full route table the frontend depends on, and the shared "No active session" 400 contract.
 
 ### Interactive & Diagnostic Tools
 - **`eval_retrieval.py`** — CLI tool computing `Hit-Rate@K`, `MRR`, and failure categorization directly against your indexed documents:
@@ -462,14 +456,8 @@ Gemini's free tier has a real requests-per-minute quota — this is the quota, n
 **Upload "succeeded" but semantic search doesn't seem to work for one document**
 Check the upload response for a per-file `warning` field — this means embeddings failed for that specific file (see above) and it's keyword-search-only until re-uploaded with a working embeddings backend.
 
-**Clicking "Open ↗" on a source shows "No document ID specified."**
-This was a real bug (fixed): `templates/view.html` wasn't passing `doc_id` into `window.DOC_ID`. If you're still seeing it, confirm you're on the current `view.html`/`view.js`.
-
 **Opened a PDF source but the passage isn't highlighted**
 Expected for PDFs — see §5b. The page-jump (`#page=N`) works; in-document highlighting doesn't, because the browser's native PDF plugin gives no hook for it. Look for the banner showing the exact passage text, and use your browser's Find (Ctrl/Cmd+F).
-
-**VS Code shows red errors on `{{ doc_id | tojson }}` in `view.html`**
-Editor-only false positive — see the note at the end of §5b.
 
 **Local chat model (Ollama) drops citations or answers outside the retrieved excerpts**
 A known, real tradeoff of `CHAT_BACKEND=ollama` — smaller local models follow strict grounding/citation instructions less reliably than a frontier cloud model. Try `OLLAMA_CHAT_MODEL=qwen2.5` (tends to follow strict formats a bit better at similar size) before assuming the retrieval pipeline itself is broken, or switch `CHAT_BACKEND=xai` if citation discipline matters more than staying fully local.

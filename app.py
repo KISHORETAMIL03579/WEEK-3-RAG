@@ -8,6 +8,7 @@ import uuid
 import pickle
 import base64
 import shutil
+import subprocess
 import tempfile
 import hashlib
 import hmac
@@ -35,13 +36,11 @@ import pymupdf as fitz  # PyMuPDF — imports the real module directly, avoiding
                         # the deprecated `import fitz` legacy-alias shim that
                         # prints the runtime warning. Every fitz.* call below
                         # is unaffected since this is just a local alias.
-import jinja2
 from fastapi import Body, Depends, FastAPI, File, Form, Query, Request, Response, UploadFile
 from fastapi.encoders import jsonable_encoder
 from fastapi.exceptions import RequestValidationError
 from fastapi.responses import FileResponse, JSONResponse
 from fastapi.staticfiles import StaticFiles
-from fastapi.templating import Jinja2Templates
 from pydantic import BaseModel, ConfigDict
 from starlette.datastructures import Headers
 from starlette.middleware import Middleware
@@ -291,16 +290,85 @@ app = FastAPI(
     ],
 )
 
-# Flask auto-served ./static; FastAPI needs it mounted explicitly.
-app.mount("/static", StaticFiles(directory=str(BASE_DIR / "static")), name="static")
+FRONTEND_DIR = BASE_DIR / "frontend"
+FRONTEND_DIST = FRONTEND_DIR / "dist"
 
-templates = Jinja2Templates(directory=str(BASE_DIR / "templates"))
-# Flask registers a `tojson` filter automatically; Starlette's Jinja2Templates
-# builds a bare jinja2.Environment. Jinja ships `tojson` in its own defaults,
-# but templates/view.html depends on it for script-context escaping of
-# window.DOC_ID et al, so register it explicitly rather than relying on a
-# Jinja default that could change underneath us.
-templates.env.filters["tojson"] = jinja2.filters.do_tojson
+if (FRONTEND_DIST / "assets").exists():
+    app.mount("/assets", StaticFiles(directory=str(FRONTEND_DIST / "assets")), name="assets")
+
+
+def ensure_frontend_built(force: bool = False) -> bool:
+    """
+    Ensures that the React 18 + TypeScript + Vite production build exists.
+    If frontend/dist/index.html is missing (or force=True), executes:
+      npm.cmd run build (on Windows) or npm run build (on Linux/macOS)
+    from the frontend/ directory.
+
+    Returns True if the build exists or succeeded.
+    Raises SystemExit(1) if the build fails, npm is missing, or index.html is not created.
+    """
+    index_html = FRONTEND_DIST / "index.html"
+    if index_html.exists() and not force:
+        return True
+
+    package_json = FRONTEND_DIR / "package.json"
+    if not package_json.exists():
+        print(f"❌ frontend/package.json not found at {FRONTEND_DIR}", file=sys.stderr)
+        logger.error("frontend/package.json not found at %s", FRONTEND_DIR)
+        raise SystemExit(1)
+
+    npm_cmd = "npm.cmd" if sys.platform.startswith("win") else "npm"
+    logger.info("📦 React frontend not built. Executing '%s run build' in %s...", npm_cmd, FRONTEND_DIR)
+    print(f"\n📦 Building React 18 + Vite frontend ({npm_cmd} run build)...")
+
+    try:
+        res = subprocess.run(
+            [npm_cmd, "run", "build"],
+            cwd=str(FRONTEND_DIR),
+            capture_output=True,
+            text=True,
+            check=False,
+        )
+        if res.returncode != 0:
+            print(f"❌ Frontend build failed (exit code {res.returncode}):\n", file=sys.stderr)
+            if res.stdout:
+                print(res.stdout, file=sys.stderr)
+            if res.stderr:
+                print(res.stderr, file=sys.stderr)
+            logger.error("Frontend build failed:\n%s\n%s", res.stdout, res.stderr)
+            raise SystemExit(1)
+
+        if not index_html.exists():
+            print("❌ Frontend build finished with code 0 but frontend/dist/index.html was not generated.", file=sys.stderr)
+            logger.error("Frontend build did not create %s", index_html)
+            raise SystemExit(1)
+
+        print("✅ Frontend build completed successfully!\n")
+        logger.info("✅ Frontend build completed.")
+
+        # Mount /assets if it wasn't mounted yet at startup
+        assets_dir = FRONTEND_DIST / "assets"
+        if assets_dir.exists():
+            has_assets_route = any(getattr(route, "path", None) == "/assets" for route in app.routes)
+            if not has_assets_route:
+                app.mount("/assets", StaticFiles(directory=str(assets_dir)), name="assets")
+
+        return True
+    except FileNotFoundError:
+        print(
+            f"❌ '{npm_cmd}' was not found in PATH.\n"
+            f"   Node.js and npm are required to build the frontend when frontend/dist is missing.\n"
+            f"   Please install Node.js 18+ or run 'npm run build' inside frontend/.",
+            file=sys.stderr,
+        )
+        logger.error("'%s' not found in PATH when building frontend.", npm_cmd)
+        raise SystemExit(1)
+    except SystemExit:
+        raise
+    except Exception as exc:
+        print(f"❌ Unexpected error while building frontend: {exc}", file=sys.stderr)
+        logger.error("Unexpected error during frontend build: %s", exc, exc_info=True)
+        raise SystemExit(1)
 
 # ─────────────────────────────────────────────────────────────────────────────
 #  Trace logging (W5 Task Set C — durable, replayable /ask traces)
@@ -2628,7 +2696,7 @@ async def _no_active_session_handler(request: Request, exc: NoActiveSessionError
 @app.exception_handler(RequestValidationError)
 async def _validation_error_handler(request: Request, exc: RequestValidationError) -> JSONResponse:
     """Every error this API returns carries an `error` string — that is what
-    static/js/app.js's handleResponse() reads. FastAPI's default 422 body is
+    frontend/src/services/api.ts's handleResponse() reads. FastAPI's default 422 body is
     `{"detail": [...]}` instead, which the frontend would render as a bare
     "Request failed with status 422". This keeps the envelope consistent
     while still exposing the structured `detail` for API clients and /docs.
@@ -2685,9 +2753,14 @@ RequiredStore = Annotated[VectorStore, Depends(require_session_store)]
 @app.get("/", include_in_schema=False)
 def index(request: Request, sid: SessionId):
     # `sid` is unused in the body on purpose: depending on it is what mints
-    # the session cookie for a first-time visitor, exactly as the old
-    # `if "session_id" not in session` block did.
-    return templates.TemplateResponse(request, "index.html")
+    # the session cookie for a first-time visitor.
+    index_html = FRONTEND_DIST / "index.html"
+    if index_html.exists():
+        return FileResponse(str(index_html))
+    return JSONResponse(
+        {"message": "React frontend not built. Run 'npm run build' in the frontend/ directory."},
+        status_code=503,
+    )
 
 
 def _index_into_store(sid: str, doc_info: dict, pages: list[dict],
@@ -3108,16 +3181,20 @@ def load_url(sid: SessionId, payload: LoadUrlRequest | None = Body(default=None)
 
 @app.get("/favicon.ico", include_in_schema=False)
 def favicon():
-    """Serves the project's RAG icon as favicon."""
-    ico_path = BASE_DIR / "static" / "favicon.ico"
-    if ico_path.exists():
-        return FileResponse(ico_path, media_type="image/x-icon")
-    return FileResponse(BASE_DIR / "static" / "rag.svg", media_type="image/svg+xml")
+    """Serves the project's favicon."""
+    for path in (
+        FRONTEND_DIST / "favicon.ico",
+        FRONTEND_DIST / "rag.svg",
+    ):
+        if path.exists():
+            media_type = "image/x-icon" if path.suffix == ".ico" else "image/svg+xml"
+            return FileResponse(path, media_type=media_type)
+    return JSONResponse({"error": "Favicon not found"}, status_code=404)
 
 
 @app.get("/file/{doc_id}", include_in_schema=False)
 def serve_file(request: Request, doc_id: str, store: RequiredStore):
-    """View an uploaded document (e.g. PDF) in an HTML viewer page."""
+    """View an uploaded document in the React Single Page Application."""
     sid = request.session["session_id"]
     info = SESSION_FILES.get(sid, {}).get(doc_id)
     doc_chunks = [c for c in store.chunks if c["doc_id"] == doc_id]
@@ -3125,15 +3202,13 @@ def serve_file(request: Request, doc_id: str, store: RequiredStore):
     if not info and not doc_chunks:
         return JSONResponse({"error": "File not found or no longer available"}, status_code=404)
 
-    if info and info["path"].exists():
-        name = info["name"]
-        ext = (name.rsplit(".", 1)[1] if "." in name else "").lower()
-    else:
-        name = doc_chunks[0]["filename"] if doc_chunks else "Document"
-        ext = "txt"
+    index_html = FRONTEND_DIST / "index.html"
+    if index_html.exists():
+        return FileResponse(str(index_html))
 
-    return templates.TemplateResponse(
-        request, "view.html", {"doc_id": doc_id, "filename": name, "ext": ext}
+    return JSONResponse(
+        {"message": "React frontend not built. Run 'npm run build' in the frontend/ directory."},
+        status_code=503,
     )
 
 
@@ -3708,10 +3783,14 @@ def eval_parse_qa_pdf(file: UploadFile | None = File(default=None)):
 
 @app.get("/eval", include_in_schema=False)
 def eval_page(request: Request, sid: SessionId):
-    """Serves the Week 4 evaluation page — a real hit-rate@k measurement
-    tool, separate from the main chat UI, using the documents already
-    indexed in this session."""
-    return templates.TemplateResponse(request, "eval.html")
+    """Serves the evaluation page via the React Single Page Application."""
+    index_html = FRONTEND_DIST / "index.html"
+    if index_html.exists():
+        return FileResponse(str(index_html))
+    return JSONResponse(
+        {"message": "React frontend not built. Run 'npm run build' in the frontend/ directory."},
+        status_code=503,
+    )
 
 
 # Named presets for the Week 4 ablation ladder — each maps to a specific,
@@ -4052,6 +4131,9 @@ if __name__ == "__main__":
     print(f"\n🚀 Ask My Docs is running → http://localhost:{port}")
     print(f"   Mode: {mode_label}")
     print(f"   API docs: http://localhost:{port}/docs\n")
+    # Ensure React 18 + Vite frontend is built before starting server
+    ensure_frontend_built()
+
     # APP_DEBUG turns on uvicorn's autoreloader, which needs an import string
     # rather than the app object (it re-imports the module in the child process).
     uvicorn.run(

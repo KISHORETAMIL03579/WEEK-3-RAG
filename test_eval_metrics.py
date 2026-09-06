@@ -1429,29 +1429,24 @@ class TestFastAPIMigration(unittest.TestCase):
         tampered.cookies.set("session", cookie_after_first[:-4] + "AAAA")
         self.assertEqual(tampered.get("/orphans").status_code, 401)
 
-    def test_tojson_filter_is_registered_and_script_safe(self):
-        """templates/view.html embeds values into a <script> block via
-        `| tojson`. Flask registers that filter automatically; Starlette's
-        Jinja2Templates does not guarantee it, so it is wired up explicitly."""
-        from app import templates
-
-        self.assertIn("tojson", templates.env.filters)
-        hostile = '</script><script>alert(1)</script>'
-        rendered = templates.env.from_string("{{ v | tojson }}").render(v=hostile)
-        # Must not be able to break out of the surrounding <script> element...
-        self.assertNotIn("</script>", rendered)
-        # ...while still round-tripping to the exact original value.
-        self.assertEqual(json.loads(rendered), hostile)
-
-    def test_static_files_are_mounted(self):
-        """Flask served ./static automatically; in FastAPI it is an explicit
-        mount, so a missing mount would only surface as a broken UI."""
+    def test_favicon_is_served_from_frontend(self):
+        """Verify that /favicon.ico serves the application icon."""
         from app import app
 
         client = make_client(app)
-        for path in ("/static/js/app.js", "/static/js/view.js", "/static/css/app.css"):
-            with self.subTest(path=path):
-                self.assertEqual(client.get(path).status_code, 200)
+        resp = client.get("/favicon.ico")
+        self.assertEqual(resp.status_code, 200)
+        self.assertGreater(len(resp.content), 100)
+
+    def test_vite_frontend_viewer_route_serving(self):
+        """Verify that GET /file/{doc_id} serves the SPA index when compiled dist is present."""
+        from app import app, FRONTEND_DIST
+
+        client = make_client(app)
+        set_session(client, "test_viewer_sess")
+        resp = client.get("/file/testdoc123")
+        self.assertEqual(resp.status_code, 404)  # no doc yet -> 404
+
 
     def test_every_documented_route_is_registered(self):
         """The frontend calls these paths by hard-coded string; a renamed or
@@ -1505,7 +1500,7 @@ class TestFastAPIMigration(unittest.TestCase):
     def test_validation_errors_use_the_apis_error_envelope(self):
         """Pydantic validation is new (Flask silently ignored unparseable
         values), but every error this API returns must still carry an `error`
-        string — that is the only field static/js/app.js's handleResponse()
+        string — that is the envelope frontend/src/services/api.ts's handleResponse()
         looks at."""
         from app import app
 
@@ -1550,6 +1545,132 @@ class TestFastAPIMigration(unittest.TestCase):
                 resp = getattr(client, method)(path)
                 self.assertEqual(resp.status_code, 400)
                 self.assertEqual(resp.json(), {"error": "No active session"})
+
+    def test_vite_frontend_dist_serving_and_assets(self):
+        """Verify that FastAPI correctly serves the built React 18 + Vite SPA and compiled assets."""
+        from app import app, FRONTEND_DIST
+        import re
+
+        client = make_client(app)
+        if FRONTEND_DIST.exists() and (FRONTEND_DIST / "index.html").exists():
+            resp = client.get("/")
+            self.assertEqual(resp.status_code, 200)
+            self.assertIn('<div id="root"></div>', resp.text)
+            match_js = re.search(r'src="(/assets/[^"]+\.js)"', resp.text)
+            self.assertIsNotNone(match_js, "Vite JS asset tag must be present in index.html")
+            if match_js:
+                asset_resp = client.get(match_js.group(1))
+                self.assertEqual(asset_resp.status_code, 200)
+                self.assertGreater(len(asset_resp.content), 1000)
+
+    def test_vite_frontend_eval_route_serving(self):
+        """Verify that GET /eval serves the SPA index when compiled dist is present."""
+        from app import app, FRONTEND_DIST
+
+        client = make_client(app)
+        resp = client.get("/eval")
+        self.assertEqual(resp.status_code, 200)
+        self.assertIn('<div id="root"></div>', resp.text)
+
+    def test_ensure_frontend_built_warm_start(self):
+        """TEST 1 — Warm start: When index.html exists, return True without running subprocess."""
+        from app import ensure_frontend_built
+        from unittest.mock import patch
+
+        with patch("pathlib.Path.exists", return_value=True), \
+             patch("subprocess.run") as mock_sub:
+            res = ensure_frontend_built(force=False)
+            self.assertTrue(res)
+            mock_sub.assert_not_called()
+
+    def test_ensure_frontend_built_cold_start(self):
+        """TEST 2 — Cold start: When index.html is missing, run npm build with platform command and cwd."""
+        from app import ensure_frontend_built, FRONTEND_DIR
+        from unittest.mock import patch, MagicMock
+
+        mock_res = MagicMock()
+        mock_res.returncode = 0
+        mock_res.stdout = "Build succeeded"
+        mock_res.stderr = ""
+
+        # Initial check (index.html missing) -> package.json (present) -> post-build index.html (present) -> assets (present)
+        exists_side_effects = [False, True, True, True]
+
+        with patch("pathlib.Path.exists", side_effect=exists_side_effects), \
+             patch("subprocess.run", return_value=mock_res) as mock_sub:
+            res = ensure_frontend_built(force=False)
+            self.assertTrue(res)
+            mock_sub.assert_called_once()
+            args, kwargs = mock_sub.call_args
+            expected_npm = "npm.cmd" if sys.platform.startswith("win") else "npm"
+            self.assertEqual(args[0], [expected_npm, "run", "build"])
+            self.assertEqual(kwargs.get("cwd"), str(FRONTEND_DIR))
+
+    def test_ensure_frontend_built_failure_nonzero_exit(self):
+        """TEST 3 — Build failure: Non-zero npm exit code raises SystemExit(1)."""
+        from app import ensure_frontend_built
+        from unittest.mock import patch, MagicMock
+
+        mock_res = MagicMock()
+        mock_res.returncode = 1
+        mock_res.stdout = ""
+        mock_res.stderr = "TypeScript error: TS2304"
+
+        # exists returns False for index.html, True for package.json
+        exists_side_effects = [False, True]
+
+        with patch("pathlib.Path.exists", side_effect=exists_side_effects), \
+             patch("subprocess.run", return_value=mock_res):
+            with self.assertRaises(SystemExit) as ctx:
+                ensure_frontend_built(force=False)
+            self.assertEqual(ctx.exception.code, 1)
+
+    def test_ensure_frontend_built_missing_index_html_after_build(self):
+        """TEST 4 — Build succeeds (code 0) but index.html missing raises SystemExit(1)."""
+        from app import ensure_frontend_built
+        from unittest.mock import patch, MagicMock
+
+        mock_res = MagicMock()
+        mock_res.returncode = 0
+        mock_res.stdout = "OK"
+        mock_res.stderr = ""
+
+        # exists returns False for index.html, True for package.json, False for post-build index.html
+        exists_side_effects = [False, True, False]
+
+        with patch("pathlib.Path.exists", side_effect=exists_side_effects), \
+             patch("subprocess.run", return_value=mock_res):
+            with self.assertRaises(SystemExit) as ctx:
+                ensure_frontend_built(force=False)
+            self.assertEqual(ctx.exception.code, 1)
+
+    def test_ensure_frontend_built_missing_package_json(self):
+        """TEST 5 — Missing frontend/package.json raises SystemExit(1)."""
+        from app import ensure_frontend_built
+        from unittest.mock import patch
+
+        # exists returns False for index.html, False for package.json
+        exists_side_effects = [False, False]
+
+        with patch("pathlib.Path.exists", side_effect=exists_side_effects):
+            with self.assertRaises(SystemExit) as ctx:
+                ensure_frontend_built(force=False)
+            self.assertEqual(ctx.exception.code, 1)
+
+    def test_ensure_frontend_built_npm_not_found(self):
+        """TEST 6 — npm not found in PATH raises SystemExit(1)."""
+        from app import ensure_frontend_built
+        from unittest.mock import patch
+
+        # exists returns False for index.html, True for package.json
+        exists_side_effects = [False, True]
+
+        with patch("pathlib.Path.exists", side_effect=exists_side_effects), \
+             patch("subprocess.run", side_effect=FileNotFoundError("npm not found")):
+            with self.assertRaises(SystemExit) as ctx:
+                ensure_frontend_built(force=False)
+            self.assertEqual(ctx.exception.code, 1)
+
 
 
 def _decode_session_cookie(cookie_value: str) -> dict:

@@ -21,6 +21,8 @@ venv/
 uploads/
 vectorstore/
 traces/
+frontend/node_modules/
+frontend/dist/
 
 # Editor / OS cruft
 .vscode/

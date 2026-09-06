@@ -1,26 +1,34 @@
-const { useState, useEffect, useRef, useCallback } = React;
+import React, { useState, useEffect, useCallback } from 'react';
+import { DocumentPage } from '../types/document';
+import { api } from '../services/api';
+import { escapeRegex } from '../utils/helpers';
 
-/* ── Safe Regex Escaping Helper ─────────────────────────────── */
-function escapeRegex(str) {
-  return (str || '').replace(/[.*+?^${}()|[\]\\]/g, '\\$&');
+interface ViewerPageProps {
+  initialDocId?: string;
 }
 
-function DocViewerApp() {
-  const [docId, setDocId] = useState('');
-  const [filename, setFilename] = useState(window.DOC_FILENAME || '');
-  const [pages, setPages] = useState([]);
-  const [curPage, setCurPage] = useState(1);
-  const [zoom, setZoom] = useState(1);
-  const [ext, setExt] = useState(window.DOC_EXT || 'pdf');
-  const [searchQuery, setSearchQuery] = useState('');
-  const [highlightQuery, setHighlightQuery] = useState('');
-  const [searchCount, setSearchCount] = useState('');
-  const [loading, setLoading] = useState(true);
-  const [error, setError] = useState(null);
+export const ViewerPage: React.FC<ViewerPageProps> = ({ initialDocId }) => {
+  const [docId, setDocId] = useState<string>(initialDocId || '');
+  const [filename, setFilename] = useState<string>('');
+  const [pages, setPages] = useState<DocumentPage[]>([]);
+  const [curPage, setCurPage] = useState<number>(1);
+  const [zoom, setZoom] = useState<number>(1);
+  const [ext, setExt] = useState<string>('pdf');
+  const [searchQuery, setSearchQuery] = useState<string>('');
+  const [highlightQuery, setHighlightQuery] = useState<string>('');
+  const [searchCount, setSearchCount] = useState<string>('');
+  const [loading, setLoading] = useState<boolean>(true);
+  const [error, setError] = useState<string | null>(null);
 
   useEffect(() => {
     const params = new URLSearchParams(window.location.search);
-    const id = params.get('doc_id') || window.DOC_ID || '';
+    let id = params.get('doc_id') || initialDocId || '';
+    if (!id && window.location.pathname.startsWith('/file/')) {
+      const parts = window.location.pathname.split('/');
+      if (parts[2] && parts[2] !== 'raw' && parts[2] !== 'pages') {
+        id = decodeURIComponent(parts[2]);
+      }
+    }
     const initialPage = parseInt(params.get('page') || '1', 10);
     const initialHl = params.get('hl') || '';
 
@@ -37,12 +45,7 @@ function DocViewerApp() {
 
     async function fetchPages() {
       try {
-        const safeId = encodeURIComponent(String(id));
-        const res = await fetch(`/file/${safeId}/pages`, { signal: controller.signal });
-        const data = await res.json().catch(() => ({}));
-        if (!res.ok) {
-          throw new Error(data.error || data.message || `Request failed with status ${res.status}`);
-        }
+        const data = await api.getFilePages(id, controller.signal);
         if (!Array.isArray(data.pages)) {
           throw new Error('Invalid document response format.');
         }
@@ -52,9 +55,10 @@ function DocViewerApp() {
         if (initialPage > 0 && initialPage <= data.pages.length) {
           setCurPage(initialPage);
         }
-      } catch (err) {
-        if (err.name === 'AbortError') return;
-        setError(err.message || 'Could not load document.');
+      } catch (err: unknown) {
+        const e = err as Error;
+        if (e.name === 'AbortError') return;
+        setError(e.message || 'Could not load document.');
       } finally {
         if (!controller.signal.aborted) {
           setLoading(false);
@@ -65,7 +69,7 @@ function DocViewerApp() {
     fetchPages();
 
     return () => controller.abort();
-  }, []);
+  }, [initialDocId]);
 
   const handleBack = useCallback(() => {
     if (typeof window !== 'undefined' && window.history.length > 1) {
@@ -84,7 +88,7 @@ function DocViewerApp() {
     }
   }, []);
 
-  const handleSearch = (e) => {
+  const handleSearch = (e: React.FormEvent) => {
     e.preventDefault();
     const trimmed = searchQuery.trim();
     if (!trimmed || pages.length === 0) return;
@@ -110,7 +114,7 @@ function DocViewerApp() {
     }
   };
 
-  const highlightText = (text, query) => {
+  const highlightText = (text: string, query: string) => {
     const safeText = typeof text === 'string' ? text : '';
     if (!safeText) return safeText;
     if (!query) return safeText;
@@ -118,7 +122,7 @@ function DocViewerApp() {
     if (!trimmed) return safeText;
     const escaped = escapeRegex(trimmed);
     const flexible = escaped.replace(/ +/g, '\\s+');
-    let regex;
+    let regex: RegExp;
     try {
       regex = new RegExp(`(${flexible})`, 'gi');
     } catch {
@@ -194,7 +198,11 @@ function DocViewerApp() {
                 className="viewer-search-input"
                 aria-label="Search within document"
               />
-              {searchCount && <span className="viewer-search-count" aria-live="polite">{searchCount}</span>}
+              {searchCount && (
+                <span className="viewer-search-count" aria-live="polite">
+                  {searchCount}
+                </span>
+              )}
             </form>
           )}
 
@@ -235,42 +243,33 @@ function DocViewerApp() {
 
       {/* Main Document Content Area */}
       <main className="viewer-main">
-        {loading && (
-          <div className="viewer-loading">Loading document pages...</div>
-        )}
+        {loading && <div className="viewer-loading">Loading document pages...</div>}
 
-        {error && (
-          <div className="viewer-error">
-            {error}
-          </div>
-        )}
+        {error && <div className="viewer-error">{error}</div>}
 
         {!loading && !error && isPdf && (
           <div className="viewer-pdf-wrapper">
             {highlightQuery && (
               <div className="viewer-pdf-notice">
                 🔍 Looking for this passage (use your browser's Find, Ctrl/Cmd+F, if it's not immediately visible):
-                <div className="viewer-pdf-snippet">
-                  "{highlightQuery}"
-                </div>
+                <div className="viewer-pdf-snippet">"{highlightQuery}"</div>
               </div>
             )}
             <embed
               type="application/pdf"
               src={`/file/${encodeURIComponent(String(docId))}/raw#page=${curPage}`}
               className="viewer-pdf-embed"
-              style={{ '--viewer-zoom': zoom }}
+              style={{ ['--viewer-zoom' as string]: zoom }}
             />
           </div>
         )}
 
         {!loading && !error && !isPdf && currentPageData && (
-          <div
-            className="viewer-doc-page"
-            style={{ '--viewer-zoom': zoom }}
-          >
+          <div className="viewer-doc-page" style={{ ['--viewer-zoom' as string]: zoom }}>
             <div className="viewer-doc-meta">
-              <span>Section {currentPageData.num} of {pages.length}</span>
+              <span>
+                Section {currentPageData.num} of {pages.length}
+              </span>
               <span>{filename}</span>
             </div>
             <div>{highlightText(currentPageData.text, highlightQuery)}</div>
@@ -279,7 +278,5 @@ function DocViewerApp() {
       </main>
     </div>
   );
-}
+};
 
-const root = ReactDOM.createRoot(document.getElementById('root'));
-root.render(<DocViewerApp />);
